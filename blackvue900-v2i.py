@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""blackvue900-v21.py -- export geotagged still images from BlackVue
+"""blackvue900-v2i.py -- export geotagged still images from BlackVue
 DR900 dash-camera videos at a fixed travelled-distance interval.
 
 A BlackVue DR900 records ordinary MP4 video, and embeds its GPS log as NMEA
@@ -90,7 +90,7 @@ import v2i_common as v2i
 from v2i_common import Track, detect_camera, plan_shots, skip_reason
 
 SCRIPT_NAME = os.path.basename(os.path.realpath(__file__))
-LOG = logging.getLogger("blackvue900-v21")
+LOG = logging.getLogger("blackvue900-v2i")
 
 KNOTS_TO_MPS = 0.514444
 DEFAULT_MODEL = "DR900"
