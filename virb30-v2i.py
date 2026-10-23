@@ -86,6 +86,7 @@ import sys
 import tempfile
 
 import v2i_common as v2i
+import v2i_metadata
 from v2i_common import Track, detect_camera, plan_shots, skip_reason
 
 SCRIPT_NAME = os.path.basename(os.path.realpath(__file__))
@@ -377,7 +378,10 @@ class Telemetry(object):
         hdg_raw = _num(fields.get(5))
         utc_raw = _num(fields.get(6))
         vel = fields.get(7)
-        self.samples.append({
+        accuracy_raw = _num(fields.get(8))
+        hdop_raw = _num(fields.get(11))
+        vdop_raw = _num(fields.get(12))
+        sample = {
             "fit_s": fit_s,
             "t": fit_s + ms / 1000.0,
             "utc_fit": utc_raw,
@@ -386,9 +390,21 @@ class Telemetry(object):
             # Garmin encodes enhanced_altitude as raw/5 - 500 metres.
             "alt": (alt_raw / 5.0 - 500.0) if alt_raw is not None else None,
             "speed": (spd_raw / 1000.0) if spd_raw is not None else None,
-            "heading": (hdg_raw / 100.0) if hdg_raw is not None else None,
+            "course": (hdg_raw / 100.0) if hdg_raw is not None else None,
             "velocity": [v / 100.0 for v in vel] if isinstance(vel, tuple) else None,
-        })
+        }
+        # FIT gps_metadata field 8 behaves like a measured accuracy in metres;
+        # fields 11/12 look like scaled HDOP/VDOP but are not in the public SDK
+        # profile, so they are used only as a documented fallback.
+        if accuracy_raw is not None:
+            sample["accuracy"] = float(accuracy_raw)
+            sample["accuracy_estimated"] = False
+            sample["accuracy_source"] = "fit-gps_metadata-field8"
+        if hdop_raw is not None:
+            sample["hdop"] = hdop_raw / 100.0
+        if vdop_raw is not None:
+            sample["vdop"] = vdop_raw / 100.0
+        self.samples.append(sample)
 
     def _add_camera_event(self, fields):
         fit_s = _num(fields.get(253))
@@ -723,93 +739,94 @@ def pick_fit(atoms, candidates, created_local, explicit=None):
 
 
 # ===========================================================================
-# Metadata (EXIF / XMP) writing
+# Records, metadata and per-video processing
 # ===========================================================================
 
-def build_metadata_args(record, source, args):
-    """exiftool arguments (without the file name) describing one image."""
-    tags = ["-overwrite_original", "-n", "-charset", "filename=utf8", "-Orientation=1"]
+def _record_from_choice(choice, track, args, video_start_utc, tz_offset,
+                        tz_known, camera, sequence, video_name):
+    """Turn a selected frame into a manifest/metadata record."""
+    point = choice.point or {}
+    pts = max(0.0, float(choice.pts))
+    captured_utc = (video_start_utc + dt.timedelta(seconds=pts)
+                    if video_start_utc is not None else None)
+    captured_local = (v2i.local_from_utc(captured_utc, tz_offset)
+                      if tz_known else None)
+    if args.time_base == "utc" and captured_utc is not None:
+        naming = captured_utc.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    else:
+        naming = captured_local
+        if naming is None and captured_utc is not None:
+            naming = captured_utc.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    if naming is None:
+        naming = dt.datetime(1970, 1, 1)
 
-    local = record.get("captured_local")
-    if local is not None:
-        stamped = v2i.exif_datetime(local)
-        tags += ["-DateTimeOriginal=" + stamped,
-                 "-CreateDate=" + stamped,
-                 "-ModifyDate=" + stamped,
-                 "-SubSecTimeOriginal=%03d" % (local.microsecond // 1000)]
-    if record.get("utc_offset_s") is not None:
-        tags.append("-OffsetTimeOriginal=" + v2i.offset_string(record["utc_offset_s"]))
-        tags.append("-OffsetTime=" + v2i.offset_string(record["utc_offset_s"]))
+    heading, heading_source = v2i.resolve_heading(
+        point, args.heading_offset, args.magnetic_declination)
+    accuracy, accuracy_estimated, accuracy_source = v2i.derive_accuracy(
+        point, args.uere)
+    course = point.get("course")
+    if course is None:
+        course = point.get("gps_course")
+    speed = point.get("speed")
+    if speed is None and point.get("speed2d") is not None:
+        speed = point["speed2d"]
 
-    if record.get("lat") is not None and record.get("lon") is not None:
-        tags += ["-GPSLatitude=%r" % record["lat"],
-                 "-GPSLongitude=%r" % record["lon"]]
-        if record.get("alt") is not None:
-            tags += ["-GPSAltitude=%r" % record["alt"],
-                     "-GPSAltitudeRef=%d" % (0 if record["alt"] >= 0 else 1)]
-        if record.get("speed") is not None:
-            tags += ["-GPSSpeed=%r" % (record["speed"] * 3.6), "-GPSSpeedRef=K"]
-        # The image direction includes --offset (camera optical axis vs. course);
-        # GPSTrack stays the raw course over ground.
-        if record.get("img_direction") is not None:
-            tags += ["-GPSImgDirection=%r" % record["img_direction"],
-                     "-GPSImgDirectionRef=T"]
-        if record.get("course") is not None:
-            tags += ["-GPSTrack=%r" % record["course"], "-GPSTrackRef=T"]
-
-    tags += ["-Make=Garmin", "-Model=VIRB Ultra 30",
-             "-Software=%s" % source["software"]]
-    if source.get("serial"):
-        tags += ["-SerialNumber=%s" % source["serial"],
-                 "-CameraSerialNumber=%s" % source["serial"]]
-
-    orient_text = ""
-    if source.get("orientation_deg") is not None:
-        orient_text = " | mount_orientation=%ddeg" % source["orientation_deg"]
-    fit_name = source.get("fit") or "none"
-    if source.get("fit_ref") and source["fit_ref"] != source.get("fit"):
-        fit_name += " (video references %s)" % source["fit_ref"]
-
-    comment = ("Garmin VIRB Ultra 30 via %s | video=%s | frame=%d | pts=%.3fs | "
-               "distance=%.2fm | heading_offset=%+gdeg | fit=%s%s"
-               % (SCRIPT_NAME, source["video"], record["frame"], record["pts"],
-                  record.get("distance") or 0.0, args.heading_offset, fit_name,
-                  orient_text))
-    tags += ["-ImageDescription=" + comment,
-             "-UserComment=" + comment,
-             "-XPComment=" + comment,
-             "-XMP:CreatorTool=" + SCRIPT_NAME,
-             "-XMP:Title=%s %s" % (source["video"],
-                                   local.strftime("%Y-%m-%d %H:%M:%S") if local else "")]
-
-    extra = {
-        "source_video": source["video"],
-        "fit_file": source.get("fit"),
-        "frame_index": record["frame"],
-        "pts_seconds": round(record["pts"], 3),
-        "distance_m": record.get("distance"),
-        "heading_offset_deg": args.heading_offset,
-        "camera_orientation_deg": source.get("orientation_deg"),
-        "grade_deg": record.get("grade"),
-        "utc": record["captured_utc"].isoformat() if record.get("captured_utc") else None,
+    filename = v2i.image_filename(naming, args.format)
+    return {
+        "sequence": sequence,
+        "video": video_name,
+        "camera": camera,
+        "image": filename,
+        "frame_index": int(choice.frame_index),
+        "pts_seconds": round(pts, 3),
+        "datetime_local": captured_local.isoformat() if captured_local else None,
+        "datetime_utc": v2i.fmt_utc(captured_utc),
+        "utc_offset_s": tz_offset if tz_known else None,
+        "latitude": point.get("lat"),
+        "longitude": point.get("lon"),
+        "altitude_m": point.get("alt"),
+        "speed_m_s": speed,
+        "course_deg": course,
+        "heading_deg": heading,
+        "heading_source": heading_source,
+        "img_direction_deg": heading,
+        "accuracy_m": accuracy,
+        "accuracy_estimated": accuracy_estimated,
+        "accuracy_source": accuracy_source,
+        "hdop": point.get("hdop"),
+        "vdop": point.get("vdop"),
+        "pdop": point.get("pdop"),
+        "distance_m": float(choice.target_distance),
+        "track_distance_m": point.get("distance"),
+        "position_source": point.get("position_source", "none"),
+        "clamped": bool(point.get("clamped")),
+        "estimated": bool(point.get("estimated")),
+        "naming_time": naming,
+        "point": point,
     }
-    tags += ["-XMP:Subject=%s" % json.dumps(extra, sort_keys=True).replace('"', "'"),
-             "-Keywords=virb;ultra30;garmin;streetview;mapillary;panoramax"]
-    return tags
 
 
-def write_sidecar(path, sequence, video_name, records, source, telemetry, args):
-    """Write a JSONL manifest describing every planned image of a sequence."""
+def _unpositioned_choices(timeline, interval, duration, max_images):
+    frames = v2i.select_time_grid_frames(
+        timeline, interval, duration=duration, max_images=max_images)
+    out = []
+    for index in frames:
+        pts = timeline.pts(index)
+        out.append(v2i.FrameChoice(
+            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
+            point={}, position_error=None, clamped=False, estimated=True))
+    return out
+
+
+def _write_sidecar(path, sequence, video_name, records, source, args):
     meta = {
         "generator": SCRIPT_NAME,
         "sequence": sequence,
         "source_video": video_name,
-        "fit_file": source.get("fit"),
         "camera": {
-            "make": "Garmin", "model": "VIRB Ultra 30",
+            "make": source.get("make"), "model": source.get("model"),
             "serial": source.get("serial"),
-            "software": source["software"],
-            "orientation_deg": source.get("orientation_deg"),
+            "software": source.get("software"),
         },
         "distance_interval_m": args.distance,
         "heading_offset_deg": args.heading_offset,
@@ -820,164 +837,84 @@ def write_sidecar(path, sequence, video_name, records, source, telemetry, args):
     with open(path, "w") as fh:
         fh.write(json.dumps({"_meta": meta}) + "\n")
         for record in records:
-            velocity = record.get("velocity") or [None, None, None]
-            fh.write(json.dumps({
-                "image": record["filename"],
-                "written": record.get("written", False),
-                "pts_seconds": round(record["pts"], 3),
-                "frame_index": record["frame"],
-                "datetime_local": (record["captured_local"].isoformat()
-                                   if record.get("captured_local") else None),
-                "datetime_utc": (record["captured_utc"].isoformat()
-                                 if record.get("captured_utc") else None),
-                "latitude": record.get("lat"),
-                "longitude": record.get("lon"),
-                "altitude_m": record.get("alt"),
-                "speed_m_s": record.get("speed"),
-                "course_deg": record.get("course"),
-                "image_direction_deg": record.get("img_direction"),
-                "grade_deg": record.get("grade"),
-                "distance_m": record.get("distance"),
-                "velocity_east_m_s": velocity[0],
-                "velocity_north_m_s": velocity[1],
-                "velocity_up_m_s": velocity[2],
-            }) + "\n")
+            row = {k: v for k, v in record.items() if k != "point"}
+            row.pop("naming_time", None)
+            fh.write(json.dumps(row) + "\n")
 
 
-# ===========================================================================
-# Per-video processing
-# ===========================================================================
-
-def resolve_utc_offset(args, telemetry):
-    """Camera UTC offset in seconds: explicit --timezone wins, else detected."""
-    offset = v2i.parse_timezone(getattr(args, "timezone", None))
-    if offset is not None:
-        return offset
-    if telemetry is not None:
-        return telemetry.local_utc_offset()
-    return None
+def _metadata_for(record, source, args, camera):
+    return v2i_metadata.FrameMetadata(
+        camera=v2i.CAMERA_LABELS[camera],
+        video=record["video"], sequence=record["sequence"],
+        frame_index=record["frame_index"], pts=record["pts_seconds"],
+        distance=record.get("distance_m"), script_name=SCRIPT_NAME,
+        make=source.get("make"), model=source.get("model"),
+        software=source.get("software"), serial=source.get("serial"),
+        captured_utc=v2i.parse_utc_timestamp(record.get("datetime_utc")),
+        captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
+                        if record.get("datetime_local") else None),
+        utc_offset_s=record.get("utc_offset_s"),
+        lat=record.get("latitude"), lon=record.get("longitude"),
+        alt=record.get("altitude_m"), speed=record.get("speed_m_s"),
+        course=record.get("course_deg"), img_direction=record.get("img_direction_deg"),
+        heading_source=record.get("heading_source", "none"),
+        accuracy=record.get("accuracy_m"),
+        accuracy_estimated=record.get("accuracy_estimated", False),
+        accuracy_source=record.get("accuracy_source"),
+        hdop=record.get("hdop"), vdop=record.get("vdop"),
+        pdop=record.get("pdop"),
+        position_source=record.get("position_source"),
+        clamped=record.get("clamped"), estimated=record.get("estimated"),
+        keywords=v2i.parse_keywords(getattr(args, "keywords", None)),
+        extra={"fit": source.get("fit"),
+               "camera_orientation_deg": source.get("orientation_deg")},
+    )
 
 
 def choose_segment(telemetry, created_local, duration, tz_offset):
-    """Pick the video segment this MP4 corresponds to.
+    """Pick the FIT camera-event segment that belongs to *video*.
 
-    Returns (start_fit, end_fit) or (None, None).
+    Garmin writes several videos into one FIT file.  The container's
+    creation_time is camera-local wall clock, so the segment whose local start
+    is closest to it wins; if that is unavailable the segment with the closest
+    duration is used.  Returns ``(start_fit_s, end_fit_s)`` (either may be
+    ``None`` only when no camera events exist).
     """
     segments = telemetry.segments()
-    if segments:
+    if not segments:
+        start = telemetry.samples[0]["t"] if telemetry.samples else None
+        end = start + duration if start is not None and duration else None
+        return start, end
+
+    best = None
+    best_score = None
+    for segment in segments:
+        start = segment.get("start")
+        end = segment.get("end")
+        if start is None:
+            continue
+        score = None
         if created_local is not None:
-            best = None
-            for segment in segments:
-                local = telemetry.local_time_of(segment["start"], tz_offset)
-                if local is None:
-                    continue
-                delta = abs((local - created_local).total_seconds())
-                if best is None or delta < best[0]:
-                    best = (delta, segment)
-            if best is not None and best[0] < 43200.0:
-                return best[1]["start"], best[1]["end"]
-        return segments[0]["start"], segments[0]["end"]
-
-    # No camera events: align the video start to the nearest GPS sample.
-    samples = telemetry.samples
-    if not samples:
-        return None, None
-    if created_local is not None and tz_offset is not None:
-        target_utc = created_local.replace(tzinfo=dt.timezone.utc) - \
-            dt.timedelta(seconds=tz_offset)
-        best = None
-        for sample in samples:
-            utc = telemetry.utc_of(sample["fit_s"])
-            if utc is None:
-                continue
-            delta = abs((utc - target_utc).total_seconds())
-            if best is None or delta < best[0]:
-                best = (delta, sample)
-        if best is not None:
-            start = best[1]["fit_s"]
-            end = start + duration if duration else samples[-1]["t"]
-            return start, end
-    return samples[0]["fit_s"], samples[-1]["t"]
-
-
-def build_records(shots, info, args, video_start_fit, video_start_local,
-                  video_start_utc, tz_offset):
-    """Turn planned shots into capture records with names and times."""
-    fps = info["fps"] or 0.0
-    records = []
-    for counter, shot in enumerate(shots, start=1):
-        if shot.get("t") is not None and video_start_fit is not None:
-            pts = shot["t"] - video_start_fit
-        else:
-            pts = shot.get("pts") or 0.0
-        pts = max(0.0, pts)
-        if fps:
-            frame = max(0, int(round(pts * fps)))
-            if info.get("frames"):
-                # The last shot can land exactly on the video end; frame
-                # indices are zero-based, so never ask for the frame after it.
-                frame = min(frame, info["frames"] - 1)
-            pts = frame / fps
-        else:
-            frame = 0
-
-        captured_local = None
-        if video_start_local is not None:
-            captured_local = video_start_local + dt.timedelta(seconds=pts)
-        captured_utc = None
-        if video_start_utc is not None:
-            captured_utc = (video_start_utc + dt.timedelta(seconds=pts)).replace(tzinfo=None)
-
-        if args.time_base == "utc" and captured_utc is not None:
-            naming = captured_utc
-        else:
-            naming = captured_local if captured_local is not None else captured_utc
-        if naming is None:
-            naming = dt.datetime(1970, 1, 1)
-
-        stamp = naming.strftime("%Y-%m-%d_%H-%M-%S") + \
-            "-%03d" % (naming.microsecond // 1000)
-        filename = "%s_%06d.%s" % (stamp, counter, args.format)
-
-        course = shot.get("heading")
-        img_direction = None
-        if course is not None:
-            img_direction = (course + args.heading_offset) % 360.0
-
-        records.append({
-            "pts": pts,
-            "frame": frame,
-            "distance": shot.get("distance"),
-            "lat": shot.get("lat"),
-            "lon": shot.get("lon"),
-            "alt": shot.get("alt"),
-            "speed": shot.get("speed"),
-            "course": course,
-            "img_direction": img_direction,
-            "grade": shot.get("grade"),
-            "velocity": shot.get("velocity"),
-            "captured_local": captured_local,
-            "captured_utc": captured_utc,
-            "utc_offset_s": tz_offset,
-            "date": naming.strftime("%Y-%m-%d"),
-            "filename": filename,
-        })
-    return records
-
-
-def time_grid_shots(duration, interval):
-    """Fallback shot list when no usable telemetry exists."""
-    shots = []
-    if not duration or interval <= 0:
-        return shots
-    count = int(duration / interval) + 1
-    for index in range(count):
-        shots.append({
-            "pts": index * interval, "t": None, "distance": index * interval,
-            "lat": None, "lon": None, "alt": None, "speed": None,
-            "heading": None, "grade": None, "velocity": None,
-        })
-    return shots
+            utc = telemetry.utc_of(start)
+            if utc is not None:
+                local = v2i.local_from_utc(utc, tz_offset)
+                if local is not None:
+                    score = abs((local - created_local).total_seconds())
+        if score is None and duration:
+            length = ((end - start) if end is not None else duration)
+            score = abs(length - duration)
+        if score is None:
+            score = 0.0
+        if best_score is None or score < best_score:
+            best, best_score = segment, score
+    if best is None:
+        start = telemetry.samples[0]["t"] if telemetry.samples else None
+        return start, (start + duration if start is not None and duration else None)
+    start = best.get("start")
+    end = best.get("end")
+    if end is None and duration:
+        end = start + duration
+    return start, end
 
 
 def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
@@ -990,6 +927,11 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
     LOG.info("  video: %sx%s %s %.3f fps, %s frames, %.2f s",
              info["width"], info["height"], info["codec"], info["fps"],
              info["frames"], info["duration"] or 0.0)
+    timeline = v2i.probe_frame_timeline(
+        video, fps_hint=info["fps"], frame_count_hint=info["frames"],
+        duration_hint=info["duration"], logger=LOG)
+    LOG.info("  frame timeline: %d frame(s), source=%s",
+             len(timeline), timeline.source)
 
     atoms = read_mp4_atoms(video)
     if atoms.get("fit_reference"):
@@ -1022,9 +964,13 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
         fit_path = None
         LOG.warning("  no usable FIT telemetry for this video")
 
-    tz_offset = resolve_utc_offset(args, telemetry)
-    if tz_offset is not None:
+    detected_offset = telemetry.local_utc_offset() if telemetry else None
+    tz_offset, tz_known = v2i.resolve_timezone(
+        args, detected_offset, camera=v2i.CAMERA_VIRB, logger=LOG)
+    if tz_known:
         LOG.info("  camera-local time offset: %s", v2i.offset_string(tz_offset))
+    else:
+        LOG.warning("  camera-local offset unknown; using UTC")
 
     # ---- align video and telemetry ---------------------------------------
     video_start_fit = None
@@ -1035,26 +981,20 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
             telemetry, created_local, duration, tz_offset)
         if video_start_fit is not None:
             LOG.info("  video starts at FIT t=%.3f s", video_start_fit)
-        if video_end_fit is not None:
-            LOG.info("  video segment ends at FIT t=%.3f s", video_end_fit)
 
-    video_start_utc = telemetry.utc_of(video_start_fit) if (telemetry and video_start_fit is not None) else None
-    video_start_local = None
-    if video_start_utc is not None and tz_offset is not None:
-        video_start_local = (video_start_utc + dt.timedelta(seconds=tz_offset)).replace(tzinfo=None)
-    elif video_start_utc is not None:
-        video_start_local = video_start_utc.replace(tzinfo=None)
-    elif created_local is not None:
-        video_start_local = created_local
-        if tz_offset is not None:
-            video_start_utc = created_local.replace(tzinfo=dt.timezone.utc) - \
-                dt.timedelta(seconds=tz_offset)
-    if video_start_local is not None:
-        LOG.info("  video start (local): %s", video_start_local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
+    video_start_utc = (telemetry.utc_of(video_start_fit)
+                       if telemetry and video_start_fit is not None else None)
+    if video_start_utc is None and created_local is not None:
+        # Garmin writes local wall clock in creation_time; use it as a last
+        # resort but never consult the host timezone.
+        video_start_utc = (created_local.replace(tzinfo=dt.timezone.utc)
+                           - dt.timedelta(seconds=tz_offset if tz_known else 0))
+    if video_start_utc is not None:
+        LOG.info("  video start (UTC): %s", v2i.fmt_utc(video_start_utc))
 
-    # ---- plan the distance-sampled shots ---------------------------------
-    shots = []
+    # ---- build the time-indexed track ------------------------------------
     track = None
+    samples = []
     if telemetry is not None and video_start_fit is not None:
         t_end = None
         if duration:
@@ -1065,42 +1005,40 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
             t_end = telemetry.samples[-1]["t"]
         if video_end_fit is not None:
             t_end = min(t_end, video_end_fit) if duration else video_end_fit
-        samples = telemetry.sample_window(video_start_fit, t_end)
+        for sample in telemetry.sample_window(video_start_fit, t_end):
+            item = dict(sample)
+            item["t"] = sample["t"] - video_start_fit
+            item["utc"] = telemetry.utc_of(sample["fit_s"])
+            v2i.apply_accuracy(item, args.uere)
+            samples.append(item)
         if samples:
-            track = Track(samples, args.distance_mode)
-            shots = plan_shots(track, args.distance,
-                               start_distance=args.start_distance,
-                               max_shots=args.max_images)
-            LOG.info("  %d capture point(s) every %g m over %.0f m of travel",
-                     len(shots), args.distance, track.length)
-            odometer = telemetry.odometer_window(video_start_fit, t_end)
-            if odometer:
-                LOG.debug("  accuracy check: walked %.1f m vs odometer %.1f m (%+.1f%%)",
-                          track.length, odometer,
-                          100.0 * (track.length / odometer - 1.0))
-        else:
-            LOG.warning("  no GPS samples inside the video window")
+            track = v2i.Track(samples, args.distance_mode)
+            LOG.info("  track: %d sample(s), %.0f m of travel",
+                     len(samples), track.length)
 
-    if not shots:
+    choices = []
+    skipped = []
+    if track is not None and track.samples:
+        choices, skipped = v2i.select_unique_frames(
+            track, timeline, args.distance,
+            start_distance=args.start_distance,
+            max_position_error=args.max_position_error,
+            max_images=args.max_images, mode=args.distance_mode, logger=LOG)
+        if skipped:
+            LOG.info("  skipped %d target(s) with no acceptable unused frame",
+                     len(skipped))
+
+    if not choices:
         if args.fallback_interval > 0 and duration:
-            shots = time_grid_shots(duration, args.fallback_interval)
+            choices = _unpositioned_choices(
+                timeline, args.fallback_interval, duration, args.max_images)
             LOG.warning("  falling back to a %g s time grid (%d images, no position)",
-                        args.fallback_interval, len(shots))
+                        args.fallback_interval, len(choices))
         else:
             LOG.error("  no distance-based capture points; skipping this video")
             return {"video": name, "sequence": sequence, "images": 0,
                     "planned": 0, "skipped": 0, "failed": True}
 
-    records = build_records(shots, info, args, video_start_fit,
-                            video_start_local, video_start_utc, tz_offset)
-    dates = sorted({r["date"] for r in records})
-    if len(dates) > 1:
-        LOG.warning("  recording spans %d calendar days (%s); each image is filed "
-                    "under its own capture date", len(dates), ", ".join(dates))
-    else:
-        LOG.info("  capture date: %s", dates[0])
-
-    # ---- firmware / source info ------------------------------------------
     firmware = None
     if telemetry is not None and telemetry.device.get("software_raw"):
         firmware = "%.2f" % (telemetry.device["software_raw"] / 100.0)
@@ -1112,83 +1050,103 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
         "video": name,
         "fit": os.path.basename(fit_path) if fit_path else None,
         "fit_ref": fit_ref,
+        "make": "Garmin",
+        "model": "VIRB Ultra 30",
         "serial": telemetry.device.get("serial") if telemetry else None,
         "software": "VIRB Ultra 30 FW %s" % (firmware or "unknown"),
         "orientation_deg": telemetry.camera_orientation() if telemetry else None,
-        "utc_offset_s": tz_offset,
+        "utc_offset_s": tz_offset if tz_known else None,
     }
-    if source["orientation_deg"] is not None:
-        LOG.info("  camera mount orientation: %d degrees", source["orientation_deg"])
 
-    # ---- plan output paths -----------------------------------------------
+    records = []
+    for choice in choices:
+        point = choice.point if choice.point else {}
+        if not point and track is not None:
+            point = track.at_time(choice.pts)
+            choice.point = point
+        records.append(_record_from_choice(
+            choice, track, args, video_start_utc, tz_offset, tz_known,
+            v2i.CAMERA_VIRB, sequence, name))
+
+    first_time = records[0]["naming_time"]
+    sequence_dir = v2i.sequence_output_dir(
+        output_dir, v2i.CAMERA_VIRB, sequence, first_time)
+    used_paths = set()
     for record in records:
-        record["path"] = os.path.join(output_dir, record["date"], sequence,
-                                      record["filename"])
+        record["path"] = v2i.unique_path(
+            os.path.join(sequence_dir, record["image"]), used_paths)
+        record["image"] = os.path.basename(record["path"])
 
+    LOG.info("  %d capture point(s) -> %s", len(records), sequence_dir)
     if args.dry_run:
         LOG.info("  dry run: %d image(s) would be written", len(records))
         return {"video": name, "sequence": sequence, "images": 0,
-                "planned": len(records), "skipped": 0,
-                "dir": os.path.join(output_dir, records[0]["date"], sequence)}
+                "planned": len(records), "skipped": 0, "dir": sequence_dir}
 
-    # ---- extract ----------------------------------------------------------
     to_extract = []
-    skipped = 0
-    for index, record in enumerate(records, start=1):
+    skipped_existing = 0
+    for record in records:
         if os.path.exists(record["path"]) and not args.overwrite:
-            LOG.debug("  exists, skipping: %s", record["filename"])
-            skipped += 1
+            LOG.debug("  exists, skipping: %s", record["image"])
+            skipped_existing += 1
             continue
-        to_extract.append({"index": index, "pts": record["pts"],
-                           "dest": record["path"], "record": record})
+        to_extract.append(record)
 
     written_paths = []
+    failed_frames = []
     temp_dir = tempfile.mkdtemp(prefix="virb30_")
     try:
-        jobs = [{"index": job["index"], "pts": job["pts"]} for job in to_extract]
-        extracted = v2i.extract_frames(
-            video, jobs, temp_dir, image_format=args.format,
-            quality=args.quality, workers=args.workers, fps=info["fps"],
-            threads=args.threads)
-        for job in to_extract:
-            temp_path = extracted.get(job["index"])
+        extracted = v2i.extract_frames_by_index(
+            video, [r["frame_index"] for r in to_extract], temp_dir,
+            image_format=args.format, quality=args.quality,
+            workers=args.workers, threads=args.threads)
+        for record in to_extract:
+            temp_path = extracted.get(record["frame_index"])
             if not temp_path:
+                failed_frames.append(record["frame_index"])
                 continue
-            dest = job["dest"]
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            shutil.copyfile(temp_path, dest)
-            job["record"]["written"] = True
-            written_paths.append(dest)
+            os.makedirs(os.path.dirname(record["path"]), exist_ok=True)
+            shutil.copyfile(temp_path, record["path"])
+            record["written"] = True
+            written_paths.append(record["path"])
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    LOG.info("  wrote %d image(s), skipped %d existing", len(written_paths), skipped)
+    if (args.start_distance == 0 and records
+            and records[0]["frame_index"] == 0
+            and records[0]["frame_index"] in failed_frames):
+        LOG.error("  first frame (index 0) could not be extracted; failing %s",
+                  name)
+        return {"video": name, "sequence": sequence, "images": 0,
+                "planned": len(records), "skipped": skipped_existing,
+                "failed": True, "dir": sequence_dir}
+
+    LOG.info("  wrote %d image(s), skipped %d existing%s",
+             len(written_paths), skipped_existing,
+             (", %d failed" % len(failed_frames)) if failed_frames else "")
 
     if have_exiftool and not args.no_exif and written_paths:
-        pairs = [(record["path"], build_metadata_args(record, source, args))
-                 for record in records if record.get("written")]
+        pairs = [(record["path"], v2i_metadata.build_exiftool_args(
+            _metadata_for(record, source, args, v2i.CAMERA_VIRB)))
+            for record in records if record.get("written")]
         v2i.write_metadata(pairs)
 
+    export_samples = (track.samples if track is not None else [])
+    v2i.export_track_files(
+        sequence_dir, sequence, export_samples, records,
+        track_export=args.track_export, camera=v2i.CAMERA_VIRB, video=name)
+
     if args.sidecars:
-        sidecar = os.path.join(output_dir, records[0]["date"], sequence,
-                               "%s.track.jsonl" % sequence)
-        os.makedirs(os.path.dirname(sidecar), exist_ok=True)
-        write_sidecar(sidecar, sequence, name, records, source, telemetry, args)
+        os.makedirs(sequence_dir, exist_ok=True)
+        _write_sidecar(os.path.join(sequence_dir, sequence + ".track.jsonl"),
+                       sequence, name, records, source, args)
 
-    entries = [{
-        "video": name, "sequence": sequence, "image": record["filename"],
-        "path": record["path"], "latitude": record.get("lat"),
-        "longitude": record.get("lon"), "altitude_m": record.get("alt"),
-        "distance_m": record.get("distance"),
-        "datetime_local": (record["captured_local"].isoformat()
-                           if record.get("captured_local") else None),
-        "datetime_utc": (record["captured_utc"].isoformat()
-                         if record.get("captured_utc") else None),
-    } for record in records if record.get("written")]
-
+    entries = [{k: v for k, v in record.items()
+                if k not in ("point", "naming_time")}
+               for record in records if record.get("written")]
     return {"video": name, "sequence": sequence, "images": len(written_paths),
-            "planned": len(records), "skipped": skipped, "entries": entries,
-            "dir": os.path.join(output_dir, records[0]["date"], sequence)}
+            "planned": len(records), "skipped": skipped_existing,
+            "entries": entries, "dir": sequence_dir}
 
 
 # ===========================================================================

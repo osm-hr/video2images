@@ -1,499 +1,360 @@
 #!/usr/bin/env python3
-"""max360-v2i - extract geotagged equirectangular still images from
-GoPro MAX ``.360`` videos at a fixed GPS distance interval.
+# -*- coding: utf-8 -*-
+"""max360-v2i.py -- extract geotagged equirectangular stills from GoPro MAX.
 
-This is a single, self-contained script.  Copy it to any machine that has
-``ffmpeg``/``ffprobe`` and ``exiftool`` on ``PATH`` and run it directly::
+GoPro MAX ``.360`` files store immersive video as two Equi-Angular Cubemap
+(EAC) hemisphere tracks.  This tool stitches the six 1344-pixel faces back into
+one 4032x2688 EAC frame and reprojects it with ffmpeg's ``v360`` filter.  It
+walks the embedded GPMF GPS track and writes a unique frame every
+``--distance`` metres with EXIF/XMP-GPano metadata and GPX/GeoJSON tracks.
 
-    ./max360-v2i.py -i video/ -o images/ -d 5
-
-``--input`` (also ``-i``) may be a single ``.360`` file or a directory.  Every
-candidate file is inspected first: only files recorded by a GoPro MAX are
-processed, and anything else (a Garmin VIRB MP4, a BlackVue clip, an
-unreadable file, ...) is skipped with a logged reason, so a folder holding
-several cameras' footage can be handed over safely.
-
-Only the Python standard library is used (Python >= 3.8); there is nothing to
-``pip install``.  The shared command-line options live in ``v2i_common.py``.
-
-The file is laid out as one section per concern, in dependency order:
-
-    1. geodesy   - spherical-earth distance / bearing helpers
-    2. gpmf      - dependency-free GoPro GPMF (KLV) telemetry reader
-    3. gps       - GPMF -> time-stamped, distance-annotated GPS track
-    4. ffmpeg    - all ffmpeg/ffprobe interaction (EAC stitch + v360 reproject)
-    5. metadata  - EXIF / XMP-GPano tags written with exiftool
-    6. cli       - argument parsing and orchestration
+Only Python's standard library is used.  ``ffmpeg``, ``ffprobe`` and
+``exiftool`` must be on ``PATH``; the optional ``max2sphere`` backend is used
+only when explicitly requested (or as an ``auto`` fallback when ffmpeg is
+missing).
 """
+
 from __future__ import annotations
 
-__version__ = "1.0.0"
-
 import argparse
-import datetime as _dt
+import datetime as dt
+import glob
 import json
 import logging
 import math
 import os
 import shutil
 import statistics
-import struct
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Sequence, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import v2i_common as v2i
+import v2i_gpmf
+import v2i_metadata
 
+SCRIPT_NAME = os.path.basename(os.path.realpath(__file__))
 LOG = logging.getLogger("max360-v2i")
 
+FFMPEG = os.environ.get("MAX360_FFMPEG", "ffmpeg")
+FFPROBE = os.environ.get("MAX360_FFPROBE", "ffprobe")
+EXIFTOOL = "exiftool"
 
-# =============================================================================
-# 1. Geodesy - spherical-earth helpers (no external dependencies)
-# =============================================================================
-# Distances use the haversine great-circle formula on a spherical earth.
-# This is accurate to better than ~0.5 % versus WGS-84 ellipsoidal distances
-# at the scales involved here (a few metres to a few kilometres), which is
-# well below the accuracy of consumer GPS / GoPro GPMF positioning.
-
-# IUGG mean earth radius (metres).
-EARTH_RADIUS_M = 6_371_008.8
+HEMI_W, HEMI_H = 4096, 1344
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 5376, 2688
 
 
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two WGS-84 coordinates, in metres."""
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2.0) ** 2
-         + math.cos(p1) * math.cos(p2) * math.sin(dlam / 2.0) ** 2)
-    return 2.0 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a)))
+class Fatal(Exception):
+    """A problem that stops the current file."""
 
 
-def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Initial great-circle bearing (course over ground) from point 1 to 2.
-
-    Returned as degrees clockwise from true north in [0, 360).
-    """
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlam = math.radians(lon2 - lon1)
-    y = math.sin(dlam) * math.cos(p2)
-    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlam)
-    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+class BackendError(Fatal):
+    """ffmpeg/ffprobe/max2sphere failure."""
 
 
-# =============================================================================
-# 2. GPMF - a small, dependency-free reader for GoPro "GoPro Metadata Format"
-# =============================================================================
-# GPMF is the telemetry container carried in the ``gpmd`` track of GoPro MP4 /
-# .360 files.  It is a nested key-length-value (KLV) structure.  Every element
-# starts with an 8-byte header::
-#
-#     key      : 4 x ASCII characters (FourCC)
-#     type     : 1 byte  (see TYPE_* below)
-#     size     : 1 byte  (number of bytes in a single sample)
-#     repeat   : 2 bytes big-endian (number of samples)
-#
-# Payload length is ``size * repeat`` bytes, padded to a 4-byte boundary.
-# Elements whose type is ``0x00`` (``NEST``) are containers: their ``repeat``
-# field holds the byte length of the nested payload instead of a sample count.
-#
-# Reference: https://github.com/gopro/gpmf-parser (GPMF_common.h).
-
-# --- Type tags (subset that matters here) ------------------------------------
-TYPE_STRING = ord('c')       # ASCII string / int8
-TYPE_INT8 = ord('b')
-TYPE_UINT8 = ord('B')
-TYPE_INT16 = ord('s')
-TYPE_UINT16 = ord('S')
-TYPE_INT32 = ord('l')
-TYPE_UINT32 = ord('L')
-TYPE_INT64 = ord('j')
-TYPE_UINT64 = ord('J')
-TYPE_FLOAT = ord('f')
-TYPE_DOUBLE = ord('d')
-TYPE_Q15_16 = ord('q')       # fixed point, scale 2**-16
-TYPE_Q31_32 = ord('Q')       # fixed point, scale 2**-32
-TYPE_FOURCC = ord('F')
-TYPE_UTC = ord('U')
-TYPE_UTF8 = ord('u')
-TYPE_GUID = ord('G')
-TYPE_COMPLEX = ord('?')
-TYPE_COMPRESSED = ord('#')   # Huffman-compressed stream payload
-TYPE_NEST = 0x00
-
-# type byte -> (struct format char, element size in bytes)
-_NUMERIC = {
-    TYPE_INT8: ('b', 1), TYPE_UINT8: ('B', 1),
-    TYPE_INT16: ('h', 2), TYPE_UINT16: ('H', 2),
-    TYPE_INT32: ('i', 4), TYPE_UINT32: ('I', 4),
-    TYPE_INT64: ('q', 8), TYPE_UINT64: ('Q', 8),
-    TYPE_FLOAT: ('f', 4), TYPE_DOUBLE: ('d', 8),
-    TYPE_Q15_16: ('i', 4), TYPE_Q31_32: ('q', 8),
-}
-_BYTES = {TYPE_STRING, TYPE_FOURCC, TYPE_UTC, TYPE_UTF8, TYPE_GUID,
-          TYPE_COMPLEX, TYPE_COMPRESSED}
-
-_KNOWN_BYTES = set(_NUMERIC) | _BYTES | {TYPE_NEST}
-
-
-class GpmfError(Exception):
-    """Raised when the GPMF stream cannot be parsed."""
-
-
+# ---------------------------------------------------------------------------
+# Probing
+# ---------------------------------------------------------------------------
 @dataclass
-class Element:
-    level: int          # nesting depth (0 = top level / device container)
-    key: str            # FourCC as text
-    typ: int            # type byte
-    struct_size: int    # bytes per sample
-    repeat: int         # number of samples (or payload bytes for NEST)
-    offset: int         # offset of the payload inside the buffer
-    length: int         # payload length in bytes (before 4-byte padding)
-
-    @property
-    def end(self) -> int:
-        return self.offset + self.length
-
-    @property
-    def type_char(self) -> str:
-        return chr(self.typ) if 32 <= self.typ < 127 else f"\\x{self.typ:02x}"
-
-    @property
-    def is_compressed(self) -> bool:
-        return self.typ == TYPE_COMPRESSED
+class VideoInfo:
+    path: str
+    duration: float
+    fps: float
+    frame_count: int
+    video_ordinals: Dict[int, int]      # absolute index -> v:N ordinal
+    hemi_a: int                         # absolute stream index
+    hemi_b: Optional[int]
+    gpmd: Optional[int]
+    width: int                          # native hemisphere width
+    height: int                         # native hemisphere height
+    creation_time: Optional[dt.datetime]
+    already_equirect: bool = False
+    firmware: Optional[str] = None
+    make: str = "GoPro"
+    model: str = "GoPro Max"
+    serial: Optional[str] = None
 
 
-def iter_elements(buf: bytes, start: int = 0, end: Optional[int] = None,
-                  level: int = 0) -> Iterator[Element]:
-    """Yield every GPMF element in ``buf`` in document (pre-)order."""
-    if end is None:
-        end = len(buf)
-    pos = start
-    while pos + 8 <= end:
-        key = buf[pos:pos + 4]
-        typ = buf[pos + 4]
-        struct_size = buf[pos + 5]
-        repeat = struct.unpack_from(">H", buf, pos + 6)[0]
+def _parse_rate(rate) -> float:
+    if not rate:
+        return 0.0
+    text = str(rate)
+    if "/" in text:
+        try:
+            num, den = text.split("/", 1)
+            return float(num) / float(den) if float(den) else 0.0
+        except ValueError:
+            return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
 
-        # 4x zero bytes = padding / end marker.
-        if key == b"\x00\x00\x00\x00":
-            pos += 4
-            continue
 
-        if typ not in _KNOWN_BYTES:
-            # Unknown type: stop parsing this level rather than desync.
-            raise GpmfError(
-                f"unknown GPMF type 0x{typ:02x} for key "
-                f"{key.decode('ascii', 'replace')!r} at offset {pos}")
+def _frame_count(stream: dict, duration: float, fps: float) -> int:
+    try:
+        count = int(stream.get("nb_frames"))
+        if count > 0:
+            return count
+    except (TypeError, ValueError):
+        pass
+    return max(1, int(round(duration * fps))) if duration and fps else 1
 
-        if typ == TYPE_NEST:
-            payload_len = repeat
-            yield Element(level, key.decode('ascii', 'replace'), typ,
-                          struct_size, repeat, pos + 8, payload_len)
-            yield from iter_elements(buf, pos + 8, pos + 8 + payload_len,
-                                     level + 1)
+
+def probe(path: str) -> VideoInfo:
+    """Inspect a GoPro MAX file and describe its hemisphere/telemetry layout."""
+    meta = v2i.probe_metadata(path, FFPROBE)
+    videos = meta.video_streams_info()
+    if not videos:
+        raise BackendError("%s: no video stream" % os.path.basename(path))
+    fmt_duration = meta.duration or 0.0
+    creation = v2i.parse_utc_timestamp(meta.creation_time)
+
+    if len(videos) >= 2:
+        # Prefer the largest pair of equally-sized video streams; sorted by
+        # absolute index so the top hemisphere comes first.
+        pairs = []
+        for i in range(len(videos)):
+            for j in range(i + 1, len(videos)):
+                a, b = videos[i], videos[j]
+                if (a.get("width") == b.get("width")
+                        and a.get("height") == b.get("height")):
+                    area = int(a.get("width") or 0) * int(a.get("height") or 0)
+                    pairs.append((area, a, b))
+        if not pairs:
+            raise BackendError(
+                "%s: found %d video streams but no matching EAC hemisphere pair"
+                % (os.path.basename(path), len(videos)))
+        _area, hemi_a, hemi_b = max(pairs, key=lambda item: item[0])
+        if hemi_a.get("index", 0) > hemi_b.get("index", 0):
+            hemi_a, hemi_b = hemi_b, hemi_a
+        width = int(hemi_a.get("width") or HEMI_W)
+        height = int(hemi_a.get("height") or HEMI_H)
+        fps = _parse_rate(hemi_a.get("avg_frame_rate")
+                          or hemi_a.get("r_frame_rate")) or 30000.0 / 1001.0
+        duration = float(hemi_a.get("duration") or fmt_duration or 0.0)
+        count_a = _frame_count(hemi_a, duration, fps)
+        count_b = _frame_count(hemi_b, duration, fps)
+        frame_count = min(count_a, count_b)
+        a_idx, b_idx = int(hemi_a["index"]), int(hemi_b["index"])
+        already = False
+    elif len(videos) == 1:
+        stream = videos[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        aspect = (width / height) if height else 0.0
+        if aspect < 1.85:
+            raise BackendError(
+                "%s: one %dx%d video stream is not an EAC hemisphere pair or "
+                "an equirectangular frame" % (os.path.basename(path), width,
+                                              height))
+        hemi_a = int(stream["index"])
+        hemi_b = None
+        fps = _parse_rate(stream.get("avg_frame_rate")
+                          or stream.get("r_frame_rate")) or 30000.0 / 1001.0
+        duration = float(stream.get("duration") or fmt_duration or 0.0)
+        frame_count = _frame_count(stream, duration, fps)
+        a_idx, b_idx = hemi_a, None
+        already = True
+    else:
+        raise BackendError("%s: no video stream" % os.path.basename(path))
+
+    ordinals = {}
+    for ordinal, stream in enumerate(videos):
+        try:
+            ordinals[int(stream["index"])] = ordinal
+        except (KeyError, TypeError, ValueError):
+            pass
+    return VideoInfo(
+        path=path, duration=duration, fps=fps, frame_count=frame_count,
+        video_ordinals=ordinals, hemi_a=a_idx, hemi_b=b_idx, gpmd=meta.gpmd_index,
+        width=width, height=height, creation_time=creation,
+        already_equirect=already,
+        firmware=meta.format_tags.get("firmware"),
+        serial=meta.format_tags.get("serial_number") or meta.format_tags.get("serial"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# EAC stitching filter
+# ---------------------------------------------------------------------------
+def build_eac_filter(a: int, b: Optional[int], width: int, height: int,
+                     select: Optional[str] = None,
+                     interp: str = "cubic",
+                     already_equirect: bool = False) -> str:
+    """Build the ffmpeg filter graph for one EAC hemisphere pair.
+
+    Each native 4096x1344 hemisphere contains three 1344-wide faces at x=0,
+    x=1376 and x=2752 with 32-pixel gaps.  The gaps are dropped, the three
+    faces are hstacked to 4032 pixels, the two hemispheres are vstacked to
+    4032x2688, and v360 reprojects EAC -> equirectangular.
+    """
+    lines: List[str] = []
+    if already_equirect:
+        if select:
+            lines.append("[0:%d]select='%s'[src]" % (a, select))
         else:
-            payload_len = struct_size * repeat
-            yield Element(level, key.decode('ascii', 'replace'), typ,
-                          struct_size, repeat, pos + 8, payload_len)
+            lines.append("[0:%d]null[src]" % a)
+        lines.append("[src]scale=%d:%d[OUT]" % (width, height))
+        return ";\n".join(lines)
 
-        pos += 8 + payload_len
-        pos = (pos + 3) & ~3  # elements are 4-byte aligned
+    if b is None:
+        raise BackendError("EAC stitching needs two hemisphere streams")
+    if select:
+        lines.append("[0:%d]select='%s'[ain]" % (a, select))
+        lines.append("[0:%d]select='%s'[bin]" % (b, select))
+    else:
+        lines.append("[0:%d]null[ain]" % a)
+        lines.append("[0:%d]null[bin]" % b)
 
-
-def decode(buf: bytes, elem: Element) -> Union[List, bytes]:
-    """Decode an element's payload.
-
-    Numeric types return a list of numbers; string/fourcc/UTC/GUID types
-    return raw ``bytes``.  Compressed payloads return ``b""`` (unsupported).
-    """
-    data = buf[elem.offset:elem.end]
-    if elem.typ in _BYTES:
-        return b"" if elem.typ == TYPE_COMPRESSED else data
-    fmt, esz = _NUMERIC[elem.typ]
-    n = elem.length // esz
-    return list(struct.unpack(">" + fmt * n, data[:n * esz]))
-
-
-def as_text(buf: bytes, elem: Element) -> str:
-    """Return a decoded element as a NUL-trimmed ASCII string."""
-    raw = buf[elem.offset:elem.end]
-    return raw.split(b"\x00", 1)[0].decode("ascii", "replace")
-
-
-def scaled(values: List[float], scale: Optional[List[float]]) -> List[float]:
-    """Apply a GPMF SCAL divisor per position (``value / scale``)."""
-    if not scale:
-        return list(values)
-    out = []
-    for i, v in enumerate(values):
-        s = scale[i % len(scale)]
-        out.append(v / s if s else v)
-    return out
+    for tag, source in (("A", "[ain]"), ("B", "[bin]")):
+        lines.append("%ssplit=3[%s0][%s1][%s2]" % (source, tag, tag, tag))
+        for face, x in enumerate((0, 1376, 2752)):
+            lines.append(
+                "[%s%d]crop=1344:1344:%d:0,format=yuv420p[%sF%d]"
+                % (tag, face, x, tag, face))
+        lines.append("[%sF0][%sF1][%sF2]hstack=inputs=3[%sROW]"
+                     % (tag, tag, tag, tag))
+    lines.append("[AROW][BROW]vstack=inputs=2[eac]")
+    lines.append("[eac]v360=eac:equirect:interp=%s:w=%d:h=%d[OUT]"
+                 % (interp, width, height))
+    return ";\n".join(lines)
 
 
-# =============================================================================
-# 3. GPS - turn raw GPMF bytes into a time-stamped, distance-annotated track
-# =============================================================================
-# The GoPro ``GPS5`` stream carries latitude, longitude, altitude, 2-D speed
-# and 3-D speed at ~18 Hz (18 or 19 samples per one-second GPMF block).  Each
-# block also carries a ``GPSU`` UTC timestamp and a ``STMP`` microsecond clock
-# reading for its first sample.
-#
-# Timestamps
-# ----------
-# ``GPSU`` is the absolute UTC time but is only emitted once per block and is
-# occasionally stale (e.g. the very first block after a cold start).  ``STMP``
-# is a smooth, monotonic microsecond clock.  For every block we therefore
-# compute ``offset = GPSU_epoch_us - STMP_us`` and take the *median* offset as
-# the clock correction, which rejects the occasional stale ``GPSU`` while
-# keeping sub-100 ms absolute accuracy.  A sample's time is then
-# ``STMP_sample + median_offset``.
-#
-# Distance
-# --------
-# Latitude/longitude are lightly smoothed with a moving average to remove
-# position noise, then consecutive samples are joined with the haversine
-# great-circle distance.  Samples without a usable fix (no 2-D/3-D fix, an
-# out-of-range or ``(0, 0)`` position) are discarded before smoothing, so a
-# stray cold-start fix cannot drag the track.  A step only contributes distance
-# while the camera is actually moving: the per-sample Doppler speed is used as a
-# stationary gate (``stationary_speed``), which stops a parked camera from
-# integrating GPS jitter into phantom distance.  When a file carries no speed, a
-# raw step smaller than ``jitter_m`` is treated as noise instead.
-
-GPS5_SCALE = [1e7, 1e7, 1e3, 1e3, 1e2]  # lat, lon, alt(m), 2D spd, 3D spd
+def max2sphere_command(video: str, output: str, width: int, height: int,
+                       fps: float) -> List[str]:
+    """Command line for the optional max2sphere backend (experimental)."""
+    return ["max2sphere", "-i", video, "-o", output,
+            "-w", str(width), "-h", str(height), "-f", "%.6f" % fps]
 
 
-class GpsError(Exception):
-    """Raised when no usable GPS data can be extracted."""
+def _run(cmd: Sequence[str]) -> None:
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise BackendError("required program not found: %s" % cmd[0]) from exc
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise BackendError("command failed (%d): %s"
+                           % (proc.returncode, tail[-1] if tail else "unknown"))
 
 
-@dataclass
-class GpsSample:
-    utc: Optional[_dt.datetime]
-    stmp_us: int
-    lat: float
-    lon: float
-    alt: Optional[float]
-    speed2d: float
-    speed3d: float
-    fix: Optional[int] = None
-    dop: Optional[float] = None
-
-    @property
-    def valid_fix(self) -> bool:
-        # GPSF: 0/1 = no fix, 2 = 2-D, 3 = 3-D.  Accept 2-D and 3-D.
-        fix_ok = self.fix is None or self.fix >= 2
-        pos_ok = (-90.0 <= self.lat <= 90.0 and -180.0 <= self.lon <= 180.0
-                  and not (self.lat == 0.0 and self.lon == 0.0))
-        return bool(fix_ok and pos_ok)
+def _resolve_backend(name: str) -> str:
+    if name == "auto":
+        if shutil.which(FFMPEG):
+            return "ffmpeg"
+        if shutil.which("max2sphere"):
+            return "max2sphere"
+        raise BackendError("neither ffmpeg nor max2sphere is on PATH")
+    if name == "ffmpeg":
+        if not shutil.which(FFMPEG):
+            raise BackendError("ffmpeg is not on PATH")
+        return "ffmpeg"
+    if not shutil.which(name):
+        raise BackendError("%s is not on PATH (install it or use "
+                           "--stitch-backend ffmpeg)" % name)
+    return name
 
 
-@dataclass
-class SelectedPoint:
-    """A frame chosen at a fixed distance interval along the track."""
-    index: int                 # 1-based sequence
-    utc: _dt.datetime
-    video_time: float          # seconds from the first frame of the video
-    lat: float
-    lon: float
-    alt: Optional[float]
-    heading: Optional[float]   # degrees clockwise from north
-    distance: float            # cumulative track distance (m)
+def _copy_outputs(temp_files: Sequence[str], outputs: Sequence[str]) -> None:
+    if len(temp_files) < len(outputs):
+        raise BackendError("ffmpeg produced %d image(s) for %d selected frames"
+                           % (len(temp_files), len(outputs)))
+    for temp, dest in zip(temp_files, outputs):
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(temp, dest)
 
 
-@dataclass
-class Track:
-    samples: List[GpsSample]
-    times: List[Optional[_dt.datetime]]
-    slat: List[float]          # smoothed latitudes
-    slon: List[float]          # smoothed longitudes
-    cumdist: List[float]       # cumulative distance (m), same length
-    total_distance: float
-    start_utc: _dt.datetime
-    end_utc: _dt.datetime
-    has_speed: bool = False
-    offsets_spread_s: float = field(default=0.0)
+def stitch_ffmpeg(info: VideoInfo, frames: Sequence[int],
+                  outputs: Sequence[str], *, width: int, height: int,
+                  quality: int, image_format: str, interp: str,
+                  threads: int, keep_filter: Optional[str]) -> None:
+    """Extract selected frames through the EAC/v360 graph in one decode pass."""
+    ordered_frames = sorted(int(f) for f in frames)
+    if not ordered_frames:
+        return
+    # outputs correspond to the original (already increasing) choices
+    by_frame = {int(frame): output for frame, output in zip(frames, outputs)}
+    temp_dir = tempfile.mkdtemp(prefix="max360_")
+    script_path = os.path.join(temp_dir, "stitch.filter")
+    select = v2i.select_expression(ordered_frames)
+    script = build_eac_filter(
+        info.hemi_a, info.hemi_b, width, height, select=select,
+        interp=interp, already_equirect=info.already_equirect)
+    with open(script_path, "w") as fh:
+        fh.write(script + "\n")
+    if keep_filter:
+        parent = os.path.dirname(keep_filter)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(script_path, keep_filter)
+
+    ext = "png" if image_format == "png" else "jpg"
+    pattern = os.path.join(temp_dir, "img_%06d." + ext)
+    pix_fmt = "rgb24" if image_format == "png" else "yuvj420p"
+    cmd = [FFMPEG, "-v", "error", "-y", "-i", info.path,
+           "-filter_complex_script", script_path, "-map", "[OUT]",
+           "-an", "-sn", "-dn", "-vsync", "0", "-pix_fmt", pix_fmt]
+    cmd += v2i.ffmpeg_quality_args(image_format, quality)
+    if threads:
+        cmd += ["-threads", str(threads)]
+    cmd.append(pattern)
+    try:
+        _run(cmd)
+        temp_files = sorted(glob.glob(os.path.join(temp_dir, "img_*." + ext)))
+        if len(temp_files) != len(ordered_frames):
+            raise BackendError(
+                "ffmpeg produced %d image(s) for %d selected frames"
+                % (len(temp_files), len(ordered_frames)))
+        for frame, temp in zip(ordered_frames, temp_files):
+            dest = by_frame[frame]
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            shutil.copyfile(temp, dest)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _parse_gpsu(text: str) -> _dt.datetime:
-    """Parse GPMF ``U`` time ``yymmddhhmmss.sss`` as UTC."""
-    yy = int(text[0:2]); mo = int(text[2:4]); dd = int(text[4:6])
-    hh = int(text[6:8]); mi = int(text[8:10]); sec = float(text[10:])
-    whole = int(sec)
-    frac_us = int(round((sec - whole) * 1_000_000))
-    if frac_us >= 1_000_000:  # guard against round-up
-        whole += 1
-        frac_us -= 1_000_000
-    return _dt.datetime(2000 + yy, mo, dd, hh, mi, whole, frac_us,
-                        tzinfo=_dt.timezone.utc)
+def stitch_max2sphere(info: VideoInfo, frames: Sequence[int],
+                      outputs: Sequence[str], *, width: int, height: int,
+                      quality: int, image_format: str, threads: int) -> None:
+    """Stitch with the optional max2sphere binary, then extract frames."""
+    temp_dir = tempfile.mkdtemp(prefix="max360_m2s_")
+    video_out = os.path.join(temp_dir, "equirect.mp4")
+    try:
+        _run(max2sphere_command(info.path, video_out, width, height, info.fps))
+        extracted = v2i.extract_frames_by_index(
+            video_out, frames, os.path.join(temp_dir, "frames"),
+            image_format=image_format, quality=quality, threads=threads)
+        for frame, dest in zip(frames, outputs):
+            temp = extracted.get(int(frame))
+            if temp is None:
+                raise BackendError("max2sphere/ffmpeg did not produce frame %d"
+                                   % frame)
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            shutil.copyfile(temp, dest)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _epoch_us(dt: _dt.datetime) -> int:
-    return int(round(dt.timestamp() * 1_000_000))
-
-
-@dataclass
-class _Block:
-    stmp_us: Optional[int]
-    utc: Optional[_dt.datetime]
-    scale: Optional[List[float]]
-    fix: Optional[int]
-    dop: Optional[float]
-    samples: List[tuple]  # raw 5-tuples
-
-
-def _collect_blocks(buf: bytes) -> List[_Block]:
-    """Walk the GPMF tree and pull out every GPS5 block.
-
-    ``STMP``/``TSMP`` appear *before* ``STNM`` inside every stream, so
-    elements are accumulated per stream and only kept once the stream is
-    known to be a GPS stream.
-    """
-    blocks: List[_Block] = []
-
-    def flush(s: Optional[dict]) -> None:
-        if s and s.get("is_gps") and s.get("samples"):
-            blocks.append(_Block(s.get("stmp"), s.get("utc"), s.get("scale"),
-                                 s.get("fix"), s.get("dop"), s["samples"]))
-
-    cur: Optional[dict] = None
-    for e in iter_elements(buf):
-        if e.level == 0 and e.key == "DEVC":
-            flush(cur)
-            cur = None
-        elif e.level == 1 and e.key == "STRM":
-            flush(cur)
-            cur = {"stmp": None, "utc": None, "scale": None, "fix": None,
-                   "dop": None, "samples": [], "is_gps": False}
-        elif e.level == 2 and cur is not None:
-            if e.key == "STMP":
-                cur["stmp"] = decode(buf, e)[0]
-            elif e.key == "STNM":
-                nm = as_text(buf, e)
-                cur["is_gps"] = bool(nm and "GPS" in nm)
-            elif cur["is_gps"]:
-                if e.key == "SCAL":
-                    cur["scale"] = decode(buf, e)
-                elif e.key == "GPSU":
-                    txt = as_text(buf, e)
-                    if len(txt) >= 12:
-                        try:
-                            cur["utc"] = _parse_gpsu(txt)
-                        except ValueError:
-                            pass
-                elif e.key == "GPSF":
-                    cur["fix"] = decode(buf, e)[0]
-                elif e.key == "GPSP":
-                    cur["dop"] = decode(buf, e)[0] / 100.0
-                elif e.key == "GPS5":
-                    if e.is_compressed:
-                        raise GpsError("GPS5 stream is Huffman-compressed "
-                                       "(QUAN enabled); not supported")
-                    vals = decode(buf, e)
-                    cur["samples"] = [tuple(vals[i:i + 5])
-                                      for i in range(0, len(vals) - 4, 5)]
-    flush(cur)
-    return blocks
-
-
-def extract_track(buf: bytes, *, stationary_speed: float = 0.3,
-                  smooth: int = 9, jitter_m: float = 0.5) -> Track:
-    """Parse a raw gpmd stream into a :class:`Track`."""
-    blocks = _collect_blocks(buf)
-    if not blocks:
-        raise GpsError("no GPS5 data found in GPMF stream")
-
-    scale = next((b.scale for b in blocks if b.scale), GPS5_SCALE)
-    scale = (scale + GPS5_SCALE)[:5]
-
-    # --- clock offset (GPSU - STMP), robust against stale GPSU ----------
-    offsets = [_epoch_us(b.utc) - b.stmp_us
-               for b in blocks if b.stmp_us is not None and b.utc is not None]
-    median_offset = int(statistics.median(offsets)) if offsets else 0
-    spread = (max(offsets) - min(offsets)) / 1e6 if len(offsets) > 1 else 0.0
-
-    # --- per-sample absolute time ---------------------------------------
-    samples: List[GpsSample] = []
-    have_stmp = all(b.stmp_us is not None for b in blocks)
-    prev_stmp = None
-    for bi, b in enumerate(blocks):
-        n = len(b.samples)
-        if n == 0:
-            prev_stmp = b.stmp_us
-            continue
-        if have_stmp:
-            nxt = blocks[bi + 1].stmp_us if bi + 1 < len(blocks) else None
-            if nxt is not None:
-                period = (nxt - b.stmp_us) / n
-            elif prev_stmp is not None:
-                period = (b.stmp_us - prev_stmp) / n
-            else:
-                period = 1_000_000 / 18.0
-            prev_stmp = b.stmp_us
-            for i, s in enumerate(b.samples):
-                stmp = int(b.stmp_us + i * period)
-                utc = _dt.datetime.fromtimestamp(
-                    (stmp + median_offset) / 1e6, _dt.timezone.utc)
-                samples.append(_make_sample(s, scale, stmp, utc, b))
-        else:
-            base = _epoch_us(b.utc) if b.utc else 0
-            nxt = next((_epoch_us(nb.utc) for nb in blocks[bi + 1:]
-                        if nb.utc is not None), None)
-            step = ((nxt - base) / n) if (nxt and base) else 1_000_000 / 18.0
-            for i, s in enumerate(b.samples):
-                us = int(base + i * step)
-                utc = (_dt.datetime.fromtimestamp(us / 1e6, _dt.timezone.utc)
-                       if base else None)
-                samples.append(_make_sample(s, scale, us, utc, b))
-
-    samples.sort(key=lambda s: s.stmp_us)
-
-    # Drop samples without a usable fix (bad/absent GPSF, out-of-range or
-    # (0,0) positions) *before* smoothing and distance integration, so a
-    # stray invalid sample cannot drag the smoothed track towards it.
-    samples = [s for s in samples if s.valid_fix]
-    if not samples:
-        raise GpsError("no GPS sample has a valid fix")
-
-    times = [s.utc for s in samples]
-    valid_times = [t for t in times if t is not None]
-    if not valid_times:
-        raise GpsError("GPS samples have no usable timestamps")
-
-    has_speed = any(s.speed2d > 0.0 for s in samples)
-    slat = _smooth([s.lat for s in samples], smooth)
-    slon = _smooth([s.lon for s in samples], smooth)
-    cum = cumulative_distance(samples, slat, slon,
-                              stationary_speed=stationary_speed,
-                              jitter_m=jitter_m, has_speed=has_speed)
-
-    return Track(samples=samples, times=times, slat=slat, slon=slon,
-                 cumdist=cum, total_distance=cum[-1] if cum else 0.0,
-                 start_utc=valid_times[0], end_utc=valid_times[-1],
-                 has_speed=has_speed, offsets_spread_s=spread)
-
-
-def _make_sample(raw, scale, stmp, utc, block) -> GpsSample:
-    lat, lon, alt, sp2, sp3 = (raw[i] / scale[i] for i in range(5))
-    return GpsSample(utc=utc, stmp_us=stmp, lat=lat, lon=lon, alt=alt,
-                     speed2d=sp2, speed3d=sp3, fix=block.fix, dop=block.dop)
-
-
+# ---------------------------------------------------------------------------
+# GPMF track
+# ---------------------------------------------------------------------------
 def _smooth(values: Sequence[float], window: int) -> List[float]:
-    """Centred moving average with a shrinking window at the edges."""
     if window <= 1 or len(values) < 3:
         return list(values)
     half = window // 2
     prefix = [0.0]
-    for v in values:
-        prefix.append(prefix[-1] + v)
+    for value in values:
+        prefix.append(prefix[-1] + value)
     out = []
     n = len(values)
     for i in range(n):
@@ -503,549 +364,303 @@ def _smooth(values: Sequence[float], window: int) -> List[float]:
     return out
 
 
-def cumulative_distance(samples: Sequence[GpsSample], slat: Sequence[float],
-                        slon: Sequence[float], *,
-                        stationary_speed: float = 0.3,
-                        jitter_m: float = 0.5,
-                        has_speed: bool = True) -> List[float]:
-    """Cumulative along-track distance (m) on the smoothed positions."""
-    cum = [0.0]
-    for i in range(len(samples) - 1):
-        a, b = samples[i], samples[i + 1]
-        if has_speed:
-            speed = 0.5 * (a.speed2d + b.speed2d)
-            moving = speed >= stationary_speed
-        else:
-            moving = haversine_m(a.lat, a.lon, b.lat, b.lon) >= jitter_m
-        d = haversine_m(slat[i], slon[i], slat[i + 1], slon[i + 1]) if moving else 0.0
-        cum.append(cum[-1] + d)
-    return cum
+def build_track(path: str, info: VideoInfo, args) -> Tuple[v2i.Track, list]:
+    if info.gpmd is None:
+        raise BackendError("no GPMF (gpmd) telemetry track in file")
+    payload = v2i_gpmf.extract_gpmf(path, info.gpmd, ffmpeg=FFMPEG)
+    data = v2i_gpmf.parse_gpmf(payload, imu_heading=args.imu_heading)
+    LOG.info("  GPMF device: %s; streams: %s", data.device_name,
+             ", ".join(sorted(data.streams)))
+    if not data.has_gps:
+        raise BackendError("no GPS5/GPS9 data found in the GPMF stream")
 
+    timed = [s for s in data.gps_samples if s.get("utc") is not None]
+    if not timed:
+        raise BackendError("GPMF GPS samples have no usable timestamps")
+    first_gps = min(s["utc"] for s in timed)
+    last_gps = max(s["utc"] for s in timed)
+    gps_span = (last_gps - first_gps).total_seconds()
 
-def _interp_time(track: Track, i: int, frac: float) -> _dt.datetime:
-    t0 = track.times[i]
-    t1 = track.times[min(i + 1, len(track.times) - 1)]
-    if t0 is None:
-        return t1
-    if t1 is None:
-        return t0
-    return t0 + (t1 - t0) * frac
+    # GoPro MAX writes creation_time as camera-local wall clock in some
+    # firmware, even though the field looks like UTC.  The GPMF GPS clock is
+    # authoritative, so use the first fix unless creation_time agrees with it
+    # to within five minutes.
+    origin = info.creation_time
+    origin_is_gps = False
+    if origin is None or abs((first_gps - origin).total_seconds()) > 300:
+        if origin is not None:
+            LOG.warning("  container creation_time is %.0f s from GPS; using "
+                        "the first GPS fix as the video clock",
+                        (first_gps - origin).total_seconds())
+        origin = first_gps
+        origin_is_gps = True
 
+    # TimeWarp (and some slow-motion modes) record real GPS time but play the
+    # video back at a different rate.  Map the GPS span onto the video span so
+    # frame selection and per-frame timestamps stay aligned, and never emit the
+    # same frame twice.
+    scale = 1.0
+    if info.duration > 0.2 and gps_span > 0.2:
+        ratio = gps_span / info.duration
+        if ratio > 1.2 or ratio < 0.8:
+            scale = info.duration / gps_span
+            origin = first_gps
+            origin_is_gps = True
+            LOG.warning("  TimeWarp/rate change detected: GPS span %.2f s -> "
+                        "video span %.2f s (scale %.4f)", gps_span,
+                        info.duration, scale)
 
-def _heading_at(track: Track, i: int, window: int = 4,
-                offset: float = 0.0) -> Optional[float]:
-    """Course over ground around sample ``i`` (centred window)."""
-    lo = max(0, i - window)
-    hi = min(len(track.samples) - 1, i + window)
-    if hi <= lo:
-        hi = min(len(track.samples) - 1, lo + 1)
-    if hi == lo:
-        return None
-    d = haversine_m(track.slat[lo], track.slon[lo],
-                    track.slat[hi], track.slon[hi])
-    if d < 0.1:  # essentially stationary -> heading undefined
-        return None
-    return (initial_bearing_deg(track.slat[lo], track.slon[lo],
-                                track.slat[hi], track.slon[hi])
-            + offset) % 360.0
-
-
-def select_by_distance(track: Track, interval_m: float, *,
-                       start_distance: float = 0.0,
-                       first_point: bool = True,
-                       heading_offset: float = 0.0,
-                       heading_window: int = 4,
-                       video_time_origin: Optional[_dt.datetime] = None,
-                       max_points: Optional[int] = None) -> List[SelectedPoint]:
-    """Choose frame locations every ``interval_m`` metres along the track.
-
-    The first point sits at the first *valid* fix (the track origin) when
-    ``first_point`` is true; subsequent points fall at
-    ``first_valid + start_distance + k * interval_m``.  Position, altitude and
-    time at each chosen distance are linearly interpolated between the two
-    bracketing GPS samples.
-    """
-    if interval_m <= 0:
-        raise ValueError("interval must be > 0")
-
-    origin = video_time_origin or next(t for t in track.times if t is not None)
-    valid = [i for i, s in enumerate(track.samples) if s.valid_fix]
-    if not valid:
-        raise GpsError("no GPS sample has a valid fix")
-    first_valid = valid[0]
-    d0 = track.cumdist[first_valid]
-
-    targets: List[float] = []
-    if first_point:
-        targets.append(d0)
-    d = max(0.0, d0 + start_distance)
-    if first_point:
-        d = max(d, d0 + interval_m)
-    while d <= track.total_distance + 1e-9:
-        targets.append(d)
-        d += interval_m
-
-    points: List[SelectedPoint] = []
-    j = 0
-    for k, target in enumerate(targets):
-        if max_points is not None and len(points) >= max_points:
-            break
-        while j + 1 < len(track.cumdist) and track.cumdist[j + 1] < target:
-            j += 1
-        i = min(j, len(track.samples) - 1)
-        nxt = min(i + 1, len(track.samples) - 1)
-        span = track.cumdist[nxt] - track.cumdist[i]
-        frac = 0.0 if span <= 0 else (target - track.cumdist[i]) / span
-        frac = min(max(frac, 0.0), 1.0)
-
-        lat = track.slat[i] + (track.slat[nxt] - track.slat[i]) * frac
-        lon = track.slon[i] + (track.slon[nxt] - track.slon[i]) * frac
-        a_alt = track.samples[i].alt
-        b_alt = track.samples[nxt].alt
-        if a_alt is not None and b_alt is not None:
-            alt = a_alt + (b_alt - a_alt) * frac
-        else:
-            alt = a_alt if a_alt is not None else b_alt
-        utc = _interp_time(track, i, frac)
-        heading = _heading_at(track, i, window=heading_window,
-                              offset=heading_offset)
-        points.append(SelectedPoint(
-            index=k + 1, utc=utc, video_time=(utc - origin).total_seconds(),
-            lat=lat, lon=lon, alt=alt, heading=heading, distance=target))
-    return points
-
-
-def _xml_escape(text: str) -> str:
-    return (text.replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def to_gpx(track: Track, name: str = "track") -> str:
-    """Serialise the GPS track as a GPX 1.1 document (UTC timestamps)."""
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
-             '<gpx version="1.1" creator="max360-v2i"',
-             '     xmlns="http://www.topografix.com/GPX/1/1">',
-             f'  <metadata><name>{_xml_escape(name)}</name></metadata>',
-             f'  <trk><name>{_xml_escape(name)}</name><trkseg>']
-    for s in track.samples:
-        if not s.valid_fix or s.utc is None:
+    samples = []
+    for sample in data.gps_samples:
+        utc = sample.get("utc")
+        if utc is None:
             continue
-        t = s.utc.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        ele = f"<ele>{s.alt:.2f}</ele>" if s.alt is not None else ""
-        lines.append(f'    <trkpt lat="{s.lat:.8f}" lon="{s.lon:.8f}">'
-                     f'{ele}<time>{t}</time>'
-                     f'<speed>{s.speed2d:.2f}</speed></trkpt>')
-    lines += ['  </trkseg></trk>', '</gpx>', '']
-    return "\n".join(lines)
+        fix = sample.get("fix")
+        if fix is not None and fix < 2:
+            continue
+        item = dict(sample)
+        item["t"] = (utc - origin).total_seconds() * scale
+        item["course"] = None
+        v2i.apply_accuracy(item, args.uere)
+        samples.append(item)
+    if not samples:
+        raise BackendError("no GPMF GPS sample has a valid fix")
+    samples.sort(key=lambda s: s["t"])
+
+    if args.smooth and args.smooth > 1:
+        lats = _smooth([s["lat"] for s in samples], args.smooth)
+        lons = _smooth([s["lon"] for s in samples], args.smooth)
+        for sample, lat, lon in zip(samples, lats, lons):
+            sample["lat"], sample["lon"] = lat, lon
+
+    track = v2i.Track(samples, args.distance_mode)
+    LOG.info("  telemetry: %d GPS sample(s), %.1f m of travel, "
+             "clock spread %.0f ms", len(samples), track.length,
+             data.clock_spread_s * 1000)
+    return track, data.gps_samples
 
 
-# =============================================================================
-# 4. ffmpeg - all interaction with the external ``ffmpeg`` / ``ffprobe`` binaries
-# =============================================================================
-# GoPro MAX ``.360`` files store the immersive video as **two Equi-Angular
-# Cubemap (EAC) hemisphere tracks** (4096x1344 HEVC each), not as dual-fisheye
-# and not as equirectangular.  To obtain a normal 2:1 equirectangular frame we
-# stitch the three EAC faces of both hemisphere tracks back together and let
-# ffmpeg's ``v360`` filter reproject ``eac -> equirect``.
-#
-# The stitching filter graph is a faithful port of the one used by
-# https://github.com/baasitsharief/gopro-to-mp4 (``gopro_stitch.sh``), which
-# cross-fades the 64-pixel overlaps between EAC faces.
-
-FFMPEG = os.environ.get("MAX360_FFMPEG", "ffmpeg")
-FFPROBE = os.environ.get("MAX360_FFPROBE", "ffprobe")
-
-HEMI_W, HEMI_H = 4096, 1344  # native GoPro MAX hemisphere track size
-DEFAULT_WIDTH, DEFAULT_HEIGHT = 5376, 2688  # native 2:1 equirect output
-
-
-class BackendError(Exception):
-    """Raised when ffmpeg/ffprobe fail or the file layout is unsupported."""
-
-
-def check_tools() -> None:
-    for tool in (FFMPEG, FFPROBE):
-        if shutil.which(tool) is None:
-            raise BackendError(
-                f"required program {tool!r} not found on PATH "
-                "(install ffmpeg, or set MAX360_FFMPEG / MAX360_FFPROBE)")
-
-
-def _run(cmd: Sequence[str], *, capture: bool = True) -> bytes:
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-    except FileNotFoundError as exc:  # pragma: no cover - checked earlier
-        raise BackendError(str(exc)) from exc
-    if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        tail = " | ".join(tail[-6:]) if tail else ""
-        raise BackendError(
-            f"command failed ({proc.returncode}): {' '.join(cmd[:6])} ... {tail}")
-    return proc.stdout if capture else b""
+# ---------------------------------------------------------------------------
+# Records
+# ---------------------------------------------------------------------------
+def _metadata_for(record, info: VideoInfo, args) -> v2i_metadata.FrameMetadata:
+    return v2i_metadata.FrameMetadata(
+        camera=v2i.CAMERA_LABELS[v2i.CAMERA_MAX], video=record["video"],
+        sequence=record["sequence"], frame_index=record["frame_index"],
+        pts=record["pts_seconds"], distance=record.get("distance_m"),
+        script_name=SCRIPT_NAME, make=info.make, model=info.model,
+        software=info.firmware, serial=info.serial,
+        captured_utc=v2i.parse_utc_timestamp(record.get("datetime_utc")),
+        captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
+                        if record.get("datetime_local") else None),
+        utc_offset_s=record.get("utc_offset_s"),
+        lat=record.get("latitude"), lon=record.get("longitude"),
+        alt=record.get("altitude_m"), speed=record.get("speed_m_s"),
+        course=record.get("course_deg"), img_direction=record.get("img_direction_deg"),
+        heading_source=record.get("heading_source", "none"),
+        accuracy=record.get("accuracy_m"),
+        accuracy_estimated=record.get("accuracy_estimated", False),
+        accuracy_source=record.get("accuracy_source"),
+        hdop=record.get("hdop"), vdop=record.get("vdop"),
+        pdop=record.get("pdop"),
+        position_source=record.get("position_source"),
+        clamped=record.get("clamped"), estimated=record.get("estimated"),
+        image_width=args.width, image_height=args.height, panorama=True,
+        pose_heading=record.get("heading_deg"),
+        keywords=v2i.parse_keywords(args.keywords),
+    )
 
 
-@dataclass
-class VideoInfo:
-    path: str
-    duration: float
-    fps: float
-    frame_count: int
-    hemi_a: int            # stream index of the "top" hemisphere track
-    hemi_b: int            # stream index of the "bottom" hemisphere track
-    gpmd: Optional[int]    # stream index of the GPMF telemetry track
-    width: int             # native hemisphere width
-    height: int            # native hemisphere height
-    creation_time: Optional[str] = None
-    location: Optional[str] = None
-    firmware: Optional[str] = None
-
-
-def _parse_rate(rate: str) -> float:
-    if "/" in rate:
-        num, den = rate.split("/")
-        den = float(den)
-        return float(num) / den if den else 0.0
-    return float(rate)
-
-
-def probe(path: str) -> VideoInfo:
-    """Inspect a .360 file and describe its hemisphere + telemetry layout."""
-    out = _run([FFPROBE, "-v", "error", "-print_format", "json",
-                "-show_streams", "-show_format", path])
-    data = json.loads(out.decode("utf-8", "replace"))
-    streams = data.get("streams", [])
-    fmt = data.get("format", {})
-
-    videos = [s for s in streams if s.get("codec_type") == "video"]
-    if len(videos) < 2:
-        raise BackendError(
-            f"{os.path.basename(path)}: expected 2 video tracks (MAX EAC "
-            f"hemispheres), found {len(videos)} - not a GoPro MAX .360 file?")
-    # The two hemisphere tracks are the two equally-sized video streams.
-    videos.sort(key=lambda s: (s.get("width", 0) * s.get("height", 0),
-                               s.get("index")))
-    hemi_a, hemi_b = videos[0], videos[1]
-
-    gpmd = None
-    for s in streams:
-        if s.get("codec_type") == "data" and \
-                s.get("codec_tag_string") == "gpmd":
-            gpmd = s.get("index")
-            break
-
-    duration = float(fmt.get("duration") or hemi_a.get("duration") or 0.0)
-    fps = _parse_rate(str(hemi_a.get("r_frame_rate", "0/1"))) or 30000.0 / 1001.0
-    counts = [int(s["nb_frames"]) for s in (hemi_a, hemi_b)
-              if str(s.get("nb_frames", "")).isdigit()]
-    frame_count = min(counts) if counts else int(round(duration * fps))
-    tags = fmt.get("tags", {})
-
-    return VideoInfo(
-        path=path, duration=duration, fps=fps, frame_count=frame_count,
-        hemi_a=hemi_a["index"], hemi_b=hemi_b["index"], gpmd=gpmd,
-        width=int(hemi_a.get("width", HEMI_W)),
-        height=int(hemi_a.get("height", HEMI_H)),
-        creation_time=tags.get("creation_time"),
-        location=tags.get("location"),
-        firmware=tags.get("firmware"))
-
-
-def extract_gpmd(path: str, gpmd_index: int) -> bytes:
-    """Copy the raw ``gpmd`` payload out of the container."""
-    return _run([FFMPEG, "-v", "error", "-i", path,
-                 "-map", f"0:{gpmd_index}", "-c", "copy", "-f", "data", "-"])
-
-
-def _geq() -> str:
-    n = 64
-    expr = (f"if(between(X, 0, {n - 1}), "
-            f"(p((X+{n}),Y)*(((X+1))/{n + 1}))"
-            f"+(p(X,Y)*(({n + 1}-((X+1)))/{n + 1})), p(X,Y))")
-    return f"geq=lum='{expr}':cb='{expr}':cr='{expr}'"
-
-
-def build_filter(a: int, b: int, width: int, height: int,
-                 select: Optional[str] = None,
-                 interp: str = "cubic") -> str:
-    """Return an ffmpeg ``filter_complex`` script string.
-
-    ``a``/``b`` are the hemisphere stream indices.  When ``select`` is given
-    it is applied to both hemisphere streams followed by a ``split`` so a
-    single decode pass can emit many synchronised frames.
-    """
-    vh = HEMI_H
-    lines: List[str] = []
-    if select:
-        lines.append(f"[0:{a}]select='{select}',split=7[a0][a1][a2][a3][a4][a5][a6]")
-        lines.append(f"[0:{b}]select='{select}',split=7[b0][b1][b2][b3][b4][b5][b6]")
-        A = [f"[a{i}]" for i in range(7)]
-        B = [f"[b{i}]" for i in range(7)]
+def _record(choice, track, args, info, tz_offset, tz_known, sequence,
+            video_name):
+    point = choice.point or {}
+    pts = max(0.0, float(choice.pts))
+    utc = point.get("utc")
+    if utc is None:
+        origin = info.creation_time
+        utc = (origin + dt.timedelta(seconds=pts)
+               if origin is not None else None)
+    if utc.tzinfo is None:
+        utc = utc.replace(tzinfo=dt.timezone.utc)
+    local = v2i.local_from_utc(utc, tz_offset) if tz_known else None
+    if args.time_base == "utc" and utc is not None:
+        naming = utc.astimezone(dt.timezone.utc).replace(tzinfo=None)
     else:
-        A = [f"[0:{a}]"] * 7
-        B = [f"[0:{b}]"] * 7
+        naming = local or (utc.astimezone(dt.timezone.utc).replace(tzinfo=None)
+                           if utc is not None else None)
+    if naming is None:
+        naming = dt.datetime(1970, 1, 1)
 
-    def row(src: List[str], tag: str) -> List[str]:
-        return [
-            f"{src[0]}crop=624:{vh}:x=0:y=0,format=yuvj420p[{tag}L]",
-            f"{src[1]}crop=128:{vh}:x=624:y=0,format=yuvj420p,{_geq()},"
-            f"crop=64:{vh}:x=0:y=0,scale=96:{vh}[{tag}O]",
-            f"{src[2]}crop=624:{vh}:x=752:y=0,format=yuvj420p[{tag}R]",
-            f"{src[3]}crop=1344:1344:1376:0[{tag}C]",
-            f"{src[4]}crop=624:{vh}:x=2720:y=0,format=yuvj420p[{tag}2L]",
-            f"{src[5]}crop=128:{vh}:x=3344:y=0,format=yuvj420p,{_geq()},"
-            f"crop=64:{vh}:x=0:y=0,scale=96:{vh}[{tag}2O]",
-            f"{src[6]}crop=624:{vh}:x=3472:y=0,format=yuvj420p[{tag}2R]",
-            f"[{tag}L][{tag}O]hstack[{tag}a]",
-            f"[{tag}a][{tag}R]hstack[{tag}b]",
-            f"[{tag}b][{tag}C]hstack[{tag}c]",
-            f"[{tag}c][{tag}2L]hstack[{tag}d]",
-            f"[{tag}d][{tag}2O]hstack[{tag}e]",
-            f"[{tag}e][{tag}2R]hstack[{tag}ROW]",
-        ]
+    heading, heading_source = v2i.resolve_heading(
+        point, args.heading_offset, args.magnetic_declination)
+    accuracy, accuracy_estimated, accuracy_source = v2i.derive_accuracy(
+        point, args.uere)
+    course = point.get("course")
+    if course is None:
+        course = point.get("gps_course")
+    speed = point.get("speed")
+    if speed is None:
+        speed = point.get("speed2d")
+    return {
+        "sequence": sequence, "video": video_name, "camera": v2i.CAMERA_MAX,
+        "image": v2i.image_filename(naming, args.format),
+        "frame_index": int(choice.frame_index), "pts_seconds": round(pts, 3),
+        "datetime_local": local.isoformat() if local else None,
+        "datetime_utc": v2i.fmt_utc(utc),
+        "utc_offset_s": tz_offset if tz_known else None,
+        "latitude": point.get("lat"), "longitude": point.get("lon"),
+        "altitude_m": point.get("alt"), "speed_m_s": speed,
+        "course_deg": course, "heading_deg": heading,
+        "heading_source": heading_source, "img_direction_deg": heading,
+        "accuracy_m": accuracy, "accuracy_estimated": accuracy_estimated,
+        "accuracy_source": accuracy_source,
+        "hdop": point.get("hdop"), "vdop": point.get("vdop"),
+        "pdop": point.get("pdop"),
+        "distance_m": float(choice.target_distance),
+        "track_distance_m": point.get("distance"),
+        "position_source": point.get("position_source", "none"),
+        "clamped": bool(point.get("clamped")),
+        "estimated": bool(point.get("estimated")),
+        "naming_time": naming, "point": point,
+    }
 
-    lines += row(A, "T")
-    lines += row(B, "B")
-    lines.append("[TROW][BROW]vstack[FULL_EAC]")
-    lines.append(f"[FULL_EAC]v360=eac:equirect:interp={interp}"
-                 f":w={width}:h={height}[OUT]")
-    return ",\n".join(lines)
 
+# ---------------------------------------------------------------------------
+# Per-file processing
+# ---------------------------------------------------------------------------
+def process_video(path: str, sequence: str, args) -> dict:
+    name = os.path.basename(path)
+    result = {"video": name, "sequence": sequence, "images": 0,
+              "planned": 0, "failed": False, "entries": [], "dir": None}
+    LOG.info("--- %s -> %s", name, sequence)
+    info = probe(path)
+    LOG.info("  video: %dx%d %.4f fps, %d frame(s), %.2f s%s",
+             info.width, info.height, info.fps, info.frame_count,
+             info.duration, " (already equirectangular)"
+             if info.already_equirect else " (EAC hemispheres)")
 
-def select_expression(frames: Sequence[int]) -> str:
-    """Build an ffmpeg ``select`` expression matching the given frame numbers."""
-    return "+".join(f"eq(n\\,{int(n)})" for n in frames)
+    ordinal = info.video_ordinals.get(info.hemi_a, 0)
+    timeline = v2i.probe_frame_timeline(
+        path, stream_ordinal=ordinal, fps_hint=info.fps,
+        frame_count_hint=info.frame_count, duration_hint=info.duration,
+        logger=LOG)
+    if len(timeline) > info.frame_count:
+        timeline = v2i.FrameTimeline(timeline.times[:info.frame_count],
+                                     timeline.source, timeline.fps)
+    LOG.info("  frame timeline: %d frame(s), source=%s",
+             len(timeline), timeline.source)
 
+    track, _gps = build_track(path, info, args)
+    detected_offset = None       # GoPro MAX stores UTC, not local wall clock
+    tz_offset, tz_known = v2i.resolve_timezone(
+        args, detected_offset, camera=v2i.CAMERA_MAX, logger=LOG)
 
-def stitch_frames(info: VideoInfo, frames: Sequence[int],
-                  outputs: Sequence[str], *,
-                  width: int, height: int, quality: int = 95,
-                  image_format: str = "jpg",
-                  interp: str = "cubic", threads: int = 0, workers: int = 1,
-                  keep_filter: Optional[str] = None) -> List[str]:
-    """Extract equirectangular images for ``frames`` by seeking per frame.
+    choices, skipped = v2i.select_unique_frames(
+        track, timeline, args.distance, start_distance=args.start_distance,
+        max_position_error=args.max_position_error, max_images=args.max_images,
+        mode=args.distance_mode, logger=LOG)
+    if skipped:
+        LOG.info("  skipped %d target(s) with no acceptable unused frame",
+                 len(skipped))
+    if not choices:
+        LOG.error("  no capture point could be matched to a unique frame")
+        result["failed"] = True
+        return result
 
-    ``outputs`` holds the destination path for each frame, in the same order
-    and with the same length as ``frames``; parent directories are created as
-    needed.  Each frame is extracted with an input-side seek plus
-    ``-frames:v 1``, which is both faster (no full-file decode) and exactly
-    frame-accurate.  The returned list equals ``outputs``.
-    """
-    outs = list(outputs)
-    if not frames:
-        return []
-    if len(outs) != len(frames):
-        raise BackendError(
-            "number of output paths must match the number of frames")
-    for out in outs:
-        parent = os.path.dirname(out)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+    records = [_record(c, track, args, info, tz_offset, tz_known, sequence,
+                       name) for c in choices]
+    first_time = records[0]["naming_time"]
+    sequence_dir = v2i.sequence_output_dir(
+        args.output, v2i.CAMERA_MAX, sequence, first_time)
+    used_paths = set()
+    for record in records:
+        record["path"] = v2i.unique_path(
+            os.path.join(sequence_dir, record["image"]), used_paths)
+        record["image"] = os.path.basename(record["path"])
+    result["planned"] = len(records)
+    result["dir"] = sequence_dir
+    LOG.info("  %d capture point(s) -> %s", len(records), sequence_dir)
 
-    script = build_filter(info.hemi_a, info.hemi_b, width, height, None, interp)
-    fd, script_path = tempfile.mkstemp(prefix=".max360-", suffix=".filter")
-    os.close(fd)
-    with open(script_path, "w") as fh:
-        fh.write(script)
-    if keep_filter:
-        parent = os.path.dirname(keep_filter)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        shutil.copyfile(script_path, keep_filter)
+    if args.dry_run:
+        for record in records:
+            LOG.info("    frame=%d pts=%.3fs %sZ %.6f,%.6f hdg=%s d=%.1fm -> %s",
+                     record["frame_index"], record["pts_seconds"],
+                     (record["datetime_utc"] or "")[11:23],
+                     record["latitude"] or 0.0, record["longitude"] or 0.0,
+                     record["heading_deg"], record["distance_m"],
+                     record["image"])
+        return result
 
-    pix_fmt = "rgb24" if image_format == "png" else "yuvj420p"
-    quality_args = v2i.ffmpeg_quality_args(image_format, quality)
+    to_extract = []
+    skipped_existing = 0
+    for record in records:
+        if os.path.exists(record["path"]) and not args.overwrite:
+            skipped_existing += 1
+            continue
+        to_extract.append(record)
 
-    def one(idx_frame):
-        i, n = idx_frame
-        t = n / info.fps
-        cmd = [FFMPEG, "-v", "error", "-y", "-ss", f"{t:.9f}", "-i", info.path,
-               "-filter_complex_script", script_path,
-               "-map", "[OUT]", "-an", "-sn", "-dn", "-frames:v", "1",
-               "-pix_fmt", pix_fmt]
-        cmd += quality_args
-        if threads:
-            cmd += ["-threads", str(threads)]
-        cmd.append(outputs[i])
-        _run(cmd)
-
-    try:
-        if workers and workers > 1:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(one, enumerate(frames)))
+    backend = _resolve_backend(args.stitch_backend)
+    LOG.info("  stitching backend: %s", backend)
+    if to_extract:
+        outputs = [record["path"] for record in to_extract]
+        frames = [record["frame_index"] for record in to_extract]
+        keep_filter = (os.path.join(sequence_dir, sequence + ".filter")
+                       if args.keep_filter else None)
+        if backend == "max2sphere":
+            stitch_max2sphere(info, frames, outputs, width=args.width,
+                              height=args.height, quality=args.quality,
+                              image_format=args.format, threads=args.threads)
         else:
-            for item in enumerate(frames):
-                one(item)
-    finally:
-        if os.path.exists(script_path):
-            os.remove(script_path)
+            stitch_ffmpeg(info, frames, outputs, width=args.width,
+                          height=args.height, quality=args.quality,
+                          image_format=args.format, interp=args.interp,
+                          threads=args.threads, keep_filter=keep_filter)
+        for record in to_extract:
+            record["written"] = os.path.exists(record["path"])
+    if (args.start_distance == 0 and records
+            and records[0]["frame_index"] == 0
+            and not os.path.exists(records[0]["path"])):
+        LOG.error("  first frame (index 0) could not be extracted; failing %s",
+                  name)
+        result["failed"] = True
+        return result
+    written = [record for record in records if record.get("written")]
+    result["images"] = len(written)
+    LOG.info("  wrote %d image(s), skipped %d existing",
+             len(written), skipped_existing)
 
-    return outs
+    if written and not args.no_exif:
+        pairs = [(record["path"], v2i_metadata.build_exiftool_args(
+            _metadata_for(record, info, args))) for record in written]
+        v2i.write_metadata(pairs)
 
-
-# =============================================================================
-# 5. Metadata - write EXIF + XMP-GPano tags into extracted frames (exiftool)
-# =============================================================================
-# The tag set mirrors what a GoPro MAX writes into its own equirectangular
-# photos (see ``sample/``), extended with the GPS/XMP-GPano fields that
-# Mapillary, Panoramax and Google Photos' 360 viewer expect.
-
-EXIFTOOL = "exiftool"
-
-TOOL_NAME = "max360-v2i"
-
-
-class MetadataError(Exception):
-    """Raised when exiftool is missing or fails."""
-
-
-def check_exiftool() -> str:
-    path = shutil.which(EXIFTOOL)
-    if path is None:
-        raise MetadataError(
-            "required program 'exiftool' not found on PATH "
-            "(install libimage-exiftool-perl)")
-    return path
+    v2i.export_track_files(
+        sequence_dir, sequence, track.samples, records,
+        track_export=args.track_export, camera=v2i.CAMERA_MAX, video=name)
+    result["entries"] = [{k: v for k, v in record.items()
+                          if k not in ("point", "naming_time")}
+                         for record in written]
+    return result
 
 
-@dataclass
-class FrameMeta:
-    utc: _dt.datetime
-    lat: float
-    lon: float
-    alt: Optional[float]
-    heading: Optional[float]      # degrees clockwise from north
-    width: int
-    height: int
-    make: str = "GoPro"
-    model: str = "GoPro Max"
-    software: Optional[str] = None
-    tz_offset_hours: float = 0.0
-    description: Optional[str] = None
-
-
-def _fmt(dt: _dt.datetime) -> str:
-    return dt.strftime("%Y:%m:%d %H:%M:%S")
-
-
-def _fmt_sub(dt: _dt.datetime) -> str:
-    return dt.strftime("%Y:%m:%d %H:%M:%S.%f")[:-3]
-
-
-def build_args(meta: FrameMeta) -> List[str]:
-    local = meta.utc + _dt.timedelta(hours=meta.tz_offset_hours)
-    lat_ref = "North" if meta.lat >= 0 else "South"
-    lon_ref = "East" if meta.lon >= 0 else "West"
-    args: List[str] = []
-
-    def add(tag: str, value) -> None:
-        args.append(f"-{tag}={value}")
-
-    # --- camera identity -------------------------------------------------
-    add("Make", meta.make)
-    add("Model", meta.model)
-    if meta.software:
-        add("Software", meta.software)
-    add("ModifyDate", _fmt(local))
-    add("DateTimeOriginal", _fmt(local))
-    add("CreateDate", _fmt(local))
-    add("Orientation#", 1)
-    if meta.description:
-        add("ImageDescription", meta.description)
-
-    # --- EXIF GPS (UTC, as required by the EXIF spec) --------------------
-    add("GPSVersionID", "2.3.0.0")
-    add("GPSLatitude", abs(meta.lat))
-    add("GPSLatitudeRef", lat_ref)
-    add("GPSLongitude", abs(meta.lon))
-    add("GPSLongitudeRef", lon_ref)
-    if meta.alt is not None:
-        add("GPSAltitude", abs(meta.alt))
-        add("GPSAltitudeRef#", 0 if meta.alt >= 0 else 1)
-    add("GPSDateStamp", meta.utc.strftime("%Y:%m:%d"))
-    add("GPSTimeStamp", meta.utc.strftime("%H:%M:%S"))
-    add("GPSDateTime", _fmt_sub(meta.utc) + "Z")
-    if meta.heading is not None:
-        add("GPSImgDirection", round(meta.heading, 2))
-        add("GPSImgDirectionRef", "True North")
-
-    # --- XMP GPS (decimal degrees; convenient for web tools) -------------
-    add("XMP:GPSLatitude", meta.lat)
-    add("XMP:GPSLongitude", meta.lon)
-    if meta.alt is not None:
-        add("XMP:GPSAltitude", abs(meta.alt))
-        add("XMP:GPSAltitudeRef#", 0 if meta.alt >= 0 else 1)
-    add("XMP:GPSDateTime", _fmt_sub(meta.utc) + "Z")
-    if meta.heading is not None:
-        add("XMP:GPSImgDirection", round(meta.heading, 2))
-    add("XMP:CreateDate", _fmt_sub(local))
-    add("XMP:ModifyDate", _fmt_sub(local))
-    add("XMP:CreatorTool", TOOL_NAME)
-
-    # --- XMP-GPano spherical panorama -------------------------------
-    heading = meta.heading if meta.heading is not None else 0.0
-    add("XMP-GPano:UsePanoramaViewer", "True")
-    add("XMP-GPano:CaptureSoftware", meta.model)
-    add("XMP-GPano:StitchingSoftware", TOOL_NAME)
-    add("XMP-GPano:ProjectionType", "equirectangular")
-    add("XMP-GPano:PoseHeadingDegrees", round(heading, 2))
-    add("XMP-GPano:PosePitchDegrees", 0)
-    add("XMP-GPano:PoseRollDegrees", 0)
-    add("XMP-GPano:InitialViewHeadingDegrees", round(heading, 2))
-    add("XMP-GPano:InitialViewPitchDegrees", 0)
-    add("XMP-GPano:InitialViewRollDegrees", 0)
-    add("XMP-GPano:InitialHorizontalFOVDegrees", 0)
-    add("XMP-GPano:InitialVerticalFOVDegrees", 0)
-    add("XMP-GPano:CroppedAreaLeftPixels", 0)
-    add("XMP-GPano:CroppedAreaTopPixels", 0)
-    add("XMP-GPano:CroppedAreaImageWidthPixels", meta.width)
-    add("XMP-GPano:CroppedAreaImageHeightPixels", meta.height)
-    add("XMP-GPano:FullPanoWidthPixels", meta.width)
-    add("XMP-GPano:FullPanoHeightPixels", meta.height)
-    add("XMP-GPano:FirstPhotoDate", _fmt(local))
-    add("XMP-GPano:LastPhotoDate", _fmt(local))
-    add("XMP-GPano:SourcePhotosCount", 2)
-    return args
-
-
-def write_frame(path: str, meta: FrameMeta) -> None:
-    """Inject metadata into an extracted JPEG in place."""
-    cmd = [EXIFTOOL, "-q", "-q", "-m", "-overwrite_original", "-P",
-           *build_args(meta), path]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        raise MetadataError(
-            f"exiftool failed on {path}: "
-            f"{proc.stderr.decode('utf-8', 'replace').strip()}")
-
-
-# =============================================================================
-# 6. CLI - argument parsing and orchestration
-# =============================================================================
-
-
-def _build_parser() -> argparse.ArgumentParser:
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="max360-v2i",
-        description="Extract geotagged equirectangular still images from "
-                    "GoPro MAX .360 videos at a fixed GPS distance interval. "
-                    "Only files recorded by a GoPro MAX are processed; any "
-                    "other video found under --input is skipped with a logged "
-                    "reason.",
+        prog=SCRIPT_NAME,
+        description="Extract geotagged equirectangular still images from GoPro "
+                    "MAX .360 videos at a fixed GPS distance interval. Only "
+                    "files recorded by a GoPro MAX are processed.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Example:\n"
-                "  max360-v2i --input video/ --output images/ --distance 5\n\n"
-                "Only files recorded by a GoPro MAX are processed; any other "
-                "video found under --input is skipped with a logged reason.\n\n"
-                "Time base: file names and folders use camera-local time by "
-                "default; use --time-base utc for UTC."))
-
-    # Options shared by every *-v2i.py exporter (identical names/defaults/help).
+                "  %(prog)s -i video/ -o images/ -d 5\n\n"
+                "Time base: GoPro MAX stores UTC and no local wall clock, so "
+                "file names/EXIF use UTC unless --timezone is given."))
     v2i.add_common_arguments(parser)
-    # Options shared with the BlackVue exporter (GPMF/NMEA GPS handling).
     v2i.add_gps_filter_arguments(parser)
+    v2i.add_track_export_arguments(parser)
 
-    # -- MAX-specific options ---------------------------------------------
     geometry = parser.add_argument_group("output geometry")
     geometry.add_argument("--width", type=int, default=DEFAULT_WIDTH,
                           help="output image width (2:1 with --height)")
@@ -1054,15 +669,21 @@ def _build_parser() -> argparse.ArgumentParser:
     geometry.add_argument("--interp", default="cubic",
                           choices=["cubic", "linear", "nearest", "lanczos"],
                           help="v360 reprojection interpolation")
+    geometry.add_argument("--stitch-backend",
+                          choices=("auto", "ffmpeg", "max2sphere"),
+                          default="auto",
+                          help="EAC stitching backend (default: ffmpeg when "
+                               "available)")
     orientation = parser.add_argument_group("orientation")
     orientation.add_argument("--heading-window", type=int, default=4,
-                             help="GPS samples either side used for heading")
+                             help="GPS samples either side used for heading "
+                                  "smoothing (compatibility option)")
+    orientation.add_argument("--imu-heading", action="store_true",
+                             help="derive compass heading from MAGN + GRAV "
+                                  "instead of GPS course (experimental)")
     run = parser.add_argument_group("run control")
-    run.add_argument("--save-telemetry", action="store_true",
-                     help="also write the raw GPMF (.gpmd) and a GPX (.gpx) "
-                          "track next to the images")
     run.add_argument("--keep-filter", action="store_true",
-                     help="keep the generated ffmpeg filter script")
+                     help="keep the generated ffmpeg filter graph")
 
     # Backwards compatibility: the input directory used to be positional.
     for action in parser._actions:
@@ -1073,204 +694,40 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _frame_for(fps: float, video_time: float, frame_count: int) -> int:
-    n = int(round(max(0.0, video_time) * fps))
-    return max(0, min(n, frame_count - 1))
-
-
-def _tz_offset_hours(args) -> float:
-    """Local-time offset in hours for file names and EXIF.
-
-    GoPro MAX stores no local wall-clock, so the offset defaults to UTC (0 h)
-    and is only applied when the user passes ``--timezone`` (or the legacy
-    ``--tz`` alias).  ``--time-base utc`` forces UTC.
-    """
-    if args.time_base == "utc":
-        return 0.0
-    seconds = v2i.parse_timezone(getattr(args, "timezone", None))
-    return 0.0 if seconds is None else seconds / 3600.0
-
-
-def _local(utc: _dt.datetime, tz_offset_hours: float) -> _dt.datetime:
-    """Frame capture time in local time (UTC plus the timezone offset)."""
-    return utc.astimezone(_dt.timezone.utc) + _dt.timedelta(hours=tz_offset_hours)
-
-
-def _image_name(local: _dt.datetime, ext: str = ".jpg") -> str:
-    """``YYYY-MM-DD_HH-MM-SS-mmm.ext`` in local time (GoPro-style)."""
-    return (local.strftime("%Y-%m-%d_%H-%M-%S")
-            + f"-{local.microsecond // 1000:03d}{ext}")
-
-
-def _image_paths(out_dir: str, stem: str, points,
-                 tz_offset_hours: float, ext: str = ".jpg") -> List[str]:
-    """Destination paths grouped as ``<output>/<date>/<sequence>/<time>.ext``.
-
-    ``date`` and the filename are the frame's local capture time; ``sequence``
-    is the source video's stem.  Collisions (two frames in the same
-    millisecond) get a ``-2`` / ``-3`` suffix.
-    """
-    paths: List[str] = []
-    used = set()
-    for pt in points:
-        local = _local(pt.utc, tz_offset_hours)
-        path = os.path.join(out_dir, local.strftime("%Y-%m-%d"), stem,
-                            _image_name(local, ext))
-        if path in used:
-            base, _ext = os.path.splitext(path)
-            k = 2
-            while f"{base}-{k}{ext}" in used:
-                k += 1
-            path = f"{base}-{k}{ext}"
-        used.add(path)
-        paths.append(path)
-    return paths
-
-
-def process_video(path: str, args) -> dict:
-    """Process one .360 file. Returns a per-file result summary dict."""
-    name = os.path.basename(path)
-    result = {"file": path, "points": [], "images": 0,
-              "error": None, "total_distance": 0.0}
-
-    LOG.info("%s", name)
-    info = probe(path)
-    LOG.debug("duration=%.2fs fps=%.4f frames=%d hemi=(%d,%d) gpmd=%s "
-              "native=%dx%d", info.duration, info.fps, info.frame_count,
-              info.hemi_a, info.hemi_b, info.gpmd, info.width, info.height)
-
-    if info.gpmd is None:
-        raise GpsError("no GPMF (gpmd) telemetry track in file")
-
-    gpmd = extract_gpmd(path, info.gpmd)
-    LOG.debug("gpmd bytes=%d", len(gpmd))
-    track = extract_track(gpmd, stationary_speed=args.stationary_speed,
-                          smooth=args.smooth, jitter_m=args.jitter)
-    result["total_distance"] = track.total_distance
-    n_valid = sum(1 for s in track.samples if s.valid_fix)
-    LOG.debug("gps samples=%d valid=%d distance=%.1fm clock-spread=%.0fms",
-              len(track.samples), n_valid, track.total_distance,
-              track.offsets_spread_s * 1000)
-
-    if n_valid == 0:
-        raise GpsError("no GPS sample has a valid fix")
-
-    points = select_by_distance(
-        track, args.distance,
-        start_distance=args.start_distance,
-        heading_offset=args.heading_offset,
-        heading_window=args.heading_window,
-        max_points=args.max_images)
-    LOG.info("  %d image(s) over %.1f m (%sZ -> %sZ)", len(points),
-             track.total_distance,
-             track.start_utc.astimezone(_dt.timezone.utc).strftime(
-                 "%Y-%m-%d %H:%M:%S"),
-             track.end_utc.astimezone(_dt.timezone.utc).strftime("%H:%M:%S"))
-
-    # Map each point to a video frame; drop points that collide on a frame.
-    planned = []
-    seen = set()
-    for pt in points:
-        n = _frame_for(info.fps, pt.video_time, info.frame_count)
-        if n in seen:
-            LOG.debug("skip point %d: frame %d already used", pt.index, n)
-            continue
-        seen.add(n)
-        planned.append((n, pt))
-
-    tz_hours = _tz_offset_hours(args)
-    ext = ".png" if args.format == "png" else ".jpg"
-    stem = os.path.splitext(name)[0]
-    outputs = _image_paths(args.output, stem, [pt for _, pt in planned],
-                           tz_hours, ext)
-
-    planned_rows = [{
-        "index": pt.index,
-        "frame": n,
-        "video_time": round(pt.video_time, 3),
-        "utc": pt.utc.astimezone(_dt.timezone.utc).isoformat(),
-        "lat": round(pt.lat, 7), "lon": round(pt.lon, 7),
-        "alt": None if pt.alt is None else round(pt.alt, 2),
-        "heading": None if pt.heading is None else round(pt.heading, 2),
-        "distance": round(pt.distance, 2),
-    } for n, pt in planned]
-    for r, p in zip(planned_rows, outputs):
-        r["output"] = os.path.relpath(p, args.output)
-    result["points"] = planned_rows
-
-    if args.dry_run:
-        for r in planned_rows:
-            LOG.info("    #%4d  f=%5d  %sZ  %.6f,%.6f  alt=%s  hdg=%s  "
-                     "d=%sm  -> %s", r["index"], r["frame"], r["utc"][11:23],
-                     r["lat"], r["lon"], r["alt"], r["heading"], r["distance"],
-                     r["output"])
-        result["images"] = len(planned_rows)
-        return result
-
-    if args.save_telemetry:
-        with open(os.path.join(args.output, stem + ".gpmd"), "wb") as fh:
-            fh.write(gpmd)
-        with open(os.path.join(args.output, stem + ".gpx"), "w") as fh:
-            fh.write(to_gpx(track, stem))
-
-    # Skip frames whose image already exists unless --overwrite was given.
-    todo = []
-    for (n, pt), out in zip(planned, outputs):
-        if os.path.exists(out) and not args.overwrite:
-            LOG.debug("exists, skipping: %s", os.path.relpath(out, args.output))
-            continue
-        todo.append((n, pt, out))
-
-    written = 0
-    if todo:
-        frames = [n for n, _, _ in todo]
-        dests = [out for _, _, out in todo]
-        files = stitch_frames(
-            info, frames, dests,
-            width=args.width, height=args.height, quality=args.quality,
-            image_format=args.format, interp=args.interp,
-            threads=args.threads, workers=args.workers,
-            keep_filter=(os.path.join(args.output, f"{stem}.filter")
-                         if args.keep_filter else None))
-        if len(files) != len(todo):
-            raise BackendError(
-                f"ffmpeg produced {len(files)} images but {len(todo)} were "
-                "selected")
-        if not args.no_exif:
-            for (n, pt, _out), fpath in zip(todo, files):
-                write_frame(fpath, FrameMeta(
-                    utc=pt.utc.astimezone(_dt.timezone.utc),
-                    lat=pt.lat, lon=pt.lon, alt=pt.alt, heading=pt.heading,
-                    width=args.width, height=args.height,
-                    make="GoPro", model="GoPro Max", software=info.firmware,
-                    tz_offset_hours=tz_hours,
-                    description=f"{name} (frame {n}, {pt.distance:.1f} m)"))
-        written = len(files)
-
-    result["images"] = written
-    return result
+def validate(parser, args):
+    v2i.validate_common_args(parser, args)
+    if args.fallback_interval < 0:
+        parser.error("--fallback-interval must not be negative")
+    if args.width < 2 or args.height < 2:
+        parser.error("--width/--height must be at least 2")
+    if args.width % 2 or args.height % 2:
+        parser.error("--width/--height must be even for yuv output")
+    if args.heading_window < 1:
+        parser.error("--heading-window must be at least 1")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.input is None:
         args.input = args.input_alias
     if args.input is None:
         parser.error("--input is required (or give a positional input path)")
-    v2i.validate_common_args(parser, args)
+    validate(parser, args)
     v2i.setup_logging(v2i.log_level(args))
 
-    try:
-        check_tools()
-        if not args.dry_run and not args.no_exif:
-            check_exiftool()
-    except (BackendError, MetadataError) as exc:
-        LOG.error("%s", exc)
-        return 2
+    for tool in (FFMPEG, FFPROBE):
+        if shutil.which(tool) is None:
+            LOG.error("required program not found on PATH: %s", tool)
+            return 2
+    have_exiftool = shutil.which(EXIFTOOL) is not None
+    if not have_exiftool and not args.no_exif:
+        LOG.warning("exiftool not found on PATH; images will have no metadata")
 
     input_arg = os.path.abspath(args.input)
+    root = input_arg if os.path.isdir(input_arg) else os.path.dirname(input_arg)
     output_dir = os.path.abspath(args.output)
+    args.output = output_dir
 
     extensions = v2i.resolve_extensions(args)
     videos = v2i.discover_videos(input_arg, extensions, args.recursive)
@@ -1279,7 +736,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                   ",".join(extensions), input_arg)
         return 1
 
-    # Keep only files this camera recorded; never touch another camera's video.
     accepted = []
     for video in videos:
         detection = v2i.detect_camera(video)
@@ -1299,36 +755,50 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.dry_run:
         os.makedirs(output_dir, exist_ok=True)
 
+    sequence_ids = v2i.build_sequence_ids(accepted, root)
     results = []
     failures = 0
     for path in accepted:
         try:
-            results.append(process_video(path, args))
-        except (BackendError, GpsError, MetadataError) as exc:
+            result = process_video(path, sequence_ids[path], args)
+            results.append(result)
+            if result.get("failed"):
+                failures += 1
+                if args.fail_fast:
+                    break
+        except (Fatal, OSError) as exc:
             failures += 1
             LOG.error("%s: %s", os.path.basename(path), exc)
-            results.append({"file": path, "error": str(exc), "images": 0,
-                            "points": [], "total_distance": 0.0})
+            results.append({"video": os.path.basename(path),
+                            "sequence": sequence_ids[path], "images": 0,
+                            "planned": 0, "failed": True, "entries": [],
+                            "dir": None})
             if args.fail_fast:
                 break
 
     total_images = sum(r.get("images", 0) for r in results)
-    total_dist = sum(r.get("total_distance", 0.0) for r in results)
-    LOG.info("done: %d image(s) from %d/%d video(s), %.1f m of track%s",
-             total_images, len(results) - failures, len(accepted), total_dist,
+    LOG.info("done: %d image(s) from %d/%d video(s)%s", total_images,
+             len(results) - failures, len(accepted),
              (", %d failure(s)" % failures) if failures else "")
 
     if args.manifest and not args.dry_run:
+        entries = [entry for result in results
+                   for entry in result.get("entries", [])]
         with open(args.manifest, "w") as fh:
-            json.dump({"generated": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                       "camera": v2i.CAMERA_MAX,
+            json.dump({"generator": SCRIPT_NAME, "camera": v2i.CAMERA_MAX,
+                       "camera_label": v2i.CAMERA_LABELS[v2i.CAMERA_MAX],
                        "distance_interval_m": args.distance,
-                       "output_dir": output_dir,
-                       "videos": results}, fh, indent=2)
+                       "image_count": len(entries), "images": entries,
+                       "videos": [{k: v for k, v in result.items()
+                                   if k != "entries"} for result in results]},
+                      fh, indent=2)
         LOG.info("manifest written to %s", args.manifest)
-
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        sys.exit(130)
