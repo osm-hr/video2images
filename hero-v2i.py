@@ -346,7 +346,7 @@ def process_video(path: str, sequence: str, args) -> dict:
         extracted = v2i.extract_frames_by_index(
             path, [record["frame_index"] for record in to_extract], temp_dir,
             image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads)
+            workers=args.workers, threads=args.threads, timeline=timeline)
         for record in to_extract:
             temp = extracted.get(record["frame_index"])
             if not temp:

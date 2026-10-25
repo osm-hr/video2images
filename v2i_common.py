@@ -1378,42 +1378,103 @@ def select_expression(frames: Sequence[int]) -> str:
     return "+".join("eq(n\\,%d)" % int(n) for n in frames)
 
 
-def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
-                            image_format: str, quality: int, workers: int = 1,
-                            threads: int = 0,
-                            stream_ordinal: int = 0) -> Dict[int, str]:
-    """Extract exact frames by index with one ffmpeg decode pass.
+# ffmpeg parses ``select`` expressions with a rather small recursion limit:
+# more than ~100 ``eq(n,...)`` terms fail with "Error while parsing expression"
+# (and on memory-constrained machines even earlier).  Batches are therefore
+# kept comfortably below that limit.
+EXTRACT_CHUNK_SIZE = 90
 
-    ``select`` runs on actual decoded frame numbers and ``-vsync 0`` prevents
-    ffmpeg from duplicating/dropping frames, so every requested index yields
-    exactly one image.  Outputs are numbered in the same order as the sorted
-    frame list and mapped back to the original indices.
+
+def _extract_batch(video: str, frames: Sequence[int], pattern: str, *,
+                   image_format: str, quality: int, threads: int,
+                   stream_ordinal: int, seek_time: Optional[float]) -> bool:
+    """Run one ffmpeg ``select`` batch; return whether every image appeared.
+
+    When *seek_time* is given the filter indices are relative to that input
+    seek point (``frames[0] == 0``); otherwise they are absolute decoded frame
+    numbers.  Input seeking is accurate in ffmpeg and was verified to return
+    byte-identical frames to a full decode.
     """
-    unique = sorted({int(f) for f in frames if int(f) >= 0})
-    if not unique:
-        return {}
-    os.makedirs(tmp_dir, exist_ok=True)
-    pattern = os.path.join(tmp_dir, "f_%06d." + image_format)
-    expr = select_expression(unique)
-    cmd = [FFMPEG, "-v", "error", "-y", "-i", video,
-           "-map", "0:v:%d" % stream_ordinal,
-           "-vf", "select='%s'" % expr, "-vsync", "0"]
+    selected = frames if seek_time is None else \
+        [int(frame) - int(frames[0]) for frame in frames]
+    expr = select_expression(selected)
+    cmd = [FFMPEG, "-v", "error", "-y"]
+    if seek_time is not None:
+        cmd += ["-ss", "%.6f" % seek_time]
+    cmd += ["-i", video, "-map", "0:v:%d" % stream_ordinal,
+            "-vf", "select='%s'" % expr, "-vsync", "0"]
     cmd += ffmpeg_quality_args(image_format, quality)
     if threads:
         cmd += ["-threads", str(threads)]
     cmd.append(pattern)
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                          stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=300)
+    except subprocess.TimeoutExpired:
+        LOG.warning("batch frame extraction timed out")
+        return False
     if proc.returncode != 0:
         LOG.warning("batch frame extraction failed: %s",
                     proc.stderr.decode("utf-8", "replace").strip()
                     .splitlines()[-1:] or "")
+        return False
+    return all(os.path.exists(pattern % order)
+               for order in range(1, len(frames) + 1))
+
+
+def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
+                            image_format: str, quality: int, workers: int = 1,
+                            threads: int = 0, stream_ordinal: int = 0,
+                            timeline: Optional[FrameTimeline] = None,
+                            chunk_size: int = EXTRACT_CHUNK_SIZE
+                            ) -> Dict[int, str]:
+    """Extract exact frames by index in bounded ffmpeg batches."""
+    unique = sorted({int(f) for f in frames if int(f) >= 0})
+    if not unique:
         return {}
+    os.makedirs(tmp_dir, exist_ok=True)
+    limit = max(1, int(chunk_size))
+
+    if (timeline is None and len(unique) > limit):
+        try:
+            timeline = probe_frame_timeline(
+                video, stream_ordinal=stream_ordinal, logger=LOG)
+        except (UnreadableVideo, OSError):
+            timeline = None
+
     extracted: Dict[int, str] = {}
-    for order, index in enumerate(unique, start=1):
-        path = os.path.join(tmp_dir, "f_%06d.%s" % (order, image_format))
-        if os.path.exists(path):
-            extracted[index] = path
+    use_seek = (timeline is not None and timeline.source == "ffprobe"
+                and len(timeline))
+    for batch_index, start in enumerate(range(0, len(unique), limit)):
+        chunk = unique[start:start + limit]
+        pattern = os.path.join(
+            tmp_dir, "f_%03d_%%06d.%s" % (batch_index, image_format))
+        seek_time: Optional[float] = None
+        if use_seek and chunk[-1] < len(timeline):
+            seek_time = float(timeline.pts(chunk[0]))
+        if seek_time is not None and _extract_batch(
+                video, chunk, pattern, image_format=image_format,
+                quality=quality, threads=threads,
+                stream_ordinal=stream_ordinal, seek_time=seek_time):
+            paths = [(chunk[order - 1], pattern % order)
+                     for order in range(1, len(chunk) + 1)]
+        else:
+            if seek_time is not None:
+                pattern = os.path.join(
+                    tmp_dir, "f_%03d_full_%%06d.%s"
+                    % (batch_index, image_format))
+            if not _extract_batch(
+                    video, chunk, pattern, image_format=image_format,
+                    quality=quality, threads=threads,
+                    stream_ordinal=stream_ordinal, seek_time=None):
+                LOG.error("could not extract frames %d-%d from %s",
+                          chunk[0], chunk[-1], os.path.basename(video))
+                continue
+            paths = [(chunk[order - 1], pattern % order)
+                     for order in range(1, len(chunk) + 1)]
+        for index, path in paths:
+            if os.path.exists(path):
+                extracted[index] = path
     return extracted
 
 

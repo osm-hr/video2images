@@ -180,16 +180,42 @@ def probe(path: str) -> VideoInfo:
 # ---------------------------------------------------------------------------
 # EAC stitching filter
 # ---------------------------------------------------------------------------
+# Known GoPro MAX hemisphere layouts: (strip width, strip height) ->
+# (side width, centre width, blend width).  A strip is side + centre + side
+# with no gaps; each side region contains its own 2*blend overlap seam.
+EAC_LAYOUTS = {
+    (4096, 1344): (1376, 1344, 32),
+    (2272, 736): (768, 736, 16),
+}
+
+
+def _eac_layout(width: int, height: int) -> Tuple[int, int, int]:
+    """Return ``(side, centre, blend)`` for a native hemisphere strip."""
+    key = (int(width), int(height))
+    if key in EAC_LAYOUTS:
+        return EAC_LAYOUTS[key]
+    # Unknown layout: assume the same equal-gap cube net as the known strips.
+    gap = (int(width) - 3 * int(height)) // 2
+    if gap < 2 or int(width) != 3 * int(height) + 2 * gap:
+        raise BackendError("unsupported EAC hemisphere layout %dx%d"
+                           % (width, height))
+    return int(height) + gap, int(height), gap
+
+
 def build_eac_filter(a: int, b: Optional[int], width: int, height: int,
                      select: Optional[str] = None,
                      interp: str = "cubic",
-                     already_equirect: bool = False) -> str:
+                     already_equirect: bool = False,
+                     hemi_width: int = HEMI_W,
+                     hemi_height: int = HEMI_H) -> str:
     """Build the ffmpeg filter graph for one EAC hemisphere pair.
 
-    Each native 4096x1344 hemisphere contains three 1344-wide faces at x=0,
-    x=1376 and x=2752 with 32-pixel gaps.  The gaps are dropped, the three
-    faces are hstacked to 4032 pixels, the two hemispheres are vstacked to
-    4032x2688, and v360 reprojects EAC -> equirectangular.
+    A native 4096x1344 strip is side 1376 + centre 1344 + side 1376 with no
+    gaps.  The outer halves of the left/right side regions overlap by 32 px,
+    so they must be cross-blended instead of simply cropped (max2sphere does
+    the same).  The six faces are assembled into a 3x2 EAC net and v360
+    reprojects it to equirectangular.  The 2272x736 (side 768, centre 736,
+    blend 16) layout is handled by the same code.
     """
     lines: List[str] = []
     if already_equirect:
@@ -202,22 +228,72 @@ def build_eac_filter(a: int, b: Optional[int], width: int, height: int,
 
     if b is None:
         raise BackendError("EAC stitching needs two hemisphere streams")
-    if select:
-        lines.append("[0:%d]select='%s'[ain]" % (a, select))
-        lines.append("[0:%d]select='%s'[bin]" % (b, select))
-    else:
-        lines.append("[0:%d]null[ain]" % a)
-        lines.append("[0:%d]null[bin]" % b)
+    side, centre, blend = _eac_layout(hemi_width, hemi_height)
+    unique_src = side // 2 - 2 * blend      # one outer half of a side region
+    blend_chunk = 2 * blend                 # width of each overlap crop
+    out_unique = (centre - blend_chunk) // 2
+    if (unique_src <= 0 or blend_chunk <= 1 or out_unique <= 0
+            or 2 * out_unique + blend_chunk != centre):
+        raise BackendError("unsupported EAC hemisphere layout %dx%d"
+                           % (hemi_width, hemi_height))
 
-    for tag, source in (("A", "[ain]"), ("B", "[bin]")):
-        lines.append("%ssplit=3[%s0][%s1][%s2]" % (source, tag, tag, tag))
-        for face, x in enumerate((0, 1376, 2752)):
-            lines.append(
-                "[%s%d]crop=1344:1344:%d:0,format=yuv420p[%sF%d]"
-                % (tag, face, x, tag, face))
-        lines.append("[%sF0][%sF1][%sF2]hstack=inputs=3[%sROW]"
-                     % (tag, tag, tag, tag))
-    lines.append("[AROW][BROW]vstack=inputs=2[eac]")
+    for stream, tag in ((a, "A"), (b, "B")):
+        if select:
+            head = "[0:%d]select='%s',format=rgb24" % (stream, select)
+        else:
+            head = "[0:%d]format=rgb24" % stream
+        lines.append("%s,split=3[%sL][%sC][%sR]"
+                     % (head, tag, tag, tag))
+        lines.append("[%sL]split=4[%sL0][%sL1][%sL2][%sL3]"
+                     % (tag, tag, tag, tag, tag))
+        lines.append("[%sR]split=4[%sR0][%sR1][%sR2][%sR3]"
+                     % (tag, tag, tag, tag, tag))
+
+    def fit(source: str, destination: str) -> None:
+        if unique_src == out_unique:
+            lines.append("[%s]null[%s]" % (source, destination))
+        else:
+            lines.append("[%s]scale=%d:%d:flags=lanczos[%s]"
+                         % (source, out_unique, centre, destination))
+
+    def side_face(name: str, pads: Sequence[str], x0: int,
+                  near_first: bool) -> None:
+        """Assemble one left/right side face with a 2*blend overlap seam."""
+        near_x = x0 if near_first else x0 + unique_src + 2 * blend_chunk
+        far_x = (x0 + unique_src + 2 * blend_chunk
+                 if near_first else x0)
+        ov1_x = x0 + unique_src
+        ov2_x = x0 + unique_src + blend_chunk
+        lines.append("[%s]crop=%d:%d:%d:0[%s_near_src]"
+                     % (pads[0], unique_src, hemi_height, near_x, name))
+        lines.append("[%s]crop=%d:%d:%d:0[%s_ov1]"
+                     % (pads[1], blend_chunk, hemi_height, ov1_x, name))
+        lines.append("[%s]crop=%d:%d:%d:0[%s_ov2]"
+                     % (pads[2], blend_chunk, hemi_height, ov2_x, name))
+        lines.append("[%s]crop=%d:%d:%d:0[%s_far_src]"
+                     % (pads[3], unique_src, hemi_height, far_x, name))
+        fit("%s_near_src" % name, "%s_near" % name)
+        fit("%s_far_src" % name, "%s_far" % name)
+        lines.append(
+            "[%s_ov1][%s_ov2]blend=all_expr='A*(1-X/%d)+B*(X/%d)'[%s_ov]"
+            % (name, name, blend_chunk - 1, blend_chunk - 1, name))
+        order = (("%s_near" % name, "%s_ov" % name, "%s_far" % name)
+                 if near_first else
+                 ("%s_far" % name, "%s_ov" % name, "%s_near" % name))
+        lines.append("%shstack=inputs=3[%s]"
+                     % ("".join("[%s]" % item for item in order), name))
+
+    side_face("LEFT", ["AL0", "AL1", "AL2", "AL3"], 0, near_first=False)
+    side_face("RIGHT", ["AR0", "AR1", "AR2", "AR3"],
+              side + centre, near_first=True)
+    side_face("DOWN", ["BL0", "BL1", "BL2", "BL3"], 0, near_first=False)
+    side_face("UP", ["BR0", "BR1", "BR2", "BR3"],
+              side + centre, near_first=True)
+    lines.append("[AC]crop=%d:%d:%d:0[FRONT]" % (centre, hemi_height, side))
+    lines.append("[BC]crop=%d:%d:%d:0[BACK]" % (centre, hemi_height, side))
+    lines.append("[LEFT][FRONT][RIGHT]hstack=inputs=3[ROWA]")
+    lines.append("[DOWN][BACK][UP]hstack=inputs=3[ROWB]")
+    lines.append("[ROWA][ROWB]vstack=inputs=2[eac]")
     lines.append("[eac]v360=eac:equirect:interp=%s:w=%d:h=%d[OUT]"
                  % (interp, width, height))
     return ";\n".join(lines)
@@ -270,53 +346,116 @@ def _copy_outputs(temp_files: Sequence[str], outputs: Sequence[str]) -> None:
         shutil.copyfile(temp, dest)
 
 
-def stitch_ffmpeg(info: VideoInfo, frames: Sequence[int],
-                  outputs: Sequence[str], *, width: int, height: int,
-                  quality: int, image_format: str, interp: str,
-                  threads: int, keep_filter: Optional[str]) -> None:
-    """Extract selected frames through the EAC/v360 graph in one decode pass."""
-    ordered_frames = sorted(int(f) for f in frames)
-    if not ordered_frames:
-        return
-    # outputs correspond to the original (already increasing) choices
-    by_frame = {int(frame): output for frame, output in zip(frames, outputs)}
-    temp_dir = tempfile.mkdtemp(prefix="max360_")
-    script_path = os.path.join(temp_dir, "stitch.filter")
-    select = v2i.select_expression(ordered_frames)
+def _kept_filter_path(base: str, index: int, total: int) -> str:
+    """Per-batch name for ``--keep-filter`` (plain name for a single batch)."""
+    if total <= 1:
+        return base
+    root, ext = os.path.splitext(base)
+    return "%s.%02d%s" % (root, index, ext or ".filter")
+
+
+def _stitch_batch(info: VideoInfo, frames: Sequence[int],
+                  by_frame: Dict[int, str], temp_dir: str, batch_index: int,
+                  *, width: int, height: int, quality: int,
+                  image_format: str, interp: str, threads: int,
+                  keep_filter: Optional[str], total_batches: int,
+                  seek_time: Optional[float]) -> None:
+    """Run one bounded EAC/v360 batch and copy its images to their targets."""
+    ordered = [int(frame) for frame in frames]
+    selected = ordered if seek_time is None else \
+        [frame - ordered[0] for frame in ordered]
+    select = v2i.select_expression(selected)
     script = build_eac_filter(
         info.hemi_a, info.hemi_b, width, height, select=select,
-        interp=interp, already_equirect=info.already_equirect)
+        interp=interp, already_equirect=info.already_equirect,
+        hemi_width=info.width, hemi_height=info.height)
+    attempt = "seek" if seek_time is not None else "full"
+    script_path = os.path.join(
+        temp_dir, "stitch_%03d_%s.filter" % (batch_index, attempt))
     with open(script_path, "w") as fh:
         fh.write(script + "\n")
     if keep_filter:
-        parent = os.path.dirname(keep_filter)
+        dest = _kept_filter_path(keep_filter, batch_index, total_batches)
+        parent = os.path.dirname(dest)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        shutil.copyfile(script_path, keep_filter)
+        shutil.copyfile(script_path, dest)
 
     ext = "png" if image_format == "png" else "jpg"
-    pattern = os.path.join(temp_dir, "img_%06d." + ext)
+    prefix = "img_%03d_%s_" % (batch_index, attempt)
+    pattern = os.path.join(temp_dir, prefix + "%06d." + ext)
     pix_fmt = "rgb24" if image_format == "png" else "yuvj420p"
-    cmd = [FFMPEG, "-v", "error", "-y", "-i", info.path,
-           "-filter_complex_script", script_path, "-map", "[OUT]",
-           "-an", "-sn", "-dn", "-vsync", "0", "-pix_fmt", pix_fmt]
+    cmd = [FFMPEG, "-v", "error", "-y"]
+    if seek_time is not None:
+        cmd += ["-ss", "%.6f" % seek_time]
+    cmd += ["-i", info.path, "-filter_complex_script", script_path,
+            "-map", "[OUT]", "-an", "-sn", "-dn", "-vsync", "0",
+            "-pix_fmt", pix_fmt]
     cmd += v2i.ffmpeg_quality_args(image_format, quality)
     if threads:
         cmd += ["-threads", str(threads)]
     cmd.append(pattern)
+    _run(cmd)
+    temp_files = sorted(glob.glob(
+        os.path.join(temp_dir, prefix + "*." + ext)))
+    if len(temp_files) != len(ordered):
+        raise BackendError(
+            "ffmpeg produced %d image(s) for %d selected frames"
+            % (len(temp_files), len(ordered)))
+    for frame, temp in zip(ordered, temp_files):
+        dest = by_frame[frame]
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(temp, dest)
+
+
+def stitch_ffmpeg(info: VideoInfo, frames: Sequence[int],
+                  outputs: Sequence[str], *, width: int, height: int,
+                  quality: int, image_format: str, interp: str,
+                  threads: int, keep_filter: Optional[str],
+                  timeline: Optional[v2i.FrameTimeline] = None) -> None:
+    """Stitch selected frames in bounded batches (seek-assisted when possible).
+
+    A single ``select`` expression cannot hold hundreds of frame numbers, so
+    frames are processed in batches.  Real ffprobe PTS values allow each batch
+    to seek to its first frame; a failed seek batch is retried from the start
+    of the file.  This keeps long MAX recordings both correct and fast.
+    """
+    ordered_frames = sorted({int(f) for f in frames})
+    if not ordered_frames:
+        return
+    # outputs correspond to the original (already increasing) choices
+    by_frame = {int(frame): output for frame, output in zip(frames, outputs)}
+    size = v2i.EXTRACT_CHUNK_SIZE
+    chunks = [ordered_frames[i:i + size]
+              for i in range(0, len(ordered_frames), size)]
+    temp_dir = tempfile.mkdtemp(prefix="max360_")
     try:
-        _run(cmd)
-        temp_files = sorted(glob.glob(os.path.join(temp_dir, "img_*." + ext)))
-        if len(temp_files) != len(ordered_frames):
-            raise BackendError(
-                "ffmpeg produced %d image(s) for %d selected frames"
-                % (len(temp_files), len(ordered_frames)))
-        for frame, temp in zip(ordered_frames, temp_files):
-            dest = by_frame[frame]
-            parent = os.path.dirname(dest)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            shutil.copyfile(temp, dest)
+        for batch_index, chunk in enumerate(chunks):
+            seek_time = None
+            if (timeline is not None and timeline.source == "ffprobe"
+                    and len(timeline) and chunk[-1] < len(timeline)):
+                seek_time = float(timeline.pts(chunk[0]))
+            if seek_time is not None:
+                try:
+                    _stitch_batch(
+                        info, chunk, by_frame, temp_dir, batch_index,
+                        width=width, height=height, quality=quality,
+                        image_format=image_format, interp=interp,
+                        threads=threads, keep_filter=keep_filter,
+                        total_batches=len(chunks), seek_time=seek_time)
+                    continue
+                except BackendError as exc:
+                    LOG.warning("seek-based stitching failed for frames "
+                                "%d-%d (%s); retrying with a full decode",
+                                chunk[0], chunk[-1], exc)
+            _stitch_batch(
+                info, chunk, by_frame, temp_dir, batch_index,
+                width=width, height=height, quality=quality,
+                image_format=image_format, interp=interp, threads=threads,
+                keep_filter=keep_filter, total_batches=len(chunks),
+                seek_time=None)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -329,9 +468,13 @@ def stitch_max2sphere(info: VideoInfo, frames: Sequence[int],
     video_out = os.path.join(temp_dir, "equirect.mp4")
     try:
         _run(max2sphere_command(info.path, video_out, width, height, info.fps))
+        timeline = v2i.probe_frame_timeline(
+            video_out, fps_hint=info.fps, duration_hint=info.duration,
+            logger=LOG)
         extracted = v2i.extract_frames_by_index(
             video_out, frames, os.path.join(temp_dir, "frames"),
-            image_format=image_format, quality=quality, threads=threads)
+            image_format=image_format, quality=quality, threads=threads,
+            timeline=timeline)
         for frame, dest in zip(frames, outputs):
             temp = extracted.get(int(frame))
             if temp is None:
@@ -614,7 +757,8 @@ def process_video(path: str, sequence: str, args) -> dict:
             stitch_ffmpeg(info, frames, outputs, width=args.width,
                           height=args.height, quality=args.quality,
                           image_format=args.format, interp=args.interp,
-                          threads=args.threads, keep_filter=keep_filter)
+                          threads=args.threads, keep_filter=keep_filter,
+                          timeline=timeline)
         for record in to_extract:
             record["written"] = os.path.exists(record["path"])
     if (args.start_distance == 0 and records

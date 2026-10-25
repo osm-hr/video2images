@@ -771,7 +771,7 @@ def process_video(video, sequence, output_dir, args, have_exiftool):
         extracted = v2i.extract_frames_by_index(
             video, [r["frame_index"] for r in to_extract], temp_dir,
             image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads)
+            workers=args.workers, threads=args.threads, timeline=timeline)
         for record in to_extract:
             temp_path = extracted.get(record["frame_index"])
             if not temp_path:
