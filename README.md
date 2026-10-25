@@ -70,7 +70,7 @@ Measured (evidence-based):
 
 ## Headings, accuracy, DOP
 
-- Heading source precedence: `compass` (from IMU/MAGN+GRAV with `--imu-heading`), `metadata_heading`, then GPS course (`heading`/`course`/`gps_course`); `heading_source` recorded
+- Heading source precedence (in `v2i_common.resolve_heading`): `compass_heading` (IMU/MAGN+GRAV) > `metadata_heading` > `course`/`heading` > `gps_course` (computed by `Track` from positions). `heading_source` recorded. `compass_heading` = camera/device pointing direction (tilt-compensated when available); `course`/`heading`/`gps_course` = Course Over Ground (direction of travel). Use `--heading-offset` for mounting angle, `--magnetic-declination` for compass. Per camera: HERO/MAX use GPMF GPS + optional `--imu-heading` compass from MAGN+GRAV; VIRB reads `course/heading` from FIT (usually travel direction) with `camera_orientation_deg` stored separately (not used for `img_direction`); BlackVue uses NMEA RMC/VTG course or Track-computed GPS course.
 - `--heading-offset` (`--offset` alias), `--magnetic-declination` applied to true north
 - Accuracy: measured (FIT/GPMF/EXIF) takes precedence; else `accuracy_m ≈ HDOP × UERE` with `accuracy_estimated=true`, `accuracy_source=hdop*uere` (default `--uere 5.0`)
 - VIRB uses FIT GPS accuracy fields (including field 8) and HDOP/VDOP; BlackVue uses GGA HDOP/sats and GSA PDOP/HDOP/VDOP; MAX/HERO use GPMF GPSP/GPSF and DOP
