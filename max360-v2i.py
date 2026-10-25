@@ -313,7 +313,8 @@ def _run(cmd: Sequence[str]) -> None:
     except FileNotFoundError as exc:
         raise BackendError("required program not found: %s" % cmd[0]) from exc
     if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        tail = stderr.splitlines()
         raise BackendError("command failed (%d): %s"
                            % (proc.returncode, tail[-1] if tail else "unknown"))
 
@@ -498,12 +499,12 @@ def _smooth(values: Sequence[float], window: int) -> List[float]:
     prefix = [0.0]
     for value in values:
         prefix.append(prefix[-1] + value)
-    out = []
+    out = [0.0] * len(values)
     n = len(values)
     for i in range(n):
         lo = max(0, i - half)
         hi = min(n, i + half + 1)
-        out.append((prefix[hi] - prefix[lo]) / (hi - lo))
+        out[i] = (prefix[hi] - prefix[lo]) / (hi - lo)
     return out
 
 
