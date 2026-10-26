@@ -98,6 +98,8 @@ Measured (evidence-based):
 
 All exporters accept: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
 
+Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (CRITICAL bold red, DEBUG grey). Colours are disabled automatically when stderr is redirected; set `NO_COLOR=1` to force them off or `FORCE_COLOR=1` to force them on.
+
 ## Measured sample evidence (for reference)
 
 | Sample | Notes |

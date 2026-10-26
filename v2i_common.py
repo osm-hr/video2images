@@ -680,6 +680,54 @@ def output_inside_input(args: argparse.Namespace) -> bool:
 # ---------------------------------------------------------------------------
 LOG = logging.getLogger("v2i")
 
+# ANSI colours per level: INFO green, WARNING yellow, ERROR red.
+_LEVEL_COLORS = {
+    "DEBUG": "\033[90m",         # bright black / grey
+    "INFO": "\033[32m",          # green
+    "WARNING": "\033[33m",       # yellow
+    "ERROR": "\033[31m",         # red
+    "CRITICAL": "\033[1;31m",    # bold red
+}
+_COLOR_RESET = "\033[0m"
+
+
+def color_enabled(stream=None) -> bool:
+    """Whether ANSI colours should be used for *stream* (stderr by default).
+
+    Honours ``NO_COLOR`` (disable) and ``FORCE_COLOR``/``CLICOLOR_FORCE``
+    (enable), otherwise colours are used only on a terminal.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if (os.environ.get("FORCE_COLOR")
+            or os.environ.get("CLICOLOR_FORCE")):
+        return True
+    stream = stream if stream is not None else sys.stderr
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+class ColorFormatter(logging.Formatter):
+    """Prefix each line with its level, coloured by severity."""
+
+    def __init__(self, fmt: str = "[%(levelname)s] %(message)s",
+                 color: bool = True):
+        super().__init__(fmt)
+        self.color = color
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if not self.color:
+            return text
+        code = _LEVEL_COLORS.get(record.levelname)
+        if not code:
+            return text
+        # Colour each line so multi-line messages stay readable.
+        return "\n".join(code + line + _COLOR_RESET
+                         for line in text.split("\n"))
+
 
 def setup_logging(level: str = "INFO", *, verbose: bool = False,
                   quiet: bool = False) -> None:
@@ -692,7 +740,7 @@ def setup_logging(level: str = "INFO", *, verbose: bool = False,
     for handler in list(root.handlers):
         root.removeHandler(handler)
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    handler.setFormatter(ColorFormatter(color=color_enabled(handler.stream)))
     root.addHandler(handler)
     root.setLevel(level)
 
