@@ -43,6 +43,14 @@ python3 hero-v2i.py -i video/2026-07-14-hero -o images/ --allow-missing-gps --fa
 
 Cameras are identified from container handlers, GPMF `DVNM`, stream layout and filenames; ambiguous GoPro metadata is **not guessed** (e.g. generic GoPro handler with no device/filename/layout evidence). Wrong-camera files are skipped with a clear reason.
 
+Every candidate file is reported during detection:
+
+- `[INFO] camera <camera label>: <file>` for videos that belong to the exporter's camera (evidence is shown with `-v`/`--log-level DEBUG`),
+- `[WARNING] skipping <file>: <reason>` for files from other cameras or unreadable files,
+- `[INFO] camera detection summary: BlackVue DR900=N, GoPro MAX 360=N, Garmin VIRB Ultra 30=N, GoPro HERO=N` once per run, counting **all** camera types found under `--input` (an `unsupported=N` entry is added when unknown files are present).
+
+So a single `-i video/` run shows both which files this exporter will process and the camera mix of the whole input tree.
+
 Measured (evidence-based):
 - MAX: `DVNM` includes `Max`, dual EAC video streams or `.360`, filename `GS*.360/mp4/mov`
 - HERO: `DVNM` includes `HERO`, single flat video stream with GPMF, filename `GX*/GH*/GOPR*/GOPRO*`

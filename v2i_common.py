@@ -390,6 +390,46 @@ def skip_reason(detection: Detection, expected: str) -> Optional[str]:
     return "recorded by %s, not %s" % (detection.label, CAMERA_LABELS[expected])
 
 
+def summarize_detections(counts: Dict[Optional[str], int]) -> str:
+    """One-line count per known camera type plus unrecognised files."""
+    parts = ["%s=%d" % (CAMERA_LABELS[camera], counts.get(camera, 0))
+             for camera in (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_VIRB,
+                            CAMERA_HERO)]
+    unsupported = counts.get(None, 0)
+    if unsupported:
+        parts.append("unsupported=%d" % unsupported)
+    return ", ".join(parts)
+
+
+def detect_videos(videos: Sequence[str], expected: str, *,
+                  logger: Optional[logging.Logger] = None
+                  ) -> Tuple[List[str], Dict[Optional[str], int]]:
+    """Detect every candidate and keep only videos from *expected*.
+
+    Videos that belong to the expected camera are reported at INFO, others are
+    skipped with a WARNING.  Returns ``(accepted, counts)`` where ``counts``
+    maps every detected camera id (``None`` for unrecognised files) to its file
+    count, and a summary of those counts is logged once at the end.
+    """
+    log = logger or LOG
+    counts: Dict[Optional[str], int] = {camera: 0 for camera in CAMERA_LABELS}
+    counts[None] = 0
+    accepted: List[str] = []
+    for video in videos:
+        detection = detect_camera(video)
+        counts[detection.camera] = counts.get(detection.camera, 0) + 1
+        reason = skip_reason(detection, expected)
+        if reason:
+            log.warning("skipping %s: %s", os.path.basename(video), reason)
+            continue
+        log.info("camera %s: %s", detection.label, os.path.basename(video))
+        log.debug("  evidence: %s",
+                  "; ".join(detection.evidence.get(expected, [])) or "none")
+        accepted.append(video)
+    log.info("camera detection summary: %s", summarize_detections(counts))
+    return accepted, counts
+
+
 # ---------------------------------------------------------------------------
 # Video discovery
 # ---------------------------------------------------------------------------

@@ -88,7 +88,7 @@ import tempfile
 
 import v2i_common as v2i
 import v2i_metadata
-from v2i_common import Track, detect_camera, plan_shots, skip_reason
+from v2i_common import Track, plan_shots
 
 SCRIPT_NAME = os.path.basename(os.path.realpath(__file__))
 LOG = logging.getLogger("blackvue900-v2i")
@@ -895,16 +895,8 @@ def main(argv=None):
         return 2
 
     # Keep only files this camera recorded; never touch another camera's video.
-    accepted = []
-    for video in videos:
-        detection = detect_camera(video)
-        reason = skip_reason(detection, v2i.CAMERA_BLACKVUE)
-        if reason:
-            LOG.warning("skipping %s: %s", os.path.basename(video), reason)
-            continue
-        LOG.debug("accepted %s (%s)", os.path.basename(video),
-                  "; ".join(detection.evidence.get(v2i.CAMERA_BLACKVUE, [])))
-        accepted.append(video)
+    accepted, _counts = v2i.detect_videos(videos, v2i.CAMERA_BLACKVUE,
+                                         logger=LOG)
     if not accepted:
         LOG.error("no %s video found among %d candidate file(s)",
                   v2i.CAMERA_LABELS[v2i.CAMERA_BLACKVUE], len(videos))

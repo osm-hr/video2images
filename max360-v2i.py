@@ -881,15 +881,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                   ",".join(extensions), input_arg)
         return 1
 
-    accepted = []
-    for video in videos:
-        detection = v2i.detect_camera(video)
-        reason = v2i.skip_reason(detection, v2i.CAMERA_MAX)
-        if reason:
-            LOG.warning("skipping %s: %s", os.path.basename(video), reason)
-            continue
-        LOG.debug("accepted %s", os.path.basename(video))
-        accepted.append(video)
+    accepted, _counts = v2i.detect_videos(videos, v2i.CAMERA_MAX, logger=LOG)
     if not accepted:
         LOG.error("no %s video found among %d candidate file(s)",
                   v2i.CAMERA_LABELS[v2i.CAMERA_MAX], len(videos))
