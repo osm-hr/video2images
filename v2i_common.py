@@ -168,17 +168,17 @@ def _run(cmd: Sequence[str]) -> Tuple[int, bytes, bytes]:
 
 
 @lru_cache(maxsize=64)
-def _probe_metadata_cache(key: str) -> VideoMeta:
-    path, ffprobe = key.rsplit("|", 1)
+def _probe_metadata_cached(path: str, mtime: float,
+                           ffprobe: str) -> VideoMeta:
     return _probe_metadata_impl(path, ffprobe)
 
 
 def probe_metadata(path: str, ffprobe: str = FFPROBE) -> VideoMeta:
     try:
         mtime = os.path.getmtime(path)
-        return _probe_metadata_cache(f"{path}|{mtime}|{ffprobe}")
     except OSError:
         return _probe_metadata_impl(path, ffprobe)
+    return _probe_metadata_cached(path, mtime, ffprobe)
 
 
 def _probe_metadata_impl(path: str, ffprobe: str) -> VideoMeta:
@@ -1115,10 +1115,14 @@ def _parse_rate(rate) -> float:
 
 
 @lru_cache(maxsize=64)
-def _probe_stream_info_cache(key: str) -> dict:
-    path, ffprobe, stream_ordinal = key.split("|")
+def _probe_stream_info_cached(path: str, mtime: float, ffprobe: str,
+                              stream_ordinal: int) -> dict:
+    return _read_stream_info(path, ffprobe, stream_ordinal)
+
+
+def _read_stream_info(path: str, ffprobe: str, stream_ordinal: int) -> dict:
     rc, out, err = _run([ffprobe, "-v", "error", "-print_format", "json",
-                         "-show_streams", "-select_streams", "v:%s"
+                         "-show_streams", "-select_streams", "v:%d"
                          % stream_ordinal, path])
     if rc != 0:
         return {}
@@ -1135,51 +1139,58 @@ def probe_stream_info(path: str, *, ffprobe: str = FFPROBE,
     """Return basic information for one video stream (ordinal, not index)."""
     try:
         mtime = os.path.getmtime(path)
-        return _probe_stream_info_cache(f"{path}|{mtime}|{ffprobe}|{stream_ordinal}")
     except OSError:
-        rc, out, err = _run([ffprobe, "-v", "error", "-print_format", "json",
-                             "-show_streams", "-select_streams", "v:%d"
-                             % stream_ordinal, path])
-        if rc != 0:
-            return {}
-        try:
-            data = json.loads(out.decode("utf-8", "replace"))
-        except ValueError:
-            return {}
-        streams = data.get("streams", [])
-        return streams[0] if streams else {}
+        return _read_stream_info(path, ffprobe, stream_ordinal)
+    return _probe_stream_info_cached(path, mtime, ffprobe, stream_ordinal)
 
 
-@lru_cache(maxsize=32)
-def _probe_frame_timeline_cache(key: str) -> FrameTimeline:
-    path, ffprobe, stream_ordinal_str = key.split("|")
-    stream_ordinal = int(stream_ordinal_str)
+def _read_packet_times(path: str, ffprobe: str,
+                       stream_ordinal: int) -> Tuple[Optional[float], ...]:
+    """Raw packet PTS values in decode order (empty when unreadable)."""
     rc, out, err = _run([ffprobe, "-v", "error", "-select_streams",
                          "v:%d" % stream_ordinal, "-show_packets",
                          "-show_entries", "packet=pts_time,dts_time",
                          "-of", "json", path])
-    raw_times: List[Optional[float]] = []
-    if rc == 0:
+    if rc != 0:
+        return ()
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+    except ValueError:
+        return ()
+    values: List[Optional[float]] = []
+    for packet in data.get("packets", []):
+        value = packet.get("pts_time")
+        if value in (None, "N/A"):
+            value = packet.get("dts_time")
         try:
-            data = json.loads(out.decode("utf-8", "replace"))
-            for packet in data.get("packets", []):
-                value = packet.get("pts_time")
-                if value in (None, "N/A"):
-                    value = packet.get("dts_time")
-                try:
-                    raw_times.append(None if value in (None, "N/A")
-                                     else float(value))
-                except (TypeError, ValueError):
-                    raw_times.append(None)
-            if raw_times and all(value is not None for value in raw_times):
-                raw_times = sorted(raw_times)
-        except ValueError:
-            raw_times = []
-    # Fall back - but we can't get fps hints easily here, will handle outside
-    return _build_timeline_from_raw(raw_times, path, ffprobe, stream_ordinal, 0, 0, None)
+            values.append(None if value in (None, "N/A") else float(value))
+        except (TypeError, ValueError):
+            values.append(None)
+    # Packets are stored in decode order; a decoder emits frames in presentation
+    # order, which is also the order of ffmpeg's select frame index.
+    if values and all(value is not None for value in values):
+        values = sorted(values)
+    return tuple(values)
 
 
-def _build_timeline_from_raw(raw_times, path, ffprobe, stream_ordinal, fps_hint, frame_count_hint, duration_hint):
+@lru_cache(maxsize=32)
+def _probe_packet_times_cached(path: str, mtime: float, ffprobe: str,
+                               stream_ordinal: int
+                               ) -> Tuple[Optional[float], ...]:
+    return _read_packet_times(path, ffprobe, stream_ordinal)
+
+
+def _probe_packet_times(path: str, ffprobe: str,
+                        stream_ordinal: int) -> Tuple[Optional[float], ...]:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return _read_packet_times(path, ffprobe, stream_ordinal)
+    return _probe_packet_times_cached(path, mtime, ffprobe, stream_ordinal)
+
+
+def _build_timeline_from_raw(raw_times, path, ffprobe, stream_ordinal,
+                             fps_hint, frame_count_hint, duration_hint):
     fps = fps_hint or 0.0
     if fps <= 0:
         info = probe_stream_info(path, ffprobe=ffprobe,
@@ -1200,6 +1211,7 @@ def _build_timeline_from_raw(raw_times, path, ffprobe, stream_ordinal, fps_hint,
         for i in range(first + 1, len(raw_times)):
             if raw_times[i] is None:
                 times[i] = times[i - 1] + nominal
+        # Keep PTS monotonic even if the container reports a stray value.
         for i in range(1, len(times)):
             if times[i] <= times[i - 1]:
                 times[i] = times[i - 1] + nominal
@@ -1220,74 +1232,21 @@ def probe_frame_timeline(path: str, *, stream_ordinal: int = 0,
                          duration_hint: Optional[float] = None,
                          ffprobe: str = FFPROBE,
                          logger: Optional[logging.Logger] = None) -> FrameTimeline:
-    """Read actual frame PTS values with ffprobe, falling back to a fixed fps."""
-    log = logger or LOG
-    try:
-        mtime = os.path.getmtime(path)
-        cached = _probe_frame_timeline_cache(f"{path}|{mtime}|{ffprobe}|{stream_ordinal}")
-        # Rebuild with correct hints
-        raw_times = cached.times if cached.source == "ffprobe" else []
-        # Get raw data again for rebuild
-        rc, out, err = _run([ffprobe, "-v", "error", "-select_streams",
-                             "v:%d" % stream_ordinal, "-show_packets",
-                             "-show_entries", "packet=pts_time,dts_time",
-                             "-of", "json", path])
-        if rc == 0 and cached.source == "ffprobe":
-            try:
-                data = json.loads(out.decode("utf-8", "replace"))
-                raw_times_list: List[Optional[float]] = []
-                for packet in data.get("packets", []):
-                    value = packet.get("pts_time")
-                    if value in (None, "N/A"):
-                        value = packet.get("dts_time")
-                    try:
-                        raw_times_list.append(None if value in (None, "N/A")
-                                         else float(value))
-                    except (TypeError, ValueError):
-                        raw_times_list.append(None)
-                if raw_times_list and all(value is not None for value in raw_times_list):
-                    raw_times_list = sorted(raw_times_list)
-                timeline = _build_timeline_from_raw(raw_times_list, path, ffprobe, stream_ordinal, fps_hint, frame_count_hint, duration_hint)
-                if timeline.source == "ffprobe" and len(timeline) > 0 and logger:
-                    pass  # success
-                return timeline
-            except Exception:
-                pass
-        if cached.source == "fps-fallback":
-            timeline = _build_timeline_from_raw([], path, ffprobe, stream_ordinal, fps_hint, frame_count_hint, duration_hint)
-            if timeline.source == "fps-fallback":
-                log.warning("could not read frame PTS with ffprobe; falling back to a "
-                            "uniform %.3f fps grid (%d frames)", timeline.fps, len(timeline))
-            return timeline
-        return cached
-    except Exception:
-        pass
+    """Read actual frame PTS values with ffprobe, falling back to a fixed fps.
 
-    rc, out, err = _run([ffprobe, "-v", "error", "-select_streams",
-                         "v:%d" % stream_ordinal, "-show_packets",
-                         "-show_entries", "packet=pts_time,dts_time",
-                         "-of", "json", path])
-    raw_times: List[Optional[float]] = []
-    if rc == 0:
-        try:
-            data = json.loads(out.decode("utf-8", "replace"))
-            for packet in data.get("packets", []):
-                value = packet.get("pts_time")
-                if value in (None, "N/A"):
-                    value = packet.get("dts_time")
-                try:
-                    raw_times.append(None if value in (None, "N/A")
-                                     else float(value))
-                except (TypeError, ValueError):
-                    raw_times.append(None)
-            if raw_times and all(value is not None for value in raw_times):
-                raw_times = sorted(raw_times)
-        except ValueError:
-            raw_times = []
-    timeline = _build_timeline_from_raw(raw_times, path, ffprobe, stream_ordinal, fps_hint, frame_count_hint, duration_hint)
+    VFR and low-frame-rate videos are handled naturally because every frame
+    keeps its measured PTS.  If ffprobe cannot report frames, a uniform grid is
+    synthesised from the frame count/duration/fps and a warning is logged.
+    """
+    log = logger or LOG
+    raw_times = _probe_packet_times(path, ffprobe, stream_ordinal)
+    timeline = _build_timeline_from_raw(raw_times, path, ffprobe,
+                                        stream_ordinal, fps_hint,
+                                        frame_count_hint, duration_hint)
     if timeline.source == "fps-fallback":
         log.warning("could not read frame PTS with ffprobe; falling back to a "
-                    "uniform %.3f fps grid (%d frames)", timeline.fps, len(timeline))
+                    "uniform %.3f fps grid (%d frames)", timeline.fps,
+                    len(timeline))
     return timeline
 
 
