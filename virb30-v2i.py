@@ -747,9 +747,9 @@ def _record_from_choice(choice, track, args, video_start_utc, tz_offset,
     """Turn a selected frame into a manifest/metadata record."""
     point = choice.point or {}
     pts = max(0.0, float(choice.pts))
-    # Prefer the GPS sample's own UTC.  This keeps TimeLapse/Travelapse images
-    # stamped with the real time they were captured instead of the short
-    # playback offset from the start of the clip.
+    # Prefer the GPS sample's own UTC.  This keeps images stamped with the real
+    # time they were captured instead of the short playback offset from the
+    # start of the clip.
     captured_utc = point.get("utc")
     if captured_utc is not None and captured_utc.tzinfo is None:
         captured_utc = captured_utc.replace(tzinfo=dt.timezone.utc)
@@ -1002,27 +1002,8 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
     track = None
     samples = []
     if telemetry is not None and video_start_fit is not None:
-        # A normal clip covers the same FIT span as its playback duration.  In
-        # TimeLapse/Travelapse mode the camera records a long GPS span into a
-        # short clip, so the telemetry must be squeezed onto the video timeline
-        # instead of being truncated after `duration` seconds (which used to
-        # geotag only the first few seconds of the route).
-        fit_span = None
-        if video_end_fit is not None:
-            fit_span = video_end_fit - video_start_fit
-        timewarp_scale = 1.0
-        timelapse = False
-        if duration and duration > 0.2 and fit_span and fit_span > 0.2:
-            ratio = fit_span / duration
-            if ratio > 1.2 or ratio < 0.8:
-                timewarp_scale = duration / fit_span
-                timelapse = True
-                LOG.warning("  TimeLapse/Travelapse detected: FIT span %.1f s "
-                            "-> video %.1f s (scale %.4f)", fit_span, duration,
-                            timewarp_scale)
-        if timelapse:
-            t_end = video_end_fit
-        elif duration:
+        # A normal clip covers the same FIT span as its playback duration.
+        if duration:
             t_end = video_start_fit + duration
             if video_end_fit is not None:
                 t_end = min(t_end, video_end_fit)
@@ -1032,7 +1013,7 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
             t_end = telemetry.samples[-1]["t"]
         for sample in telemetry.sample_window(video_start_fit, t_end):
             item = dict(sample)
-            item["t"] = ((sample["t"] - video_start_fit) * timewarp_scale)
+            item["t"] = (sample["t"] - video_start_fit)
             item["utc"] = telemetry.utc_of(sample["fit_s"])
             v2i.apply_accuracy(item, args.uere)
             samples.append(item)
