@@ -391,6 +391,7 @@ def _stitch_batch(info: VideoInfo, frames: Sequence[int],
         cmd += ["-ss", "%.6f" % seek_time]
     cmd += ["-i", info.path, "-filter_complex_script", script_path,
             "-map", "[OUT]", "-an", "-sn", "-dn", "-vsync", "0",
+            "-frames:v", str(len(ordered)),
             "-pix_fmt", pix_fmt]
     cmd += v2i.ffmpeg_quality_args(image_format, quality)
     if threads:

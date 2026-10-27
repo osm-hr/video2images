@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1506,7 +1507,7 @@ def _position_error(target: dict, point: Optional[dict], mode: str
 
 
 # ---------------------------------------------------------------------------
-# Frame extraction (exact frame-index select in one decode pass)
+# Frame extraction (one accurate seek + single frame per requested index)
 # ---------------------------------------------------------------------------
 def ffmpeg_quality_args(image_format: str, quality: int) -> List[str]:
     """Map a 1..100 quality to ffmpeg encoder options (higher = better)."""
@@ -1526,55 +1527,57 @@ def select_expression(frames: Sequence[int]) -> str:
 # ffmpeg parses ``select`` expressions with a rather small recursion limit:
 # more than ~100 ``eq(n,...)`` terms fail with "Error while parsing expression"
 # (and on memory-constrained machines even earlier).  Batches are therefore
-# kept comfortably below that limit.
+# kept comfortably below that limit.  Used by the MAX360 EAC stitcher, which
+# still decodes a bounded batch per ffmpeg call.
 EXTRACT_CHUNK_SIZE = 60
 
 
-def _extract_batch(video: str, frames: Sequence[int], pattern: str, *,
-                   image_format: str, quality: int, threads: int,
-                   stream_ordinal: int, seek_time: Optional[float]) -> bool:
-    """Run one ffmpeg ``select`` batch; return whether every image appeared."""
-    selected = frames if seek_time is None else \
-        [int(frame) - int(frames[0]) for frame in frames]
-    expr = select_expression(selected)
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
-    if seek_time is not None and seek_time > 0:
-        cmd += ["-ss", "%.6f" % seek_time]
-    cmd += ["-i", video]
+def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
+                 *, image_format: str, quality: int, threads: int,
+                 stream_ordinal: int) -> Optional[str]:
+    """Extract one frame with an accurate input seek; return its path."""
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+           "-ss", "%.6f" % max(0.0, seek_time)]
     if threads:
         cmd += ["-threads", str(threads)]
-    cmd += ["-map", "0:v:%d" % stream_ordinal,
-            "-vf", "select='%s'" % expr, "-vsync", "0"]
+    cmd += ["-i", video,
+            "-map", "0:v:%d" % stream_ordinal,
+            "-frames:v", "1"]
     cmd += ffmpeg_quality_args(image_format, quality)
     cmd.append(pattern)
     try:
         proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.PIPE, timeout=1800)
-    except subprocess.TimeoutExpired:
-        LOG.warning("batch frame extraction timed out")
-        return False
+                              stderr=subprocess.PIPE, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOG.warning("frame %d extraction failed: %s", frame_index, exc)
+        return None
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         tail = err.splitlines()[-1:] if err else []
-        LOG.warning("batch frame extraction failed: %s", tail[0] if tail else "")
-        return False
-    return all(os.path.exists(pattern % order)
-               for order in range(1, len(frames) + 1))
+        LOG.warning("frame %d extraction failed: %s", frame_index,
+                    tail[0] if tail else "ffmpeg error")
+        return None
+    output = pattern % 1
+    return output if os.path.exists(output) else None
 
 
 def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
                             image_format: str, quality: int, workers: int = 1,
                             threads: int = 0, stream_ordinal: int = 0,
-                            timeline: Optional[FrameTimeline] = None,
-                            chunk_size: int = EXTRACT_CHUNK_SIZE
+                            timeline: Optional[FrameTimeline] = None
                             ) -> Dict[int, str]:
-    """Extract exact frames by index in bounded ffmpeg batches."""
+    """Extract exact frames, one accurate seek per frame.
+
+    Seeking to the frame's real PTS (``timeline.pts``) keeps variable frame
+    rate sources correct; a uniform ``index / fps`` grid is only used when no
+    usable timeline is available.  ``workers`` independent ffmpeg processes
+    are run at a time.
+    """
     unique = sorted({int(f) for f in frames if int(f) >= 0})
     if not unique:
         return {}
     os.makedirs(tmp_dir, exist_ok=True)
 
-    extracted: Dict[int, str] = {}
     # Try to get fps from timeline if available
     fps = timeline.fps if timeline is not None and timeline.fps > 0 else 23.976
     if timeline is None or timeline.source != "ffprobe" or len(timeline) == 0:
@@ -1585,29 +1588,37 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
         except Exception:
             pass
 
-    # For each frame, extract individually with seek for reliability
-    for idx, fidx in enumerate(unique):
-        pat = os.path.join(tmp_dir, "f_%06d_%%06d.%s" % (idx, image_format))
-        t = fidx / fps if fps > 0 else 0
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
-               "-ss", "%.6f" % max(0, t),
-               "-threads", str(threads) if threads else "1",
-               "-i", video,
-               "-map", "0:v:%d" % stream_ordinal,
-               "-frames:v", "1"]
-        cmd += ffmpeg_quality_args(image_format, quality)
-        cmd.append(pat)
-        try:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE, timeout=300)
-            if proc.returncode == 0 and os.path.exists(pat % 1):
-                extracted[int(fidx)] = pat % 1
-                continue
-        except Exception:
-            pass
-        LOG.error("could not extract frames %d-%d from %s",
-                  fidx, fidx, os.path.basename(video))
-        continue
+    have_timeline = (timeline is not None and timeline.source == "ffprobe"
+                     and len(timeline) > 0)
+
+    def seek_for(frame_index: int) -> float:
+        if have_timeline and frame_index < len(timeline):
+            return float(timeline.pts(frame_index))
+        return frame_index / fps if fps > 0 else 0.0
+
+    def run(item: Tuple[int, int]) -> Tuple[int, Optional[str]]:
+        order, frame_index = item
+        pattern = os.path.join(tmp_dir,
+                               "f_%06d_%%06d.%s" % (order, image_format))
+        path = _extract_one(video, frame_index, seek_for(frame_index), pattern,
+                            image_format=image_format, quality=quality,
+                            threads=threads, stream_ordinal=stream_ordinal)
+        return frame_index, path
+
+    items = list(enumerate(unique))
+    extracted: Dict[int, str] = {}
+    if workers > 1 and len(items) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+            results = list(pool.map(run, items))
+    else:
+        results = [run(item) for item in items]
+
+    for frame_index, path in results:
+        if path is not None:
+            extracted[frame_index] = path
+        else:
+            LOG.error("could not extract frame %d from %s",
+                      frame_index, os.path.basename(video))
     return extracted
 
 
@@ -1732,14 +1743,20 @@ def sequence_output_dir(output_dir: str, camera: str, sequence: str,
 
 
 def unique_path(path: str, used: set) -> str:
-    """Avoid two planned images with the same millisecond (no ``_NNNNNN``)."""
-    if path not in used and not os.path.exists(path):
+    """Disambiguate two planned images that share the same millisecond.
+
+    ``used`` holds the paths already planned in this run.  Files that merely
+    exist on disk are *not* collisions: the caller compares the returned path
+    with the filesystem to skip (or overwrite) them, so treating them as
+    collisions here would turn every re-run into ``-2`` duplicates.
+    """
+    if path not in used:
         used.add(path)
         return path
     base, ext = os.path.splitext(path)
     suffix = 2
     candidate = "%s-%d%s" % (base, suffix, ext)
-    while candidate in used or os.path.exists(candidate):
+    while candidate in used:
         suffix += 1
         candidate = "%s-%d%s" % (base, suffix, ext)
     used.add(candidate)

@@ -748,14 +748,16 @@ def _record_from_choice(choice, track, args, video_start_utc, tz_offset,
     """Turn a selected frame into a manifest/metadata record."""
     point = choice.point or {}
     pts = max(0.0, float(choice.pts))
-    # Prefer the GPS sample's own UTC.  This keeps images stamped with the real
-    # time they were captured instead of the short playback offset from the
-    # start of the clip.
-    captured_utc = point.get("utc")
-    if captured_utc is not None and captured_utc.tzinfo is None:
-        captured_utc = captured_utc.replace(tzinfo=dt.timezone.utc)
-    if captured_utc is None and video_start_utc is not None:
+    # Derive the capture time from the video timeline so the file name keeps
+    # sub-second precision.  FIT/GPS samples only carry whole seconds, which
+    # would otherwise turn every image into a ``-000`` millisecond name.
+    captured_utc = None
+    if video_start_utc is not None:
         captured_utc = video_start_utc + dt.timedelta(seconds=pts)
+    else:
+        captured_utc = point.get("utc")
+        if captured_utc is not None and captured_utc.tzinfo is None:
+            captured_utc = captured_utc.replace(tzinfo=dt.timezone.utc)
     captured_local = (v2i.local_from_utc(captured_utc, tz_offset)
                       if tz_known else None)
     if args.time_base == "utc" and captured_utc is not None:

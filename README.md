@@ -19,24 +19,25 @@ All scripts share CLI, output layout, naming, time base, metadata policy, teleme
 - Camera suffixes: `virb30`, `max360`, `blackvue`, `hero`
 - Sequence directory name is derived from the source video stem, made collision-safe by prepending a nested path prefix when stems collide (no numeric `-2` counters)
 - Filenames: `YYYY-MM-DD_HH-MM-SS-mmm.jpg` or `.png`. Timestamps cross midnight while staying in the same sequence folder
+- A `-2`/`-3` suffix is used **only** when two frames selected in the same run share a millisecond. Re-running skips images that already exist; `--overwrite` rewrites them in place (no new suffixed copies)
 - Each sequence writes `<sequence>.gpx` and `<sequence>.geojson` by default (`--track-export {both,gpx,geojson,none}`, `--save-telemetry` alias)
 
 ## Quick start
 
 ```bash
 # VIRB (finds FIT in GMetrix/ automatically)
-python3 virb30-v2i.py -i video/2026-10-05-virb -o images/ -d 5 --start-distance 0
+python3 virb30-v2i.py -i video/2026-10-05-virb-1080-24fps -o images/ -d 5 --start-distance 0
 
 # GoPro MAX 360 (TimeWarp/variable rates handled)
-python3 max360-v2i.py -i video/2026-10-17-max360 -o images/ -d 2 --start-distance 0
+python3 max360-v2i.py -i video/2026-10-26-max360-000-timelapse05-30fps -o images/ -d 2 --start-distance 0
 
 # BlackVue DR900
-python3 blackvue900-v2i.py -i video/2019-07-12-blackvue -o images/ -d 5 --start-distance 0
+python3 blackvue900-v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-distance 0
 
 # GoPro HERO flat (no GPS → skipped unless fallback)
-python3 hero-v2i.py -i video/2026-07-14-hero -o images/ -d 5 --dry-run
+python3 hero-v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
 # HERO with no GPS, unpositioned time-lapse:
-python3 hero-v2i.py -i video/2026-07-14-hero -o images/ --allow-missing-gps --fallback-interval 30
+python3 hero-v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
 ```
 
 ## Detection
@@ -60,7 +61,7 @@ Measured (evidence-based):
 ## Frame timeline & selection
 
 - Frame timeline comes from `ffprobe` actual PTS (`-show_packets`, presentation order) with fallback to a uniform fps grid if unreadable
-- Frames are extracted by **exact frame index** in one decode pass via `select='eq(n,...)'` with `-vsync 0` (`v2i_common.extract_frames_by_index`)
+- Frames are extracted by **exact frame index**, one accurate `-ss <PTS> -frames:v 1` seek per frame (`v2i_common.extract_frames_by_index`); `--workers` runs that many ffmpeg processes in parallel (default 1)
 - One unique frame per target distance along the interpolated track; **never reused**, indices **strictly increasing**
 - `--start-distance 0` **always exports the first frame (index 0)** even if telemetry starts later (position clamped to start, `position_source=clamped-start`); failing to extract frame 0 with `--start-distance 0` is a hard error
 - Nearest unused frame within `--max-position-error` (default `distance/2`); targets with no acceptable frame are **skipped** (gaps allowed)
@@ -108,12 +109,23 @@ All exporters accept: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recur
 
 Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (CRITICAL bold red, DEBUG grey). Colours are disabled automatically when stderr is redirected; set `NO_COLOR=1` to force them off or `FORCE_COLOR=1` to force them on.
 
+## Tests
+
+Standard library only (no pytest needed):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite covers detection/reporting, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming, and seek-based frame extraction compared against a `select` decode pass.
+
 ## Measured sample evidence (for reference)
 
 | Sample | Notes |
 |---|---|
-| `video/2026-10-17-max360/GS013328.360` | GoPro Max, DVNM GoPro Max, dual EAC, GPMF GPS5 194 samples over ~6.44s video but ~32s GPS span (TimeWarp) → scaled; GPSP ~117/120 |
-| `video/2026-07-14-hero/GX011785.MP4` | HERO11 Black, GPMF IMU but **no GPS5/GPSU/GPSF/GPSP** → skipped by default, fallback unpositioned works with UTC naming |
-| `video/2026-10-05-virb/VIRB0996.MP4` + `GMetrix/2026-10-05-07-53-07.fit` | 9108 GPS, IMU; camera events align segment, offset +02:00 |
+| `video/2026-10-26-max360-000-timelapse05-30fps/GS013336.360` | GoPro Max, DVNM GoPro Max, dual EAC 4096×1344, 1208 frames / 40.34 s; GPS span 604.57 s (TimeWarp) scaled to video span; equirect 5376×2688 with full GPano tags |
+| `video/2025-08-16-hero-standard-nogps/GX011785.MP4` | HERO11 Black, GPMF IMU but **no GPS5/GPSU/GPSF/GPSP** → skipped by default, fallback unpositioned works with UTC millisecond naming |
+| `video/2026-10-05-virb-1080-24fps/VIRB0996.MP4` + `GMetrix/2026-10-05-07-53-07.fit` | 9108 GPS, IMU; camera events align segment, offset +02:00 |
+| `video/2026-10-18-virb-090-4k-30fps/VIRB0782.MP4` / `video/2026-10-18-virb-270-4k-24fps/VIRB0008.MP4` | VIRB Ultra 30; filenames carry real capture milliseconds (e.g. `2026-10-18_16-18-37-111.jpg`) |
 | BlackVue samples | NMEA in `free` atoms, GGA/RMC/VTG/GSA parsed, clock reconciliation to GPS, course from RMC/VTG |
 
