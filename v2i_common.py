@@ -1527,41 +1527,36 @@ def select_expression(frames: Sequence[int]) -> str:
 # more than ~100 ``eq(n,...)`` terms fail with "Error while parsing expression"
 # (and on memory-constrained machines even earlier).  Batches are therefore
 # kept comfortably below that limit.
-EXTRACT_CHUNK_SIZE = 90
+EXTRACT_CHUNK_SIZE = 60
 
 
 def _extract_batch(video: str, frames: Sequence[int], pattern: str, *,
                    image_format: str, quality: int, threads: int,
                    stream_ordinal: int, seek_time: Optional[float]) -> bool:
-    """Run one ffmpeg ``select`` batch; return whether every image appeared.
-
-    When *seek_time* is given the filter indices are relative to that input
-    seek point (``frames[0] == 0``); otherwise they are absolute decoded frame
-    numbers.  Input seeking is accurate in ffmpeg and was verified to return
-    byte-identical frames to a full decode.
-    """
+    """Run one ffmpeg ``select`` batch; return whether every image appeared."""
     selected = frames if seek_time is None else \
         [int(frame) - int(frames[0]) for frame in frames]
     expr = select_expression(selected)
-    cmd = [FFMPEG, "-v", "error", "-y"]
-    if seek_time is not None:
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
+    if seek_time is not None and seek_time > 0:
         cmd += ["-ss", "%.6f" % seek_time]
-    cmd += ["-i", video, "-map", "0:v:%d" % stream_ordinal,
-            "-vf", "select='%s'" % expr, "-vsync", "0"]
-    cmd += ffmpeg_quality_args(image_format, quality)
+    cmd += ["-i", video]
     if threads:
         cmd += ["-threads", str(threads)]
+    cmd += ["-map", "0:v:%d" % stream_ordinal,
+            "-vf", "select='%s'" % expr, "-vsync", "0"]
+    cmd += ffmpeg_quality_args(image_format, quality)
     cmd.append(pattern)
     try:
         proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.PIPE, timeout=300)
+                              stderr=subprocess.PIPE, timeout=1800)
     except subprocess.TimeoutExpired:
         LOG.warning("batch frame extraction timed out")
         return False
     if proc.returncode != 0:
-        LOG.warning("batch frame extraction failed: %s",
-                    proc.stderr.decode("utf-8", "replace").strip()
-                    .splitlines()[-1:] or "")
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        tail = err.splitlines()[-1:] if err else []
+        LOG.warning("batch frame extraction failed: %s", tail[0] if tail else "")
         return False
     return all(os.path.exists(pattern % order)
                for order in range(1, len(frames) + 1))
@@ -1578,48 +1573,41 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
     if not unique:
         return {}
     os.makedirs(tmp_dir, exist_ok=True)
-    limit = max(1, int(chunk_size))
-
-    if (timeline is None and len(unique) > limit):
-        try:
-            timeline = probe_frame_timeline(
-                video, stream_ordinal=stream_ordinal, logger=LOG)
-        except (UnreadableVideo, OSError):
-            timeline = None
 
     extracted: Dict[int, str] = {}
-    use_seek = (timeline is not None and timeline.source == "ffprobe"
-                and len(timeline))
-    for batch_index, start in enumerate(range(0, len(unique), limit)):
-        chunk = unique[start:start + limit]
-        pattern = os.path.join(
-            tmp_dir, "f_%03d_%%06d.%s" % (batch_index, image_format))
-        seek_time: Optional[float] = None
-        if use_seek and chunk[-1] < len(timeline):
-            seek_time = float(timeline.pts(chunk[0]))
-        if seek_time is not None and _extract_batch(
-                video, chunk, pattern, image_format=image_format,
-                quality=quality, threads=threads,
-                stream_ordinal=stream_ordinal, seek_time=seek_time):
-            paths = [(chunk[order - 1], pattern % order)
-                     for order in range(1, len(chunk) + 1)]
-        else:
-            if seek_time is not None:
-                pattern = os.path.join(
-                    tmp_dir, "f_%03d_full_%%06d.%s"
-                    % (batch_index, image_format))
-            if not _extract_batch(
-                    video, chunk, pattern, image_format=image_format,
-                    quality=quality, threads=threads,
-                    stream_ordinal=stream_ordinal, seek_time=None):
-                LOG.error("could not extract frames %d-%d from %s",
-                          chunk[0], chunk[-1], os.path.basename(video))
+    # Try to get fps from timeline if available
+    fps = timeline.fps if timeline is not None and timeline.fps > 0 else 23.976
+    if timeline is None or timeline.source != "ffprobe" or len(timeline) == 0:
+        # try to guess
+        try:
+            info = probe_stream_info(video)
+            fps = _parse_rate(info.get("avg_frame_rate") or info.get("r_frame_rate")) or fps
+        except Exception:
+            pass
+
+    # For each frame, extract individually with seek for reliability
+    for idx, fidx in enumerate(unique):
+        pat = os.path.join(tmp_dir, "f_%06d_%%06d.%s" % (idx, image_format))
+        t = fidx / fps if fps > 0 else 0
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+               "-ss", "%.6f" % max(0, t),
+               "-threads", str(threads) if threads else "1",
+               "-i", video,
+               "-map", "0:v:%d" % stream_ordinal,
+               "-frames:v", "1"]
+        cmd += ffmpeg_quality_args(image_format, quality)
+        cmd.append(pat)
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, timeout=300)
+            if proc.returncode == 0 and os.path.exists(pat % 1):
+                extracted[int(fidx)] = pat % 1
                 continue
-            paths = [(chunk[order - 1], pattern % order)
-                     for order in range(1, len(chunk) + 1)]
-        for index, path in paths:
-            if os.path.exists(path):
-                extracted[index] = path
+        except Exception:
+            pass
+        LOG.error("could not extract frames %d-%d from %s",
+                  fidx, fidx, os.path.basename(video))
+        continue
     return extracted
 
 
