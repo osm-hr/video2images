@@ -18,7 +18,7 @@ All scripts share CLI, output layout, naming, time base, metadata policy, teleme
 - One date folder per source video based on the **first exported frame**: `<output>/YYYY-MM-DD-<camera>/<sequence>/`
 - Camera suffixes: `virb30`, `max360`, `blackvue`, `hero`
 - Sequence directory name is derived from the source video stem, made collision-safe by prepending a nested path prefix when stems collide (no numeric `-2` counters)
-- Filenames: `YYYY-MM-DD_HH-MM-SS-mmm.jpg` or `.png` — **no `_NNNNNN` counter**. Timestamps cross midnight while staying in the same sequence folder
+- Filenames: `YYYY-MM-DD_HH-MM-SS-mmm.jpg` or `.png`. Timestamps cross midnight while staying in the same sequence folder
 - Each sequence writes `<sequence>.gpx` and `<sequence>.geojson` by default (`--track-export {both,gpx,geojson,none}`, `--save-telemetry` alias)
 
 ## Quick start
@@ -117,15 +117,3 @@ Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (C
 | `video/2026-10-05-virb/VIRB0996.MP4` + `GMetrix/2026-10-05-07-53-07.fit` | 9108 GPS, IMU; camera events align segment, offset +02:00 |
 | BlackVue samples | NMEA in `free` atoms, GGA/RMC/VTG/GSA parsed, clock reconciliation to GPS, course from RMC/VTG |
 
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-Covers detection, paths/naming/collisions, frame timeline (mock ffprobe packets/2fps/VFR/fallback), selection/low-fps/first-frame/start clamping, headings/declination, accuracy cases, GPX/GeoJSON parsing/validity, metadata keywords/GPano/UTC/offset rules, MAX EAC filter/max2sphere command construction, GPMF synthetic payloads, BlackVue NMEA/DOP.
-
-## Migration
-
-- `blackvue900-v21.py` is now a deprecated shim forwarding to `blackvue900-v2i.py` with a warning
-- `USAGE.md` merged into this README

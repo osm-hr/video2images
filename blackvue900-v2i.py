@@ -39,11 +39,12 @@ Images are written below `--output` as::
     images/
     `-- 2021-01-27/                     <- capture date
         `-- 20210127_092534_NF/         <- sequence, derived from the video name
-            |-- 2021-01-27_09-24-33-526_000001.jpg
+            |-- 2021-01-27_09-24-33-526.jpg
             `-- ...
 
-  * The file name is ``YYYY-MM-DD_HH-MM-SS-mmm_NNNNNN.ext`` with zero padded
-    fields and a per-sequence 6-digit counter.
+  * The file name is ``YYYY-MM-DD_HH-MM-SS-mmm.ext``. If two images
+    share the same millisecond in the same sequence, a numeric suffix is added
+    to avoid collisions.
   * Existing files are never overwritten unless ``--overwrite`` is given.
   * ``--sidecars`` additionally writes a ``<sequence>.track.jsonl`` manifest.
 

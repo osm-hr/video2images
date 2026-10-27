@@ -37,12 +37,13 @@ Images are written below `--output` as::
     images/
     `-- YYYY-MM-DD/                 <- capture date
         `-- VIRB0996/               <- sequence, derived from the video name
-            |-- 2026-10-05_09-59-30-191_000001.jpg
-            |-- 2026-10-05_09-59-41-021_000002.jpg
+            |-- 2026-10-05_09-59-30-191.jpg
+            |-- 2026-10-05_09-59-41-021.jpg
             `-- ...
 
-  * The file name is ``YYYY-MM-DD_HH-MM-SS-mmm_NNNNNN.ext`` with zero padded
-    fields and a per-sequence 6-digit counter.
+  * The file name is ``YYYY-MM-DD_HH-MM-SS-mmm.ext``. If two images
+    share the same millisecond in the same sequence, a numeric suffix is added
+    to avoid collisions.
   * The timestamp is camera-*local* wall-clock time by default; pass
     ``--time-base utc`` to use UTC instead.
   * Existing files are never overwritten unless ``--overwrite`` is given.
