@@ -528,11 +528,13 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                         metavar="LIST",
                         help="comma-separated video file extensions to scan")
     parser.add_argument("--heading-offset", dest="heading_offset", type=float,
-                        default=0.0, metavar="DEGREES",
+                        default=None, metavar="DEGREES",
                         help="degrees added to the heading to derive the image "
-                             "direction (-180..180)")
+                             "direction; recalculated to 000-360 and appended "
+                             "to the sequence folder as -NNN")
     parser.add_argument("--offset", dest="heading_offset", type=float,
-                        help=argparse.SUPPRESS)          # legacy VIRB alias
+                        default=None,
+                        help="alias for --heading-offset")
     parser.add_argument("--magnetic-declination", type=float, default=0.0,
                         metavar="DEGREES",
                         help="east-positive magnetic declination added to "
@@ -683,9 +685,15 @@ def validate_common_args(parser: argparse.ArgumentParser,
         parser.error("--workers must be at least 1 (got %d)" % args.workers)
     if args.threads < 0:
         parser.error("--threads must not be negative (got %d)" % args.threads)
-    if not (-180.0 <= args.heading_offset <= 180.0):
-        parser.error("--heading-offset must be between -180 and +180 degrees "
-                     "(got %g)" % args.heading_offset)
+    offset = args.heading_offset
+    if offset is None:
+        args.heading_offset_given = False
+        args.heading_offset = 0.0
+    else:
+        if not math.isfinite(offset):
+            parser.error("--heading-offset must be a finite number of degrees")
+        args.heading_offset_given = True
+        args.heading_offset = normalize_heading_offset(offset)
     if not (-180.0 <= args.magnetic_declination <= 180.0):
         parser.error("--magnetic-declination must be between -180 and +180 "
                      "degrees (got %g)" % args.magnetic_declination)
@@ -1108,6 +1116,30 @@ def plan_shots(track: Track, interval: float, *, start_distance: float = 0.0,
 # ---------------------------------------------------------------------------
 # Heading and accuracy
 # ---------------------------------------------------------------------------
+def normalize_heading_offset(value: float) -> float:
+    """Recalculate a heading offset into the unsigned ``[0, 360]`` range."""
+    raw = float(value)
+    if not math.isfinite(raw):
+        raise ValueError("heading offset must be a finite number of degrees")
+    wrapped = raw % 360.0
+    # Keep an explicit full turn as 360 rather than collapsing it to 000.
+    if wrapped == 0.0 and raw > 0.0:
+        return 360.0
+    return wrapped
+
+
+def format_heading_offset(value: float) -> str:
+    """Return the three-digit folder label for a heading offset (``000``-``360``)."""
+    return "%03d" % int(round(normalize_heading_offset(value)))
+
+
+def heading_offset_for_folder(args: argparse.Namespace) -> Optional[float]:
+    """Offset to append to the sequence folder, or ``None`` when not given."""
+    if getattr(args, "heading_offset_given", False):
+        return args.heading_offset
+    return None
+
+
 def resolve_heading(point: dict, heading_offset: float = 0.0,
                     magnetic_declination: float = 0.0) -> Tuple[Optional[float], str]:
     """Return ``(true-north heading, heading_source)`` for an interpolated point."""
@@ -1736,10 +1768,19 @@ def date_folder_name(value: dt.datetime, camera: str) -> str:
 
 
 def sequence_output_dir(output_dir: str, camera: str, sequence: str,
-                        first_capture: dt.datetime) -> str:
-    """``<output>/<date>-<camera>/<sequence>``."""
+                        first_capture: dt.datetime, *,
+                        heading_offset: Optional[float] = None) -> str:
+    """``<output>/<date>-<camera>/<sequence>``.
+
+    When a heading offset was explicitly supplied it is recalculated to
+    ``000``-``360`` and appended to the sequence folder:
+    ``<output>/<date>-<camera>/<sequence>-<offset>``.
+    """
+    folder = sequence
+    if heading_offset is not None:
+        folder = "%s-%s" % (folder, format_heading_offset(heading_offset))
     return os.path.join(output_dir, date_folder_name(first_capture, camera),
-                        sequence)
+                        folder)
 
 
 def unique_path(path: str, used: set) -> str:

@@ -1079,7 +1079,8 @@ def process_video(video, sequence, output_dir, all_fits, args, telemetry_cache,
 
     first_time = records[0]["naming_time"]
     sequence_dir = v2i.sequence_output_dir(
-        output_dir, v2i.CAMERA_VIRB, sequence, first_time)
+        output_dir, v2i.CAMERA_VIRB, sequence, first_time,
+        heading_offset=v2i.heading_offset_for_folder(args))
     used_paths = set()
     for record in records:
         record["path"] = v2i.unique_path(

@@ -716,7 +716,8 @@ def process_video(path: str, sequence: str, args) -> dict:
                        name) for c in choices]
     first_time = records[0]["naming_time"]
     sequence_dir = v2i.sequence_output_dir(
-        args.output, v2i.CAMERA_MAX, sequence, first_time)
+        args.output, v2i.CAMERA_MAX, sequence, first_time,
+        heading_offset=v2i.heading_offset_for_folder(args))
     used_paths = set()
     for record in records:
         record["path"] = v2i.unique_path(
