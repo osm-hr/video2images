@@ -1,260 +1,137 @@
-# video2images: geotagged still image export from dash/camera videos
+# video2images
 
-This repository contains three command-line tools that extract geotagged still images at fixed travelled-distance intervals from video recordings made by different action/dash cameras. Each tool automatically detects the camera type, processes only matching videos, and skips others with clear reasons. All three share a common CLI surface for consistency.
+Extract geotagged still images from dash/helmet cameras at fixed GPS distance intervals. Only the Python standard library is used; `ffmpeg`, `ffprobe`, `exiftool` must be on `PATH`. The optional `max2sphere` binary is only used if explicitly requested.
 
-## Table of Contents
+## Supported cameras
 
-- [Overview](#overview)
-- [Supported Cameras](#supported-cameras)
-- [Installation & Dependencies](#installation--dependencies)
-- [Common CLI Options](#common-cli-options)
-- [Output Structure & Naming](#output-structure--naming)
-- [Camera-Specific Documentation](#camera-specific-documentation)
-  - [Garmin VIRB Ultra 30 (`virb30-v2i.py`)](#garmin-virb-ultra-30-virb30-v2ipy)
-  - [GoPro MAX 360 (`max360-v2i.py`)](#gopro-max-360-max360-v2ipy)
-  - [BlackVue DR900 (`blackvue900-v21.py`)](#blackvue-dr900-blackvue900-v21py)
-- [Examples](#examples)
-- [Troubleshooting](#troubleshooting)
-- [Notes on Timestamps & GPS](#notes-on-timestamps--gps)
+`v2i.py` is the single entry point for all supported cameras. It detects the camera per file, groups the videos and runs the matching pipeline, so one input tree may mix manufacturers.
 
-## Overview
-
-All scripts:
-- Accept `-i/--input` as either a single video file or a directory (recursive by default).
-- Plan capture points every `-d/--distance` meters along the GPS/telemetry track.
-- Extract frames via `ffmpeg`, write still images with `exiftool` (if available), and include GPS/EXIF/XMP metadata suitable for Mapillary and Panoramax.
-- Detect the camera from container metadata (and filename as supporting evidence); **never process a video belonging to another camera** — mismatches are logged and skipped.
-- Share the same logging, sequence naming, manifest/sidecar support, and common flags.
-
-## Supported Cameras
-
-| Script | Camera | File patterns (typical) | Telemetry source | Notes |
-|---|---|---|---|---|
-| `virb30-v2i.py` | Garmin VIRB Ultra 30 | `VIRB####.MP4`/`.MOV` | FIT files (sibling `gmetrix/` or `--fit`) | Supports `.fit` lookup by default; can also use `--fallback-interval` when telemetry missing. |
-| `max360-v2i.py` | GoPro MAX 360 | `GS####.360`, `.MP4` variants | GPMF (embedded in `.360`/MP4) | Reprojects 360° to equirectangular stills; offers geometry/orientation controls; writes GPX/GPmd sidecars via `--save-telemetry`. |
-| `blackvue900-v21.py` | BlackVue DR900 (dashcam) | `YYYYMMDD_HHMMSS_NN.mp4` (e.g. `20210127_092534_NF.mp4`) | NMEA sentences embedded in `free` atoms | Reconciles camera-clock skew against GPS UTC; supports `--fallback-interval` when no GPS available. |
-
-## Installation & Dependencies
-
-Required external tools (must be on `PATH`):
-- `ffmpeg` and `ffprobe` — frame extraction and probing.
-- `exiftool` — write EXIF/XMP/GPS metadata (if missing, images are written without metadata and a warning is logged).
-
-Python dependencies: only the Python 3.11+ standard library. No third-party packages required.
-
-Get the code:
-```bash
-cd /path/to/video2images
-```
-
-All scripts are executable (`chmod +x *.py` if needed). They import `v2i_common.py` from the same directory.
-
-## Common CLI Options
-
-Every script accepts the following shared options (identical names, defaults, and help text semantics):
-
-| Option | Default | Description |
+| Camera | Telemetry | 360 stitching |
 |---|---|---|
-| `-i, --input PATH` | (required) | Input video file or directory to scan (read-only). |
-| `-o, --output PATH` | (required) | Output directory; created automatically if missing. |
-| `-r, --recursive` | `true` | Search input directories recursively. Use `--no-recursive` to disable. |
-| `-d, --distance METERS` | `5.0` | Distance between exported frames in meters (along travelled track). |
-| `--start-distance METERS` | `0.0` | Skip this many meters after track start before taking the first frame. |
-| `--max-images N` | `None` | Maximum number of images to export per video. |
-| `--extensions LIST` | `.mp4,.mov,.m4v,.360` | Comma-separated video extensions to scan. |
-| `--heading-offset DEGREES` | `0.0` | Degrees added to GPS course to derive image heading (-180..180). Aliases: `--offset` (VIRB legacy). |
-| `--timezone OFFSET` | `None` (auto-detect) | Override camera UTC offset, e.g. `+02:00`, `+2`, `-5`, or `2.5`. Aliases: `--tz` (MAX/VIRB legacy). |
-| `--time-base {local,utc}` | `local` | Wall clock used for filenames/folders and for naming. EXIF DateTimeOriginal remains local with OffsetTimeOriginal = UTC offset; UTC time is also recorded in sidecars/manifests. |
-| `--format {jpg,png}` | `jpg` | Output image format. |
-| `--quality 1-100` | `95` | Image quality (100 = best). |
-| `--overwrite` | `false` | Overwrite existing images instead of skipping them. |
-| `--dry-run` | `false` | Report what would be exported without writing anything. |
-| `--fail-fast` | `false` | Stop on the first file that errors. |
-| `--manifest FILE` | `None` | Write a JSON manifest listing all exported points. |
-| `--workers N` | `1` | Number of frames to extract in parallel. Alias: `--jobs` (MAX legacy). |
-| `--threads N` | `0` | ffmpeg threads per extraction job (0 = auto). |
-| `--no-exif` | `false` | Do not write EXIF/XMP metadata. |
-| `-v, --verbose` / `-q, --quiet` | — | Increase/decrease logging verbosity. |
-| `--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}` | `INFO` | Explicit logging level. |
-| `--version` | — | Show program version and exit. |
+| Garmin VIRB Ultra 30 | FIT (sibling `*.fit` in `GMetrix/` or matched by filename/time) | no |
+| GoPro MAX 360 (`.360`/dual-EAC) | GPMF (embedded `gpmd`) | yes (EAC → equirectangular via `ffmpeg v360`, default 5376×2688) |
+| BlackVue DR900 series | NMEA in top-level `free` atoms | no |
+| GoPro HERO (flat MP4, GPMF) | GPMF GPS5/GPS9; IMU optional | no (no GPano) |
 
-Legacy aliases (supported where unambiguous): `--offset`→`--heading-offset`, `--tz`→`--timezone`, `--jobs`→`--workers`, `--video-glob`→`--extensions` (VIRB).
+Everything lives in `v2i.py`: camera detection, all four pipelines, GPMF/FIT/NMEA telemetry readers, frame extraction, metadata writing and track export. There are no separate per-camera or helper modules.
 
-Shared GPS/track behavior (where applicable): `--distance-mode {2d,3d}`, `--sidecars`, `--stationary-speed MPS`, `--smooth N`, `--jitter METERS`, `--fallback-interval SECONDS`.
+## Output layout
 
-## Output Structure & Naming
+- One date folder per source video based on the **first exported frame**: `<output>/YYYY-MM-DD-<camera>/<sequence>/`
+- Camera suffixes: `virb30`, `max360`, `blackvue`, `hero`
+- Sequence directory name is derived from the source video stem, made collision-safe by prepending a nested path prefix when stems collide (no numeric `-2` counters)
+- When `--offset`/`--heading-offset` is supplied, the recalculated `000`-`360` value is appended to the camera folder: `<output>/YYYY-MM-DD-<camera>-<offset>/<sequence>/` (e.g. `2026-10-28-virb30-090`); without it the folder is unchanged
+- Filenames: `YYYY-MM-DD_HH-MM-SS-mmm.jpg` or `.png`. Timestamps cross midnight while staying in the same sequence folder
+- A `-2`/`-3` suffix is used **only** when two frames selected in the same run share a millisecond. Re-running skips images that already exist; `--overwrite` rewrites them in place (no new suffixed copies)
+- Each sequence writes `<sequence>.gpx` and `<sequence>.geojson` by default (`--track-export {both,gpx,geojson,none}`, `--save-telemetry` alias)
 
-Images are written as:
-```
-<output>/<YYYY-MM-DD>/<sequence>/<YYYY-MM-DD_HH-MM-SS-mmm_NNNNNN.ext>
-```
-- `<sequence>` is derived from the source video name (e.g. `VIRB0996`, `20210127_092534_NF`, `GS013287`).
-- Timestamp fields use zero-padded components with millisecond precision (`mmm`).
-- Counter `NNNNNN` is 6-digit, per sequence (000001, 000002, ...).
-- `<YYYY-MM-DD>` is the capture date of the image (by `--time-base` choice: local or UTC date).
-- Existing files are never overwritten unless `--overwrite` is given.
+## Quick start
 
-When `--sidecars` is enabled, each sequence also gets `<sequence>.track.jsonl` next to the images (one JSON line per planned point, including written status and GPS/timestamps).
-
-When `--manifest` is given, a top-level JSON manifest is written summarizing all exported points across videos.
-
-EXIF metadata (if written):
-- `Make`, `Model`, `SerialNumber`/`CameraSerialNumber`, `Software` set from camera/container where available.
-- `DateTimeOriginal`, `CreateDate`, `ModifyDate`, `SubSecTimeOriginal` = local capture time (if `--time-base local`) or UTC (if `--time-base utc`), with millisecond precision.
-- `OffsetTimeOriginal`, `OffsetTime` = UTC offset in seconds (`+HH:MM`).
-- GPS fields: `GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `GPSSpeed`, `GPSTrack`, `GPSImgDirection` (with refs). Speeds are written in km/h for EXIF speed tags where applicable.
-- Additional XMP/subject fields include source video, frame/pts, distance, heading offset, etc.
-
-## Camera-Specific Documentation
-
-### Garmin VIRB Ultra 30 (`virb30-v2i.py`)
-
-**Purpose:** Export geotagged stills from VIRB Ultra 30 MP4/MOV videos using associated FIT telemetry.
-
-**Telemetry discovery:**
-- Looks for FIT files next to the video, or in a sibling directory named `gmetrix/` (default) or as specified by `--fit-directory-name`.
-- `--fit FILE` can be given repeatedly to supply specific FIT files (applies to all videos in that run).
-- FIT provides GPS positions, timestamps, and device info.
-
-**Script-specific options:**
-| Option | Default | Description |
-|---|---|---|
-| `--fit FILE` | `[]` | Path to FIT file(s) (repeatable). One value applies to all videos. |
-| `--fit-directory-name NAME` | `gmetrix` | Sibling folder holding FIT telemetry files. |
-| `--distance-mode {2d,3d}` | `2d` | Distance travelled on ground (2D) or in 3D. |
-| `--sidecars` | `false` | Also write `<sequence>.track.jsonl` manifest per sequence. |
-| `--fallback-interval SECONDS` | `0.0` | If a video has no usable telemetry/FIT data, sample every N seconds instead of skipping (0 = skip). |
-
-**Behavior notes:**
-- VIRB timestamps come from FIT (GPS time base); local time is derived from FIT timestamps and the configured `--timezone` (or detected).
-- If no telemetry is found and fallback is enabled, images are time-gridded with no position metadata (Make/Model still written unless `--no-exif`).
-- Skips GoPro MAX `.360` and BlackVue `.mp4` files with reasons.
-
-**Example:**
 ```bash
-python3 virb30-v2i.py -i video/2026-10-05 -o images --distance 5 --recursive
+# Everything under video/, detected per file
+python3 v2i.py -i video/ -o images/ -d 7
+
+# VIRB (finds FIT in GMetrix/ automatically)
+python3 v2i.py -i video/2026-10-05-virb-1080-24fps -o images/ -d 5 --start-distance 0
+
+# GoPro MAX 360 (TimeWarp/variable rates handled)
+python3 v2i.py -i video/2026-10-26-max360-000-timelapse05-30fps -o images/ -d 2 --start-distance 0
+
+# BlackVue DR900
+python3 v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-distance 0
+
+# GoPro HERO flat (no GPS → skipped unless fallback)
+python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
+# HERO with no GPS, unpositioned time-lapse:
+python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
 ```
 
-### GoPro MAX 360 (`max360-v2i.py`)
+## Detection
 
-**Purpose:** Extract geotagged equirectangular still images from GoPro MAX `.360` (and MP4) videos at fixed GPS distance intervals. Only GoPro MAX files are processed.
+Cameras are identified from container handlers, GPMF `DVNM`, stream layout and filenames; ambiguous GoPro metadata is **not guessed** (e.g. generic GoPro handler with no device/filename/layout evidence). Recognised videos are grouped and processed by the matching pipeline; unrecognised or ambiguous files are skipped with a clear reason.
 
-**Telemetry:** GPMF embedded in the video container.
+Every candidate file is reported during detection:
 
-**Script-specific options:**
-| Option | Default | Description |
-|---|---|---|
-| `--width WIDTH` | `5376` | Output image width (equirectangular). |
-| `--height HEIGHT` | `2688` | Output image height. |
-| `--interp {cubic,linear,nearest,lanczos}` | `cubic` | v360 reprojection interpolation. |
-| `--heading-window HEADING_WINDOW` | `4` | GPS samples either side used for heading smoothing. |
-| `--stationary-speed MPS` | `0.3` | Speed below which treated as parked (no distance accumulated). |
-| `--smooth N` | `9` | Moving-average window (samples) applied to GPS positions. |
-| `--jitter METERS` | `0.5` | GPS steps shorter than this treated as noise when no speed data. |
-| `--save-telemetry` | `false` | Also write raw GPMF (`.gpmd`) and GPX (`.gpx`) track next to images. |
-| `--keep-filter` | `false` | Keep generated ffmpeg filter script. |
+- `[INFO] camera <camera label>: <file>` for every recognised video (evidence is shown with `-v`/`--log-level DEBUG`),
+- `[WARNING] skipping <file>: <reason>` for unsupported, ambiguous or unreadable files,
+- `[INFO] camera detection summary: BlackVue DR900=N, GoPro MAX 360=N, Garmin VIRB Ultra 30=N, GoPro HERO=N` once per run, counting **all** camera types found under `--input` (an `unsupported=N` entry is added when unknown files are present).
 
-**Behavior notes:**
-- Reprojects dual-lens 360° to equirectangular stills using the v360 pipeline.
-- Timezone defaults to UTC (0h) unless `--timezone` is specified; `--time-base utc` forces UTC for filenames.
-- Positional `INPUT` is accepted as a compatibility alias (e.g. `max360-v2i.py video/ -o images`).
-- Skips VIRB and BlackVue files with reasons.
+So a single `-i video/` run shows the camera mix of the whole input tree and processes every recognised camera in one pass.
 
-**Example:**
+Measured (evidence-based):
+- MAX: `DVNM` includes `Max`, dual EAC video streams or `.360`, filename `GS*.360/mp4/mov`
+- HERO: `DVNM` includes `HERO`, single flat video stream with GPMF, filename `GX*/GH*/GOPR*/GOPRO*`
+- VIRB: Garmin handler/filename `VIRB*`
+- BlackVue: PittaSoft/BlackVue handler/filename `YYYYMMDD_HHMMSS_XX`
+
+## Frame timeline & selection
+
+- Frame timeline comes from `ffprobe` actual PTS (`-show_packets`, presentation order) with fallback to a uniform fps grid if unreadable
+- Frames are extracted by **exact frame index**, one accurate `-ss <PTS> -frames:v 1` seek per frame (`extract_frames_by_index`); `--workers` runs that many ffmpeg processes in parallel (default 1)
+- One unique frame per target distance along the interpolated track; **never reused**, indices **strictly increasing**
+- `--start-distance 0` **always exports the first frame (index 0)** even if telemetry starts later (position clamped to start, `position_source=clamped-start`); failing to extract frame 0 with `--start-distance 0` is a hard error
+- Nearest unused frame within `--max-position-error` (default `distance/2`); targets with no acceptable frame are **skipped** (gaps allowed)
+- Low frame rates / VFR produce gaps rather than duplicates
+- `--max-images` caps output; `--distance-mode {2d,3d}`
+
+## Time base & timestamps
+
+- Default `--time-base local` with detected camera offset; `--timezone OFFSET` or `--tz` override
+- **MAX/HERO** carry no local wall clock: if offset unknown, filenames/EXIF use **UTC** and a warning is logged (never host timezone)
+- EXIF: `DateTimeOriginal`/`CreateDate`/`ModifyDate` are camera-local when known, else UTC; `OffsetTimeOriginal` written **only when offset known**
+- All GPS date/time tags are **UTC**
+- Track `*.gpx` is valid GPX 1.1 (UTC `<time>`, namespaced extensions); `*.geojson` RFC 7946 (`LineString` + image `Point` features; `Point` if single-sample track)
+- Midnight crossing keeps images in the same sequence folder with date-based filenames
+
+## Headings, accuracy, DOP
+
+- Heading source precedence (in `resolve_heading`): `compass_heading` (IMU/MAGN+GRAV) > `metadata_heading` > `course`/`heading` > `gps_course` (computed by `Track` from positions). `heading_source` recorded. `compass_heading` = camera/device pointing direction (tilt-compensated when available); `course`/`heading`/`gps_course` = Course Over Ground (direction of travel). Use `--heading-offset` for mounting angle, `--magnetic-declination` for compass. Per camera: HERO/MAX use GPMF GPS + optional `--imu-heading` compass from MAGN+GRAV; VIRB reads `course/heading` from FIT (usually travel direction) with `camera_orientation_deg` stored separately (not used for `img_direction`); BlackVue uses NMEA RMC/VTG course or Track-computed GPS course.
+- `--heading-offset` (`--offset` alias), `--magnetic-declination` applied to true north. Heading offsets are recalculated to unsigned `000`-`360` degrees (`-90` → `270`, `450` → `090`) and, when explicitly supplied, appended to the camera folder name
+- Accuracy: measured (FIT/GPMF/EXIF) takes precedence; else `accuracy_m ≈ HDOP × UERE` with `accuracy_estimated=true`, `accuracy_source=hdop*uere` (default `--uere 5.0`)
+- VIRB uses FIT GPS accuracy fields (including field 8) and HDOP/VDOP; BlackVue uses GGA HDOP/sats and GSA PDOP/HDOP/VDOP; MAX/HERO use GPMF GPSP/GPSF and DOP
+
+## Metadata policy
+
+- No hard-coded `Keywords`/`XMP:Subject`; `--keywords "a;b;c"` is **opt-in**
+- Provenance is written to `ImageDescription`/`UserComment`/`XMP:Description`, not keywords
+- **GPano/XMP-GPano** written **only for panoramic (MAX) images** with the full tag set; flat HERO/VIRB/BlackVue have no GPano tags
+
+## GoPro specifics
+
+### MAX 360
+- Correct EAC layout: three 1344-wide faces at x=0,1376,2752 per hemisphere, drop 32px gaps, hstack faces → 4032, vstack hemispheres → 4032×2688, `v360=eac:equirect`
+- Backends: `--stitch-backend {auto,ffmpeg,max2sphere}` (default `auto`, ffmpeg preferred). `max2sphere` used only if requested/available
+- Options: `--width/--height` (default 5376×2688), `--interp {cubic,linear,nearest,lanczos}`, `--keep-filter`, `--imu-heading`, TimeWarp handled by scaling GPS span to video span
+- GPMF GPSP raw values used for DOP
+
+### HERO (flat)
+- Options: `--gpmf-stream INDEX`, `--device-model`, `--allow-missing-gps`, `--imu-heading`, `--fallback-interval`
+- **No GPS telemetry → skipped unless both `--allow-missing-gps` and `--fallback-interval` are provided**; fallback exports an **unpositioned** time-lapse with no GPS tags and `position_source=unpositioned`
+- Supports GPMF GPS5/GPS9/GPSF/GPSP/GPSU/STMP and IMU/MAGN streams via the built-in GPMF reader
+
+## Common options
+
+The unified CLI accepts: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
+
+Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (CRITICAL bold red, DEBUG grey). Colours are disabled automatically when stderr is redirected; set `NO_COLOR=1` to force them off or `FORCE_COLOR=1` to force them on.
+
+## Tests
+
+Standard library only (no pytest needed):
+
 ```bash
-python3 max360-v2i.py -i video/2026-10-11 -o images --distance 5 --format jpg --quality 95
+python3 -m unittest discover -s tests -v
 ```
 
-### BlackVue DR900 (`blackvue900-v21.py`)
+The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming, MAX batch command construction, and seek-based frame extraction compared against a `select` decode pass.
 
-**Purpose:** Export geotagged stills from BlackVue DR900 dashcam MP4 videos using NMEA GPS sentences embedded in `free` atoms.
+## Measured sample evidence (for reference)
 
-**Telemetry:** NMEA sentences (GGA/RMC/VTG) prefixed with camera-local wall-clock epoch-millisecond stamps in `free` atoms; typically present near start and duplicated in trailing concatenated segment.
+| Sample | Notes |
+|---|---|
+| `video/2026-10-26-max360-000-timelapse05-30fps/GS013336.360` | GoPro Max, DVNM GoPro Max, dual EAC 4096×1344, 1208 frames / 40.34 s; GPS span 604.57 s (TimeWarp) scaled to video span; equirect 5376×2688 with full GPano tags |
+| `video/2025-08-16-hero-standard-nogps/GX011785.MP4` | HERO11 Black, GPMF IMU but **no GPS5/GPSU/GPSF/GPSP** → skipped by default, fallback unpositioned works with UTC millisecond naming |
+| `video/2026-10-05-virb-1080-24fps/VIRB0996.MP4` + `GMetrix/2026-10-05-07-53-07.fit` | 9108 GPS, IMU; camera events align segment, offset +02:00 |
+| `video/2026-10-18-virb-090-4k-30fps/VIRB0782.MP4` / `video/2026-10-18-virb-270-4k-24fps/VIRB0008.MP4` | VIRB Ultra 30; filenames carry real capture milliseconds (e.g. `2026-10-18_16-18-37-111.jpg`) |
+| BlackVue samples | NMEA in `free` atoms, GGA/RMC/VTG/GSA parsed, clock reconciliation to GPS, course from RMC/VTG |
 
-**Clock reconciliation:** The camera’s wall clock (bracket stamps, matching filename start) can run ahead of GPS UTC. The tool:
-1. Computes video-relative time `t` from bracket stamps minus recording start (from filename `YYYYMMDD_HHMMSS`).
-2. Derives absolute UTC from NMEA date/time fields.
-3. Computes `tz_offset = snapped-quarter-hour(median(bracket_local − nmea_utc))` (or uses `--timezone` override).
-4. Sets `video_start_utc = nmea_utc(first) − t(first)` and `video_start_local = video_start_utc + tz_offset`. This ensures `DateTimeOriginal + OffsetTimeOriginal = true GPS UTC`; if skew >= 1s, it logs “camera clock is ±X s off GPS; times follow GPS”.
-
-**Script-specific options:**
-| Option | Default | Description |
-|---|---|---|
-| `--distance-mode {2d,3d}` | `2d` | Distance travelled on ground (2D) or in 3D. |
-| `--sidecars` | `false` | Also write `<sequence>.track.jsonl` manifest per sequence. |
-| `--fallback-interval SECONDS` | `0.0` | If a video has no GPS data, sample every N seconds instead of skipping (0 = skip). When GPS exists but yields no distance-based capture points (e.g. stationary track), fallback also applies. |
-
-**Behavior notes:**
-- Reads `cprt` from container to extract make/model/firmware/serial (recorded as `BlackVue DR900M-1CH FW ...`).
-- Deduces and logs camera-local offset and video start (local). Filenames/folders follow `--time-base`.
-- If no GPS samples and `--fallback-interval` > 0 and video duration/start known, produces time-gridded images with no position metadata; otherwise skips with reason “no GPS data and no fallback requested” (or “no distance-based capture points”).
-- Skips VIRB and GoPro files with reasons.
-
-**Example:**
-```bash
-python3 blackvue900-v21.py -i video/2021-01-27 -o images --distance 5 --dry-run
-python3 blackvue900-v21.py -i video/2021-01-27/20210127_092534_NF.mp4 -o images --max-images 3 --sidecars --manifest images/manifest.json --time-base utc
-```
-
-## Examples
-
-### Process a whole mixed tree safely (each script picks its own)
-```bash
-# VIRB only
-python3 virb30-v2i.py -i video/ -o out/virb --distance 5
-
-# GoPro MAX only
-python3 max360-v2i.py -i video/ -o out/max --distance 5 --format jpg
-
-# BlackVue only
-python3 blackvue900-v21.py -i video/ -o out/bv --distance 5
-```
-
-### Dry-run to see what would be planned
-```bash
-python3 virb30-v2i.py -i video/ -o out --dry-run
-```
-
-### Single file with limits
-```bash
-python3 blackvue900-v21.py -i video/2021-01-27/20210127_092534_NF.mp4 -o out --max-images 10 --start-distance 20
-```
-
-### Time-base UTC and custom quality
-```bash
-python3 max360-v2i.py -i video/ -o out --time-base utc --quality 100 --format png
-```
-
-### Provide FIT files explicitly (VIRB)
-```bash
-python3 virb30-v2i.py -i video/ -o out --fit /path/to/track.fit --fit gmetrix/another.fit
-```
-
-### Save telemetry/GPX from MAX
-```bash
-python3 max360-v2i.py -i video/ -o out --save-telemetry
-```
-
-### Fallback when no telemetry/GPS (VIRB/BlackVue)
-```bash
-python3 virb30-v2i.py -i video/ -o out --fallback-interval 10
-python3 blackvue900-v21.py -i video/ -o out --fallback-interval 5
-```
-
-## Troubleshooting
-
-- **Missing tools:** Ensure `ffmpeg`, `ffprobe`, `exiftool` are on `PATH`. Scripts check for `ffmpeg`/`ffprobe` and warn if `exiftool` missing.
-- **No videos found:** Check `--extensions` matches your files and `--input` path. Use `--recursive` (default) for directories.
-- **Skipped files:** Look for WARNING lines like “skipping …: recorded by …, not …” or “unsupported camera/ambiguous/missing camera metadata/invalid or unreadable video/missing GPS data”. This is expected when a folder contains mixed cameras.
-- **BlackVue timing looks off:** The tool reports camera-clock skew (e.g. “camera clock is -61 s off GPS; times follow GPS”). Filenames use the reconciled local start (UTC offset applied to true GPS UTC) so EXIF DateTimeOriginal+Offset matches true GPS UTC.
-- **Low FPS + small distance:** Multiple capture points may map to the same frame (frame quantization). This is consistent across scripts and produces distinct image files (different counters) with potentially different interpolated GPS at each planned point.
-- **MAX 360 reprojection:** Large `--width/--height` increases processing time; defaults are reasonable for Mapillary/Panoramax.
-- **Dry-run first:** Use `--dry-run` to verify counts before a real run.
-
-## Notes on Timestamps & GPS
-
-- **VIRB:** Uses FIT telemetry timestamps as ground truth; `video_start_local` derives from FIT + `--timezone`. Skew detection not applicable (FIT is authoritative).
-- **MAX:** Uses GPMF GPS time (UTC) where available; timezone handling follows `--timezone`/`--time-base`.
-- **BlackVue:** Reconciles bracket (camera local wall clock) vs NMEA (GPS UTC) — this fixes typical camera-clock skew. The logged “video start (local)” is the reconciled local time used for naming/EXIF.
-- **Date folders:** Always the capture date per `--time-base`. If a recording spans midnight, each image is filed under its own capture date (warnings logged).
-- **Manifest/sidecars:** Contain both `datetime_local` and `datetime_utc` (naive UTC instants in the JSON) plus `utc_offset_s`.
