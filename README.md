@@ -18,7 +18,7 @@ All scripts share CLI, output layout, naming, time base, metadata policy, teleme
 - One date folder per source video based on the **first exported frame**: `<output>/YYYY-MM-DD-<camera>/<sequence>/`
 - Camera suffixes: `virb30`, `max360`, `blackvue`, `hero`
 - Sequence directory name is derived from the source video stem, made collision-safe by prepending a nested path prefix when stems collide (no numeric `-2` counters)
-- When `--offset`/`--heading-offset` is supplied, the recalculated `000`-`360` value is appended to the sequence folder: `<output>/YYYY-MM-DD-<camera>/<sequence>-<offset>/` (e.g. `-090`, `-270`, `-360`); without it the folder is unchanged
+- When `--offset`/`--heading-offset` is supplied, the recalculated `000`-`360` value is appended to the camera folder: `<output>/YYYY-MM-DD-<camera>-<offset>/<sequence>/` (e.g. `2026-10-28-virb30-090`); without it the folder is unchanged
 - Filenames: `YYYY-MM-DD_HH-MM-SS-mmm.jpg` or `.png`. Timestamps cross midnight while staying in the same sequence folder
 - A `-2`/`-3` suffix is used **only** when two frames selected in the same run share a millisecond. Re-running skips images that already exist; `--overwrite` rewrites them in place (no new suffixed copies)
 - Each sequence writes `<sequence>.gpx` and `<sequence>.geojson` by default (`--track-export {both,gpx,geojson,none}`, `--save-telemetry` alias)
@@ -81,7 +81,7 @@ Measured (evidence-based):
 ## Headings, accuracy, DOP
 
 - Heading source precedence (in `v2i_common.resolve_heading`): `compass_heading` (IMU/MAGN+GRAV) > `metadata_heading` > `course`/`heading` > `gps_course` (computed by `Track` from positions). `heading_source` recorded. `compass_heading` = camera/device pointing direction (tilt-compensated when available); `course`/`heading`/`gps_course` = Course Over Ground (direction of travel). Use `--heading-offset` for mounting angle, `--magnetic-declination` for compass. Per camera: HERO/MAX use GPMF GPS + optional `--imu-heading` compass from MAGN+GRAV; VIRB reads `course/heading` from FIT (usually travel direction) with `camera_orientation_deg` stored separately (not used for `img_direction`); BlackVue uses NMEA RMC/VTG course or Track-computed GPS course.
-- `--heading-offset` (`--offset` alias), `--magnetic-declination` applied to true north. Heading offsets are recalculated to unsigned `000`-`360` degrees (`-90` → `270`, `450` → `090`) and, when explicitly supplied, appended to the sequence folder name
+- `--heading-offset` (`--offset` alias), `--magnetic-declination` applied to true north. Heading offsets are recalculated to unsigned `000`-`360` degrees (`-90` → `270`, `450` → `090`) and, when explicitly supplied, appended to the camera folder name
 - Accuracy: measured (FIT/GPMF/EXIF) takes precedence; else `accuracy_m ≈ HDOP × UERE` with `accuracy_estimated=true`, `accuracy_source=hdop*uere` (default `--uere 5.0`)
 - VIRB uses FIT GPS accuracy fields (including field 8) and HDOP/VDOP; BlackVue uses GGA HDOP/sats and GSA PDOP/HDOP/VDOP; MAX/HERO use GPMF GPSP/GPSF and DOP
 

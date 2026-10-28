@@ -531,7 +531,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                         default=None, metavar="DEGREES",
                         help="degrees added to the heading to derive the image "
                              "direction; recalculated to 000-360 and appended "
-                             "to the sequence folder as -NNN")
+                             "to the camera folder as -NNN")
     parser.add_argument("--offset", dest="heading_offset", type=float,
                         default=None,
                         help="alias for --heading-offset")
@@ -1134,7 +1134,7 @@ def format_heading_offset(value: float) -> str:
 
 
 def heading_offset_for_folder(args: argparse.Namespace) -> Optional[float]:
-    """Offset to append to the sequence folder, or ``None`` when not given."""
+    """Offset to append to the camera folder, or ``None`` when not given."""
     if getattr(args, "heading_offset_given", False):
         return args.heading_offset
     return None
@@ -1762,9 +1762,17 @@ def image_filename(value: dt.datetime, image_format: str = "jpg") -> str:
             + "-%03d.%s" % (value.microsecond // 1000, image_format))
 
 
-def date_folder_name(value: dt.datetime, camera: str) -> str:
-    """``YYYY-MM-DD-<camera-suffix>`` for the first exported frame."""
-    return "%s-%s" % (value.strftime("%Y-%m-%d"), CAMERA_SUFFIX[camera])
+def date_folder_name(value: dt.datetime, camera: str, *,
+                     heading_offset: Optional[float] = None) -> str:
+    """``YYYY-MM-DD-<camera-suffix>`` for the first exported frame.
+
+    A supplied heading offset is recalculated to ``000``-``360`` and appended
+    to the camera folder: ``YYYY-MM-DD-<camera-suffix>-<offset>``.
+    """
+    name = "%s-%s" % (value.strftime("%Y-%m-%d"), CAMERA_SUFFIX[camera])
+    if heading_offset is not None:
+        name = "%s-%s" % (name, format_heading_offset(heading_offset))
+    return name
 
 
 def sequence_output_dir(output_dir: str, camera: str, sequence: str,
@@ -1773,14 +1781,13 @@ def sequence_output_dir(output_dir: str, camera: str, sequence: str,
     """``<output>/<date>-<camera>/<sequence>``.
 
     When a heading offset was explicitly supplied it is recalculated to
-    ``000``-``360`` and appended to the sequence folder:
-    ``<output>/<date>-<camera>/<sequence>-<offset>``.
+    ``000``-``360`` and appended to the camera folder:
+    ``<output>/<date>-<camera>-<offset>/<sequence>``.
     """
-    folder = sequence
-    if heading_offset is not None:
-        folder = "%s-%s" % (folder, format_heading_offset(heading_offset))
-    return os.path.join(output_dir, date_folder_name(first_capture, camera),
-                        folder)
+    return os.path.join(
+        output_dir,
+        date_folder_name(first_capture, camera, heading_offset=heading_offset),
+        sequence)
 
 
 def unique_path(path: str, used: set) -> str:
