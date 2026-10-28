@@ -4,14 +4,16 @@ Extract geotagged still images from dash/helmet cameras at fixed GPS distance in
 
 ## Supported cameras
 
-| Script | Camera | Telemetry | 360 stitching |
-|---|---|---|---|
-| `virb30-v2i.py` | Garmin VIRB Ultra 30 | FIT (sibling `*.fit` in `GMetrix/` or matched by filename/time) | no |
-| `max360-v2i.py` | GoPro MAX 360 (`.360`/dual-EAC) | GPMF (embedded `gpmd`) | yes (EAC → equirectangular via `ffmpeg v360`, default 5376×2688) |
-| `blackvue900-v2i.py` (legacy `blackvue900-v21.py` deprecated shim) | BlackVue DR900 series | NMEA in top-level `free` atoms | no |
-| `hero-v2i.py` | GoPro HERO (flat MP4, GPMF) | GPMF GPS5/GPS9; IMU optional | no (no GPano) |
+`v2i.py` is the single entry point for all supported cameras. It detects the camera per file, groups the videos and runs the matching pipeline, so one input tree may mix manufacturers.
 
-All scripts share CLI, output layout, naming, time base, metadata policy, telemetry export and selection rules via `v2i_common.py`, `v2i_gpmf.py`, `v2i_metadata.py`.
+| Camera | Telemetry | 360 stitching |
+|---|---|---|
+| Garmin VIRB Ultra 30 | FIT (sibling `*.fit` in `GMetrix/` or matched by filename/time) | no |
+| GoPro MAX 360 (`.360`/dual-EAC) | GPMF (embedded `gpmd`) | yes (EAC → equirectangular via `ffmpeg v360`, default 5376×2688) |
+| BlackVue DR900 series | NMEA in top-level `free` atoms | no |
+| GoPro HERO (flat MP4, GPMF) | GPMF GPS5/GPS9; IMU optional | no (no GPano) |
+
+Everything lives in `v2i.py`: camera detection, all four pipelines, GPMF/FIT/NMEA telemetry readers, frame extraction, metadata writing and track export. There are no separate per-camera or helper modules.
 
 ## Output layout
 
@@ -26,32 +28,35 @@ All scripts share CLI, output layout, naming, time base, metadata policy, teleme
 ## Quick start
 
 ```bash
+# Everything under video/, detected per file
+python3 v2i.py -i video/ -o images/ -d 7
+
 # VIRB (finds FIT in GMetrix/ automatically)
-python3 virb30-v2i.py -i video/2026-10-05-virb-1080-24fps -o images/ -d 5 --start-distance 0
+python3 v2i.py -i video/2026-10-05-virb-1080-24fps -o images/ -d 5 --start-distance 0
 
 # GoPro MAX 360 (TimeWarp/variable rates handled)
-python3 max360-v2i.py -i video/2026-10-26-max360-000-timelapse05-30fps -o images/ -d 2 --start-distance 0
+python3 v2i.py -i video/2026-10-26-max360-000-timelapse05-30fps -o images/ -d 2 --start-distance 0
 
 # BlackVue DR900
-python3 blackvue900-v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-distance 0
+python3 v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-distance 0
 
 # GoPro HERO flat (no GPS → skipped unless fallback)
-python3 hero-v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
+python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
 # HERO with no GPS, unpositioned time-lapse:
-python3 hero-v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
+python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
 ```
 
 ## Detection
 
-Cameras are identified from container handlers, GPMF `DVNM`, stream layout and filenames; ambiguous GoPro metadata is **not guessed** (e.g. generic GoPro handler with no device/filename/layout evidence). Wrong-camera files are skipped with a clear reason.
+Cameras are identified from container handlers, GPMF `DVNM`, stream layout and filenames; ambiguous GoPro metadata is **not guessed** (e.g. generic GoPro handler with no device/filename/layout evidence). Recognised videos are grouped and processed by the matching pipeline; unrecognised or ambiguous files are skipped with a clear reason.
 
 Every candidate file is reported during detection:
 
-- `[INFO] camera <camera label>: <file>` for videos that belong to the exporter's camera (evidence is shown with `-v`/`--log-level DEBUG`),
-- `[WARNING] skipping <file>: <reason>` for files from other cameras or unreadable files,
+- `[INFO] camera <camera label>: <file>` for every recognised video (evidence is shown with `-v`/`--log-level DEBUG`),
+- `[WARNING] skipping <file>: <reason>` for unsupported, ambiguous or unreadable files,
 - `[INFO] camera detection summary: BlackVue DR900=N, GoPro MAX 360=N, Garmin VIRB Ultra 30=N, GoPro HERO=N` once per run, counting **all** camera types found under `--input` (an `unsupported=N` entry is added when unknown files are present).
 
-So a single `-i video/` run shows both which files this exporter will process and the camera mix of the whole input tree.
+So a single `-i video/` run shows the camera mix of the whole input tree and processes every recognised camera in one pass.
 
 Measured (evidence-based):
 - MAX: `DVNM` includes `Max`, dual EAC video streams or `.360`, filename `GS*.360/mp4/mov`
@@ -62,7 +67,7 @@ Measured (evidence-based):
 ## Frame timeline & selection
 
 - Frame timeline comes from `ffprobe` actual PTS (`-show_packets`, presentation order) with fallback to a uniform fps grid if unreadable
-- Frames are extracted by **exact frame index**, one accurate `-ss <PTS> -frames:v 1` seek per frame (`v2i_common.extract_frames_by_index`); `--workers` runs that many ffmpeg processes in parallel (default 1)
+- Frames are extracted by **exact frame index**, one accurate `-ss <PTS> -frames:v 1` seek per frame (`extract_frames_by_index`); `--workers` runs that many ffmpeg processes in parallel (default 1)
 - One unique frame per target distance along the interpolated track; **never reused**, indices **strictly increasing**
 - `--start-distance 0` **always exports the first frame (index 0)** even if telemetry starts later (position clamped to start, `position_source=clamped-start`); failing to extract frame 0 with `--start-distance 0` is a hard error
 - Nearest unused frame within `--max-position-error` (default `distance/2`); targets with no acceptable frame are **skipped** (gaps allowed)
@@ -80,7 +85,7 @@ Measured (evidence-based):
 
 ## Headings, accuracy, DOP
 
-- Heading source precedence (in `v2i_common.resolve_heading`): `compass_heading` (IMU/MAGN+GRAV) > `metadata_heading` > `course`/`heading` > `gps_course` (computed by `Track` from positions). `heading_source` recorded. `compass_heading` = camera/device pointing direction (tilt-compensated when available); `course`/`heading`/`gps_course` = Course Over Ground (direction of travel). Use `--heading-offset` for mounting angle, `--magnetic-declination` for compass. Per camera: HERO/MAX use GPMF GPS + optional `--imu-heading` compass from MAGN+GRAV; VIRB reads `course/heading` from FIT (usually travel direction) with `camera_orientation_deg` stored separately (not used for `img_direction`); BlackVue uses NMEA RMC/VTG course or Track-computed GPS course.
+- Heading source precedence (in `resolve_heading`): `compass_heading` (IMU/MAGN+GRAV) > `metadata_heading` > `course`/`heading` > `gps_course` (computed by `Track` from positions). `heading_source` recorded. `compass_heading` = camera/device pointing direction (tilt-compensated when available); `course`/`heading`/`gps_course` = Course Over Ground (direction of travel). Use `--heading-offset` for mounting angle, `--magnetic-declination` for compass. Per camera: HERO/MAX use GPMF GPS + optional `--imu-heading` compass from MAGN+GRAV; VIRB reads `course/heading` from FIT (usually travel direction) with `camera_orientation_deg` stored separately (not used for `img_direction`); BlackVue uses NMEA RMC/VTG course or Track-computed GPS course.
 - `--heading-offset` (`--offset` alias), `--magnetic-declination` applied to true north. Heading offsets are recalculated to unsigned `000`-`360` degrees (`-90` → `270`, `450` → `090`) and, when explicitly supplied, appended to the camera folder name
 - Accuracy: measured (FIT/GPMF/EXIF) takes precedence; else `accuracy_m ≈ HDOP × UERE` with `accuracy_estimated=true`, `accuracy_source=hdop*uere` (default `--uere 5.0`)
 - VIRB uses FIT GPS accuracy fields (including field 8) and HDOP/VDOP; BlackVue uses GGA HDOP/sats and GSA PDOP/HDOP/VDOP; MAX/HERO use GPMF GPSP/GPSF and DOP
@@ -102,11 +107,11 @@ Measured (evidence-based):
 ### HERO (flat)
 - Options: `--gpmf-stream INDEX`, `--device-model`, `--allow-missing-gps`, `--imu-heading`, `--fallback-interval`
 - **No GPS telemetry → skipped unless both `--allow-missing-gps` and `--fallback-interval` are provided**; fallback exports an **unpositioned** time-lapse with no GPS tags and `position_source=unpositioned`
-- Supports GPMF GPS5/GPS9/GPSF/GPSP/GPSU/STMP and IMU/MAGN streams via `v2i_gpmf`
+- Supports GPMF GPS5/GPS9/GPSF/GPSP/GPSU/STMP and IMU/MAGN streams via the built-in GPMF reader
 
 ## Common options
 
-All exporters accept: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
+The unified CLI accepts: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
 
 Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (CRITICAL bold red, DEBUG grey). Colours are disabled automatically when stderr is redirected; set `NO_COLOR=1` to force them off or `FORCE_COLOR=1` to force them on.
 
@@ -118,7 +123,7 @@ Standard library only (no pytest needed):
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers detection/reporting, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming, and seek-based frame extraction compared against a `select` decode pass.
+The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming, MAX batch command construction, and seek-based frame extraction compared against a `select` decode pass.
 
 ## Measured sample evidence (for reference)
 
