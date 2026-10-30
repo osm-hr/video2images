@@ -158,3 +158,15 @@ The suite covers unified camera detection/grouping, coloured logging, filename m
 | `video/2026-10-18-virb-090-4k-30fps/VIRB0782.MP4` / `video/2026-10-18-virb-270-4k-24fps/VIRB0008.MP4` | VIRB Ultra 30; filenames carry real capture milliseconds (e.g. `2026-10-18_16-18-37-111.jpg`) |
 | BlackVue samples | NMEA in `free` atoms, GGA/RMC/VTG/GSA parsed, clock reconciliation to GPS, course from RMC/VTG |
 
+
+
+## VIRB Ultra 30 specifics
+
+- **Accelerometer sign convention**: By default, the accelerometer data is interpreted with a negative sign (`--virb-accel-sign minus`). This assumes the camera is mounted upright. If the camera is mounted upside down, use `--virb-accel-sign plus`.
+
+- **Camera mounting**: The default assumption is that the camera is mounted upright. To determine the correct mounting orientation:
+  1. Check the camera's physical mounting position
+  2. If the camera is mounted upside down, use `--virb-accel-sign plus`
+  3. If the camera is mounted in any other orientation, consult the camera's documentation for the correct accelerometer sign convention
+
+- **Leveling**: The `--level-horizon` option (default: enabled) auto-levels images using the accelerometer data. The leveling may not be perfect, especially for VIRB cameras, due to potential inaccuracies in the accelerometer data and dynamic acceleration.

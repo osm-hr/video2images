@@ -39,7 +39,8 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import (Callable, Dict, Iterable, Iterator, List, Mapping,
+                    Optional, Sequence, Tuple, Union)
 
 SCRIPT_NAME = os.path.basename(os.path.realpath(__file__))
 LOG = logging.getLogger("v2i")
@@ -566,6 +567,14 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
     parser.add_argument("--keywords", default=None, metavar="LIST",
                         help="opt-in keywords to write to Keywords/XMP:Subject, "
                              "semicolon- or comma-separated")
+    parser.add_argument("--level-horizon", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="auto-level images from IMU roll/pitch (default); "
+                             "MAX uses GPano pose, flat frames are rotated, "
+                             "use --no-level-horizon to keep the source tilt")
+    parser.add_argument("--virb-accel-sign", choices=["plus", "minus"], default="minus",
+                        help="VIRB accelerometer sign convention: 'plus' for +body, 'minus' for -body (default). "
+                             "The sign is automatically determined from the camera's internal data.")
     parser.add_argument("--track-export", choices=("both", "gpx", "geojson", "none"),
                         default="both",
                         help="write a GPX/GeoJSON track per sequence (default both)")
@@ -1577,9 +1586,20 @@ def select_expression(frames: Sequence[int]) -> str:
 EXTRACT_CHUNK_SIZE = 60
 
 
+def _flat_level_filter(roll_deg: float) -> str:
+    """Rotate a flat frame clockwise by ``roll_deg`` to level the horizon.
+
+    The canvas is expanded so no corner content is cropped; the new corners
+    are filled with black.
+    """
+    return ("rotate=a=%.6f*PI/180:ow=rotw(iw):oh=roth(ih):"
+            "fillcolor=black" % float(roll_deg))
+
+
 def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
                  *, image_format: str, quality: int, threads: int,
-                 stream_ordinal: int) -> Optional[str]:
+                 stream_ordinal: int, level_roll: Optional[float] = None
+                 ) -> Optional[str]:
     """Extract one frame with an accurate input seek; return its path."""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
            "-ss", "%.6f" % max(0.0, seek_time)]
@@ -1588,6 +1608,8 @@ def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
     cmd += ["-i", video,
             "-map", "0:v:%d" % stream_ordinal,
             "-frames:v", "1"]
+    if level_roll is not None and abs(level_roll) >= 0.05:
+        cmd += ["-vf", _flat_level_filter(level_roll)]
     cmd += ffmpeg_quality_args(image_format, quality)
     cmd.append(pattern)
     try:
@@ -1609,14 +1631,16 @@ def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
 def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
                             image_format: str, quality: int, workers: int = 1,
                             threads: int = 0, stream_ordinal: int = 0,
-                            timeline: Optional[FrameTimeline] = None
+                            timeline: Optional[FrameTimeline] = None,
+                            levels: Optional[Mapping[int, Optional[float]]] = None
                             ) -> Dict[int, str]:
     """Extract exact frames, one accurate seek per frame.
 
     Seeking to the frame's real PTS (``timeline.pts``) keeps variable frame
     rate sources correct; a uniform ``index / fps`` grid is only used when no
     usable timeline is available.  ``workers`` independent ffmpeg processes
-    are run at a time.
+    are run at a time.  ``levels`` maps a frame index to the clockwise roll
+    (degrees) used to level its horizon.
     """
     unique = sorted({int(f) for f in frames if int(f) >= 0})
     if not unique:
@@ -1645,9 +1669,11 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
         order, frame_index = item
         pattern = os.path.join(tmp_dir,
                                "f_%06d_%%06d.%s" % (order, image_format))
+        level_roll = None if levels is None else levels.get(frame_index)
         path = _extract_one(video, frame_index, seek_for(frame_index), pattern,
                             image_format=image_format, quality=quality,
-                            threads=threads, stream_ordinal=stream_ordinal)
+                            threads=threads, stream_ordinal=stream_ordinal,
+                            level_roll=level_roll)
         return frame_index, path
 
     items = list(enumerate(unique))
@@ -1669,7 +1695,9 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
 
 def extract_frames(video: str, jobs: Sequence[dict], tmp_dir: str, *,
                    image_format: str, quality: int, workers: int, fps: float,
-                   threads: int = 0) -> Dict[int, str]:
+                   threads: int = 0,
+                   levels: Optional[Mapping[int, Optional[float]]] = None
+                   ) -> Dict[int, str]:
     """Compatibility wrapper: jobs carry ``index`` and ``frame``/``pts``."""
     frames = []
     mapping: Dict[int, int] = {}
@@ -1683,7 +1711,7 @@ def extract_frames(video: str, jobs: Sequence[dict], tmp_dir: str, *,
         mapping[job["index"]] = int(frame)
     extracted = extract_frames_by_index(
         video, frames, tmp_dir, image_format=image_format, quality=quality,
-        workers=workers, threads=threads)
+        workers=workers, threads=threads, levels=levels)
     out: Dict[int, str] = {}
     for job in jobs:
         frame = mapping.get(job["index"])
@@ -2006,9 +2034,9 @@ _IMU_COMPONENTS = {
     "GYRO": ["x", "y", "z"],
     "MAGN": ["x", "y", "z"],
     "GRAV": ["x", "y", "z"],
-    "CORI": ["x", "y", "z"],
+    "CORI": ["w", "x", "y", "z"],
     "ORIN": ["x", "y", "z"],
-    "IORI": ["x", "y"],
+    "IORI": ["w", "x", "y", "z"],
 }
 
 _IMU_UNITS = {
@@ -2097,6 +2125,14 @@ def _clean_imu_point(point: dict, key: str, video_start_utc=None,
     names = _component_names(key, len(values))
     for name, value in zip(names, values):
         out[name] = value
+    roll = point.get("roll_deg")
+    pitch = point.get("pitch_deg")
+    if roll is None and key == "GRAV":
+        roll, pitch = _gravity_roll_pitch(values)
+    if roll is not None and pitch is not None:
+        out["roll_deg"] = round(float(roll), 3)
+        out["pitch_deg"] = round(float(pitch), 3)
+        out["angle_source"] = key
     if point.get("raw") is not None:
         out["raw"] = list(point["raw"])
     for field_name in ("unit", "source"):
@@ -2227,6 +2263,11 @@ def write_images_telemetry(path: str, *, camera: str, video: str,
             sample["delta_s"] = round(delta, 6)
             snapshot[key] = sample
         entry["imu"] = snapshot
+        gravity = snapshot.get("GRAV") or snapshot.get("ACCL")
+        if gravity and gravity.get("roll_deg") is not None:
+            entry["roll_deg"] = gravity["roll_deg"]
+            entry["pitch_deg"] = gravity["pitch_deg"]
+            entry["angle_source"] = gravity.get("angle_source")
         entries.append(entry)
 
     payload = {
@@ -2630,7 +2671,7 @@ def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]],
     """
     imu: Dict[str, List[dict]] = {}
     wanted = {"MAGN": 3, "ACCL": 3, "GYRO": 3, "GRAV": 3,
-              "CORI": 3, "IORI": 2, "ORIN": 3}
+              "CORI": 4, "IORI": 4, "ORIN": 3}
     for _name, blocks in blocks_by_name.items():
         for key, size in wanted.items():
             present = [block for block in blocks if block.keys.get(key)]
@@ -2676,6 +2717,101 @@ def _nearest_imu(rows: Sequence[dict], stmp_us: Optional[int],
         if abs((best.get("utc") - utc).total_seconds()) <= max_delta_us / 1e6:
             return best
     return None
+
+
+def _roll_pitch_from_body(x: float, y: float, z: float
+                          ) -> Tuple[Optional[float], Optional[float]]:
+    """Roll/pitch from an up vector in a ``(right, back, up)`` body frame.
+
+    Positive roll is a clockwise roll (right side down); positive pitch means
+    the camera is tilted down.  A level camera reads ``(0, 0, 1)``.
+    """
+    if abs(x) < 1e-12 and abs(z) < 1e-12:
+        return None, None
+    return (math.degrees(math.atan2(x, z)),
+            math.degrees(math.atan2(y, z)))
+
+
+def _gravity_roll_pitch(values: Sequence[float]
+                        ) -> Tuple[Optional[float], Optional[float]]:
+    """Derive absolute roll/pitch from a GoPro ``GRAV`` sample.
+
+    GoPro stores GRAV as ``(X, Z, Y)``: +X is right, +Z is up and +Y points
+    backwards, with a level camera reading approximately ``[0, 1, 0]``.
+    Positive roll is a clockwise roll (right side down); positive pitch means
+    the camera is tilted down.  Gravity has no yaw component, so heading still
+    comes from the magnetometer or GPS course.
+    """
+    if len(values) < 3:
+        return None, None
+    return _roll_pitch_from_body(values[0], values[2], values[1])
+
+
+def _fit_sensor_to_body(values: Sequence[float], calibration: dict
+                        ) -> List[float]:
+    """Rotate a FIT sensor sample into device axes with message 167 data.
+
+    ``orientation_matrix`` is row-major and normally scaled by 65535; some
+    files already store unit-length values, so the scale is detected instead
+    of assumed.
+    """
+    matrix = calibration.get("orientation_matrix")
+    if not matrix or len(matrix) < 9:
+        return list(values[:3])
+    scale = 65535.0 if any(abs(float(value)) > 2.0 for value in matrix) else 1.0
+    m = [float(value) / scale for value in matrix]
+    x, y, z = values[:3]
+    return [
+        m[0] * x + m[1] * y + m[2] * z,
+        m[3] * x + m[4] * y + m[5] * z,
+        m[6] * x + m[7] * y + m[8] * z,
+    ]
+
+
+def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
+                  *, max_delta_s: float = 1.0
+                  ) -> Dict[int, Tuple[float, float]]:
+    """Map ``frame_index`` to ``(roll, pitch)`` for horizon leveling.
+
+    ``GRAV`` is preferred because it is absolute; VIRB only has ``ACCL`` and
+    its FIT orientation matrix has already been applied when the stream was
+    parsed.  Missing or stale samples are simply omitted.
+    """
+    if not imu:
+        return {}
+    indexes: Dict[str, Tuple[List[dt.datetime], List[dict]]] = {}
+    for key in ("GRAV", "ACCL"):
+        timed = []
+        for row in imu.get(key) or []:
+            utc = _as_utc(row.get("utc"))
+            if utc is not None:
+                timed.append((utc, row))
+        if timed:
+            timed.sort(key=lambda item: item[0])
+            indexes[key] = ([item[0] for item in timed],
+                            [item[1] for item in timed])
+    angles: Dict[int, Tuple[float, float]] = {}
+    for record in records:
+        target = _as_utc(record.get("datetime_utc"))
+        if target is None:
+            continue
+        for key in ("GRAV", "ACCL"):
+            index = indexes.get(key)
+            if index is None:
+                continue
+            match = _nearest_timed(index[0], index[1], target, max_delta_s)
+            if match is None:
+                continue
+            row, _delta = match
+            roll = row.get("roll_deg")
+            pitch = row.get("pitch_deg")
+            if roll is None and key == "GRAV":
+                roll, pitch = _gravity_roll_pitch(row.get("values") or [])
+            if roll is None or pitch is None:
+                continue
+            angles[int(record["frame_index"])] = (float(roll), float(pitch))
+            break
+    return angles
 
 
 def _tilt_compensated_heading(magnetic: Sequence[float],
@@ -4366,6 +4502,18 @@ def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, 
 # Records
 # ---------------------------------------------------------------------------
 def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
+    pose_roll = 0.0
+    pose_pitch = 0.0
+    if getattr(args, "level_horizon", False):
+        roll = record.get("roll_deg")
+        pitch = record.get("pitch_deg")
+        if roll is not None and pitch is not None:
+            pose_roll = float(roll) % 360.0
+            if pose_roll > 180.0:
+                pose_roll -= 360.0
+            # GPano pitch is positive above the horizon; our pitch is
+            # positive when the camera is tilted down.
+            pose_pitch = max(-90.0, min(90.0, -float(pitch)))
     return FrameMetadata(
         camera=CAMERA_LABELS[CAMERA_MAX], video=record["video"],
         sequence=record["sequence"], frame_index=record["frame_index"],
@@ -4389,6 +4537,7 @@ def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
         clamped=record.get("clamped"), estimated=record.get("estimated"),
         image_width=args.width, image_height=args.height, panorama=True,
         pose_heading=record.get("heading_deg"),
+        pose_pitch=round(pose_pitch, 3), pose_roll=round(pose_roll, 3),
         keywords=parse_keywords(args.keywords),
     )
 
@@ -4491,6 +4640,14 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     records = [max360__record(c, track, args, info, tz_offset, tz_known, sequence,
                        name) for c in choices]
+    if getattr(args, "level_horizon", True):
+        angles = _image_angles(records, gpmf.imu)
+        for record in records:
+            angle = angles.get(record["frame_index"])
+            if angle is not None:
+                record["roll_deg"], record["pitch_deg"] = angle
+        LOG.debug("  horizon: IMU pose for %d/%d image(s)",
+                  len(angles), len(records))
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         args.output, CAMERA_MAX, sequence, first_time,
@@ -4989,12 +5146,24 @@ class virb_Telemetry(object):
             for row in rows:
                 values = [((value - shift) / divisor) * factor
                           for value in row["raw"]]
-                points.append({
+                point = {
                     "fit_s": row["fit_s"],
                     "utc": self.utc_of(row["fit_s"]),
                     "raw": list(row["raw"]),
                     "values": values,
-                })
+                }
+                if key == "ACCL":
+                    # FIT body axes are X right, Y forward, Z up; the shared
+                    # gravity helper expects (right, back, up), so Y flips.
+                    body = _fit_sensor_to_body(values, calibration)
+                    if args.virb_accel_sign == "plus":
+                        roll, pitch = _gravity_roll_pitch((body[0], body[2], -body[1]))
+                    else:
+                        roll, pitch = _gravity_roll_pitch((-body[0], -body[2], body[1]))
+                    if roll is not None and pitch is not None:
+                        point["roll_deg"] = round(roll, 3)
+                        point["pitch_deg"] = round(pitch, 3)
+                points.append(point)
             points.sort(key=lambda point: point["fit_s"])
             self.imu[key] = points
         self.imu_available = bool(self.imu)
@@ -5642,6 +5811,18 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
             choice, track, args, video_start_utc, tz_offset, tz_known,
             CAMERA_VIRB, sequence, name))
 
+    levels = {}
+    if args.level_horizon:
+        angles = _image_angles(
+            records, telemetry.imu if telemetry is not None else None)
+        for record in records:
+            angle = angles.get(record["frame_index"])
+            if angle is not None:
+                record["roll_deg"], record["pitch_deg"] = angle
+                levels[record["frame_index"]] = angle[0]
+        LOG.debug("  horizon: IMU roll for %d/%d image(s)",
+                  len(levels), len(records))
+
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         output_dir, CAMERA_VIRB, sequence, first_time,
@@ -5674,7 +5855,8 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
         extracted = extract_frames_by_index(
             video, [r["frame_index"] for r in to_extract], temp_dir,
             image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline)
+            workers=args.workers, threads=args.threads, timeline=timeline,
+            levels=levels)
         for record in to_extract:
             temp_path = extracted.get(record["frame_index"])
             if not temp_path:
@@ -6010,6 +6192,18 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 
     records = [hero__record(choice, args, info, tz_offset, tz_known, sequence)
                for choice in choices]
+
+    levels = {}
+    if args.level_horizon:
+        angles = _image_angles(records, gpmf.imu if gpmf else None)
+        for record in records:
+            angle = angles.get(record["frame_index"])
+            if angle is not None:
+                record["roll_deg"], record["pitch_deg"] = angle
+                levels[record["frame_index"]] = angle[0]
+        LOG.debug("  horizon: IMU roll for %d/%d image(s)",
+                  len(levels), len(records))
+
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         args.output, CAMERA_HERO, sequence, first_time,
@@ -6051,7 +6245,8 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
         extracted = extract_frames_by_index(
             path, [record["frame_index"] for record in to_extract], temp_dir,
             image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline)
+            workers=args.workers, threads=args.threads, timeline=timeline,
+            levels=levels)
         for record in to_extract:
             temp = extracted.get(record["frame_index"])
             if not temp:
