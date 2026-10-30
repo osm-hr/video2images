@@ -24,6 +24,29 @@ Everything lives in `v2i.py`: camera detection, all four pipelines, GPMF/FIT/NME
 - Filenames: `YYYY-MM-DD_HH-MM-SS-mmm.jpg` or `.png`. Timestamps cross midnight while staying in the same sequence folder
 - A `-2`/`-3` suffix is used **only** when two frames selected in the same run share a millisecond. Re-running skips images that already exist; `--overwrite` rewrites them in place (no new suffixed copies)
 - Each sequence writes `<sequence>.gpx` and `<sequence>.geojson` by default (`--track-export {both,gpx,geojson,none}`, `--save-telemetry` alias)
+- Detailed telemetry is written to `<sequence>.telemetry.json` (every GPS/IMU sample) and `<sequence>.image-telemetry.json` (snapshot per exported image); see [Detailed telemetry](#detailed-telemetry)
+
+## Detailed telemetry
+
+Each sequence writes two JSON files next to the GPX/GeoJSON. They are independent of `--track-export` and controlled by `--telemetry-export {both,points,images,none}` (default `both`):
+
+- `<sequence>.telemetry.json` — every point in the recording: `streams.gps` holds all GPS fixes (lat/lon, altitude, speed, course, DOP, accuracy, UTC and video-relative `t_s`) and every IMU stream the camera provides (all samples, not a summary)
+- `<sequence>.image-telemetry.json` — one entry per exported image: file name, capture time, export identity fields, the matching `gps` snapshot and, for each IMU stream, the nearest sample plus `delta_s`
+
+Both files share a header: `generator`, `camera`, `camera_label`, `video`, `sequence`, `video_start_utc`, `distance_interval_m` and `time_base`. The points file also records the device `calibration` when available.
+
+IMU stream keys are `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` and `ORIN`; components are named `x`/`y`/`z` (`IORI` uses `x`/`y`). Units are:
+
+| Stream | GoPro MAX/HERO | Garmin VIRB Ultra 30 |
+|---|---|---|
+| `ACCL` | `m/s^2` | `g` |
+| `GYRO` | `rad/s` | `deg/s` |
+| `MAGN` | `uT` | `G` |
+| `GRAV` | `g` | — |
+
+Every IMU point carries `utc` and video-relative `t_s` (scaled for MAX TimeWarp), `stmp_us` (GPMF) or `fit_s` (FIT), the converted components and, for VIRB, the raw ADC counts in `raw`. VIRB counts are converted with the FIT message 167 calibration: `(raw - level_shift) / divisor * factor`.
+
+BlackVue has no IMU, so its points file contains only `gps` and its image file has `imu: {}`. GoPro IMU UTC normally comes from the GPS clock; for an unpositioned HERO the IMU clock is anchored to the container creation time, so per-image IMU snapshots are still provided when that timestamp exists (otherwise they are `null`).
 
 ## Quick start
 
@@ -111,7 +134,7 @@ Measured (evidence-based):
 
 ## Common options
 
-The unified CLI accepts: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
+The unified CLI accepts: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--telemetry-export {both,points,images,none}`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
 
 Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (CRITICAL bold red, DEBUG grey). Colours are disabled automatically when stderr is redirected; set `NO_COLOR=1` to force them off or `FORCE_COLOR=1` to force them on.
 
@@ -123,7 +146,7 @@ Standard library only (no pytest needed):
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming, MAX batch command construction, and seek-based frame extraction compared against a `select` decode pass.
+The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
 
 ## Measured sample evidence (for reference)
 
