@@ -572,6 +572,12 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
     parser.add_argument("--save-telemetry", dest="track_export",
                         action="store_const", const="both",
                         help="legacy alias for --track-export both")
+    parser.add_argument("--telemetry-export",
+                        choices=("both", "points", "images", "none"),
+                        default="both",
+                        help="write detailed telemetry JSON next to each "
+                             "sequence: every raw point (points), per-image "
+                             "snapshots (images) or both (default)")
     parser.add_argument("--overwrite", action="store_true",
                         help="overwrite existing images instead of keeping them")
     parser.add_argument("--dry-run", action="store_true",
@@ -1947,8 +1953,15 @@ def write_geojson(path: str, samples: Sequence[dict],
 
 def export_track_files(directory: str, sequence: str, samples: Sequence[dict],
                        images: Sequence[dict], *, track_export: str,
-                       camera: str, video: str) -> List[str]:
-    """Write the requested ``<sequence>.gpx``/``<sequence>.geojson`` files."""
+                       camera: str, video: str,
+                       imu: Optional[Dict[str, List[dict]]] = None,
+                       video_start_utc: Optional[dt.datetime] = None,
+                       telemetry_export: str = "both",
+                       calibration: Optional[Dict[str, dict]] = None,
+                       units: Optional[Dict[str, str]] = None,
+                       time_scale: float = 1.0,
+                       extra: Optional[dict] = None) -> List[str]:
+    """Write the requested track and detailed telemetry files."""
     written: List[str] = []
     if track_export in ("both", "gpx"):
         path = os.path.join(directory, sequence + ".gpx")
@@ -1959,7 +1972,280 @@ def export_track_files(directory: str, sequence: str, samples: Sequence[dict],
         write_geojson(path, samples, images, name=sequence, camera=camera,
                       video=video)
         written.append(path)
+    if telemetry_export in ("both", "points", "images"):
+        os.makedirs(directory, exist_ok=True)
+    if telemetry_export in ("both", "points"):
+        path = os.path.join(directory, sequence + ".telemetry.json")
+        write_points_telemetry(
+            path, camera=camera, video=video, sequence=sequence,
+            gps=samples, imu=imu, video_start_utc=video_start_utc,
+            calibration=calibration, units=units, time_scale=time_scale,
+            extra=extra)
+        written.append(path)
+    if telemetry_export in ("both", "images"):
+        path = os.path.join(directory, sequence + ".image-telemetry.json")
+        write_images_telemetry(
+            path, camera=camera, video=video, sequence=sequence,
+            images=images, imu=imu, video_start_utc=video_start_utc,
+            time_scale=time_scale, extra=extra)
+        written.append(path)
+    if written:
+        LOG.info("  wrote %d export file(s): %s", len(written),
+                 ", ".join(os.path.basename(path) for path in written))
     return written
+
+
+# ---------------------------------------------------------------------------
+# Detailed telemetry JSON writers
+# ---------------------------------------------------------------------------
+# GPX/GeoJSON only keep positions.  These two writers also export the raw
+# telemetry: one file with every sampled point (GPS and IMU) and one with the
+# GPS/IMU snapshot nearest to each exported image.
+_IMU_COMPONENTS = {
+    "ACCL": ["x", "y", "z"],
+    "GYRO": ["x", "y", "z"],
+    "MAGN": ["x", "y", "z"],
+    "GRAV": ["x", "y", "z"],
+    "CORI": ["x", "y", "z"],
+    "ORIN": ["x", "y", "z"],
+    "IORI": ["x", "y"],
+}
+
+_IMU_UNITS = {
+    "ACCL": "m/s^2",
+    "GYRO": "rad/s",
+    "MAGN": "uT",
+    "GRAV": "g",
+}
+
+
+def _json_default(value):
+    """Serialise datetimes and tuples found in telemetry samples."""
+    if isinstance(value, dt.datetime):
+        return fmt_utc(value)
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, dt.timedelta):
+        return value.total_seconds()
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    raise TypeError("cannot serialise %r" % (type(value).__name__,))
+
+
+def _as_utc(value) -> Optional[dt.datetime]:
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
+    if isinstance(value, str):
+        return parse_utc_timestamp(value)
+    return None
+
+
+def _component_names(key: str, count: int) -> List[str]:
+    known = _IMU_COMPONENTS.get(key)
+    if known and len(known) == count:
+        return list(known)
+    if count == 4:
+        return ["w", "x", "y", "z"]
+    if count == 3:
+        return ["x", "y", "z"]
+    if count == 2:
+        return ["x", "y"]
+    return ["v%d" % index for index in range(count)]
+
+
+def _clean_telemetry_point(point: dict, video_start_utc=None,
+                           time_scale: float = 1.0) -> dict:
+    """Drop private keys and make one GPS sample JSON-ready."""
+    out: dict = {}
+    for key, value in point.items():
+        if key.startswith("_") or key in ("point", "naming_time", "path",
+                                          "written"):
+            continue
+        if isinstance(value, dt.datetime):
+            out[key] = fmt_utc(value)
+        else:
+            out[key] = _json_default(value) if isinstance(
+                value, (dt.date, dt.timedelta, tuple, set, bytes)) else value
+    utc = _as_utc(point.get("utc"))
+    if utc is not None:
+        out["utc"] = fmt_utc(utc)
+        origin = _as_utc(video_start_utc)
+        if origin is not None:
+            out["t_s"] = round((utc - origin).total_seconds() * time_scale, 6)
+    return out
+
+
+def _clean_imu_point(point: dict, key: str, video_start_utc=None,
+                     time_scale: float = 1.0) -> dict:
+    """Make one IMU sample JSON-ready, naming x/y/z when possible."""
+    out: dict = {}
+    utc = _as_utc(point.get("utc"))
+    if utc is not None:
+        out["utc"] = fmt_utc(utc)
+        origin = _as_utc(video_start_utc)
+        if origin is not None:
+            out["t_s"] = round((utc - origin).total_seconds() * time_scale, 6)
+    if point.get("stmp_us") is not None:
+        out["stmp_us"] = point["stmp_us"]
+    if point.get("fit_s") is not None:
+        out["fit_s"] = round(float(point["fit_s"]), 6)
+    values = point.get("values") or []
+    names = _component_names(key, len(values))
+    for name, value in zip(names, values):
+        out[name] = value
+    if point.get("raw") is not None:
+        out["raw"] = list(point["raw"])
+    for field_name in ("unit", "source"):
+        if point.get(field_name) is not None:
+            out[field_name] = point[field_name]
+    return out
+
+
+def _imu_stream_entry(key: str, rows: Sequence[dict], video_start_utc=None,
+                      units=None, time_scale: float = 1.0) -> dict:
+    size = 0
+    for row in rows:
+        size = max(size, len(row.get("values") or ()))
+    unit = None
+    if units and units.get(key):
+        unit = units[key]
+    elif key in _IMU_UNITS:
+        unit = _IMU_UNITS[key]
+    return {
+        "unit": unit,
+        "components": _component_names(key, size),
+        "point_count": len(rows),
+        "points": [_clean_imu_point(row, key, video_start_utc, time_scale)
+                   for row in rows],
+    }
+
+
+def write_points_telemetry(path: str, *, camera: str, video: str,
+                           sequence: str, gps: Sequence[dict],
+                           imu: Optional[Dict[str, List[dict]]] = None,
+                           video_start_utc=None,
+                           calibration: Optional[Dict[str, dict]] = None,
+                           units: Optional[Dict[str, str]] = None,
+                           time_scale: float = 1.0,
+                           extra: Optional[dict] = None) -> None:
+    """Write every telemetry point (GPS and IMU) for one sequence."""
+    streams: Dict[str, dict] = {}
+    if gps:
+        streams["gps"] = {
+            "point_count": len(gps),
+            "points": [_clean_telemetry_point(point, video_start_utc,
+                                              time_scale) for point in gps],
+        }
+    for key in sorted(imu or {}):
+        rows = imu[key]
+        if rows:
+            streams[key] = _imu_stream_entry(
+                key, rows, video_start_utc, units, time_scale)
+    payload = {
+        "generator": SCRIPT_NAME,
+        "camera": camera,
+        "camera_label": CAMERA_LABELS.get(camera, camera),
+        "video": video,
+        "sequence": sequence,
+        "video_start_utc": fmt_utc(_as_utc(video_start_utc)),
+        "streams": streams,
+    }
+    if calibration:
+        payload["calibration"] = calibration
+    if extra:
+        payload.update(extra)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=_json_default,
+                  sort_keys=False)
+        fh.write("\n")
+
+
+def _nearest_timed(times: Sequence[dt.datetime], rows: Sequence[dict],
+                   target: Optional[dt.datetime],
+                   max_delta_s: float = 1.0):
+    if target is None or not times:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=dt.timezone.utc)
+    index = bisect.bisect_left(times, target)
+    best = None
+    for candidate in (index - 1, index):
+        if 0 <= candidate < len(times):
+            delta = abs((times[candidate] - target).total_seconds())
+            if best is None or delta < best[0]:
+                best = (delta, candidate)
+    if best is None or best[0] > max_delta_s:
+        return None
+    return rows[best[1]], best[0]
+
+
+def write_images_telemetry(path: str, *, camera: str, video: str,
+                           sequence: str, images: Sequence[dict],
+                           imu: Optional[Dict[str, List[dict]]] = None,
+                           video_start_utc=None, time_scale: float = 1.0,
+                           extra: Optional[dict] = None) -> None:
+    """Write the GPS/IMU snapshot nearest to every exported image."""
+    indexes: Dict[str, Tuple[List[dt.datetime], List[dict]]] = {}
+    for key, rows in (imu or {}).items():
+        timed = []
+        for row in rows:
+            utc = _as_utc(row.get("utc"))
+            if utc is not None:
+                timed.append((utc, row))
+        timed.sort(key=lambda item: item[0])
+        indexes[key] = ([item[0] for item in timed],
+                        [item[1] for item in timed])
+
+    entries = []
+    for record in images:
+        point = record.get("point") or {}
+        target = _as_utc(record.get("datetime_utc"))
+        point_utc = _as_utc(point.get("utc"))
+        if target is None:
+            target = point_utc
+        entry = {key: value for key, value in record.items()
+                 if key not in ("point", "naming_time", "path", "written")}
+        entry = {key: _json_default(value) if isinstance(
+            value, (dt.date, dt.timedelta, tuple, set, bytes)) else value
+            for key, value in entry.items()}
+        entry["gps"] = (_clean_telemetry_point(point, video_start_utc,
+                                               time_scale) if point else None)
+        snapshot: Dict[str, Optional[dict]] = {}
+        for key, (times, rows) in indexes.items():
+            match = _nearest_timed(times, rows, target)
+            if match is None and point_utc is not None and point_utc != target:
+                match = _nearest_timed(times, rows, point_utc)
+            if match is None:
+                snapshot[key] = None
+                continue
+            row, delta = match
+            sample = _clean_imu_point(row, key, video_start_utc, time_scale)
+            sample["delta_s"] = round(delta, 6)
+            snapshot[key] = sample
+        entry["imu"] = snapshot
+        entries.append(entry)
+
+    payload = {
+        "generator": SCRIPT_NAME,
+        "camera": camera,
+        "camera_label": CAMERA_LABELS.get(camera, camera),
+        "video": video,
+        "sequence": sequence,
+        "video_start_utc": fmt_utc(_as_utc(video_start_utc)),
+        "image_count": len(entries),
+        "images": entries,
+    }
+    if extra:
+        payload.update(extra)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=_json_default,
+                  sort_keys=False)
+        fh.write("\n")
+
 
 # =========================================================================
 # GoPro GPMF telemetry reader (MAX 360 and HERO)
@@ -2294,10 +2580,11 @@ def _make_gps_sample(row: Sequence[float], scale: Sequence[float],
     }
 
 
-def _build_gps_samples(blocks: List[_Block]) -> Tuple[List[dict], float]:
+def _build_gps_samples(blocks: List[_Block]
+                       ) -> Tuple[List[dict], float, int]:
     gps_blocks = [b for b in blocks if _gps_rows(b)[0]]
     if not gps_blocks:
-        return [], 0.0
+        return [], 0.0, 0
 
     offsets = []
     for block in gps_blocks:
@@ -2330,11 +2617,11 @@ def _build_gps_samples(blocks: List[_Block]) -> Tuple[List[dict], float]:
                 samples.append(sample)
     samples.sort(key=lambda s: (s["utc"] or dt.datetime.min.replace(
         tzinfo=dt.timezone.utc), s["stmp_us"] or 0))
-    return samples, spread
+    return samples, spread, median_offset
 
 
-def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]]
-                       ) -> Dict[str, List[dict]]:
+def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]],
+                       median_offset: int = 0) -> Dict[str, List[dict]]:
     """Decode IMU-ish streams into ``{KEY: [{stmp_us, utc, values}]}``.
 
     GoPro's ``STNM`` is a human-readable description ("Magnetometer"), while
@@ -2360,9 +2647,14 @@ def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]]
                     vals = scaled(row, scale) if scale else list(row)
                     stmp = (int(block.stmp_us + i * period)
                             if block.stmp_us is not None else None)
-                    utc = block.utc
-                    if utc is not None and i:
-                        utc = utc + dt.timedelta(microseconds=i * period)
+                    utc = None
+                    if stmp is not None and median_offset:
+                        utc = dt.datetime.fromtimestamp(
+                            (stmp + median_offset) / 1e6, dt.timezone.utc)
+                    elif block.utc is not None:
+                        utc = block.utc
+                        if i:
+                            utc = utc + dt.timedelta(microseconds=i * period)
                     rows_out.append({"stmp_us": stmp, "utc": utc,
                                      "values": list(vals)})
     return imu
@@ -2440,6 +2732,27 @@ class GpmfData:
     imu: Dict[str, List[dict]]
     has_gps: bool
     clock_spread_s: float = 0.0
+    origin_utc: Optional[dt.datetime] = None
+    time_scale: float = 1.0
+
+
+def _anchor_imu_utc(imu: Dict[str, List[dict]],
+                    origin: Optional[dt.datetime]) -> None:
+    """Give IMU rows a UTC clock when the file has no GPS time reference.
+
+    GoPro ``STMP`` is microseconds since the start of the recording, so the
+    container creation time anchors the IMU samples to wall clock even for
+    unpositioned HERO clips.  Rows that already have a UTC value are kept.
+    """
+    if origin is None:
+        return
+    if origin.tzinfo is None:
+        origin = origin.replace(tzinfo=dt.timezone.utc)
+    for rows in imu.values():
+        for row in rows:
+            if row.get("utc") is None and row.get("stmp_us") is not None:
+                row["utc"] = origin + dt.timedelta(
+                    microseconds=int(row["stmp_us"]))
 
 
 def parse_gpmf(buf: bytes, *, imu_heading: bool = False) -> GpmfData:
@@ -2470,8 +2783,8 @@ def parse_gpmf(buf: bytes, *, imu_heading: bool = False) -> GpmfData:
                             "supported")
 
     all_blocks = [block for items in blocks.values() for block in items]
-    gps_samples, spread = _build_gps_samples(all_blocks)
-    imu = _build_imu_streams(blocks)
+    gps_samples, spread, median_offset = _build_gps_samples(all_blocks)
+    imu = _build_imu_streams(blocks, median_offset)
     if imu_heading:
         _attach_compass(gps_samples, imu)
     return GpmfData(device_name=device_name, streams=streams,
@@ -3483,7 +3796,11 @@ def blackvue_process_video(video, sequence, output_dir, args, have_exiftool):
     export_samples = track.samples if track is not None else []
     export_track_files(
         sequence_dir, sequence, export_samples, records,
-        track_export=args.track_export, camera=CAMERA_BLACKVUE, video=name)
+        track_export=args.track_export, camera=CAMERA_BLACKVUE, video=name,
+        video_start_utc=video_start_utc,
+        telemetry_export=args.telemetry_export,
+        extra={"distance_interval_m": args.distance,
+               "time_base": args.time_base})
 
     if args.sidecars:
         os.makedirs(sequence_dir, exist_ok=True)
@@ -3967,7 +4284,7 @@ def max360__smooth(values: Sequence[float], window: int) -> List[float]:
     return out
 
 
-def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, list]:
+def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, GpmfData]:
     if info.gpmd is None:
         raise max360_BackendError("no GPMF (gpmd) telemetry track in file")
     payload = extract_gpmf(path, info.gpmd, ffmpeg=FFMPEG)
@@ -4040,7 +4357,9 @@ def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, 
     LOG.info("  telemetry: %d GPS sample(s), %.1f m of travel, "
              "clock spread %.0f ms", len(samples), track.length,
              data.clock_spread_s * 1000)
-    return track, data.gps_samples
+    data.origin_utc = origin
+    data.time_scale = scale
+    return track, data
 
 
 # ---------------------------------------------------------------------------
@@ -4153,7 +4472,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     LOG.info("  frame timeline: %d frame(s), source=%s",
              len(timeline), timeline.source)
 
-    track, _gps = max360_build_track(path, info, args)
+    track, gpmf = max360_build_track(path, info, args)
     detected_offset = None       # GoPro MAX stores UTC, not local wall clock
     tz_offset, tz_known = resolve_timezone(
         args, detected_offset, camera=CAMERA_MAX, logger=LOG)
@@ -4241,7 +4560,12 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     export_track_files(
         sequence_dir, sequence, track.samples, records,
-        track_export=args.track_export, camera=CAMERA_MAX, video=name)
+        track_export=args.track_export, camera=CAMERA_MAX, video=name,
+        imu=gpmf.imu, video_start_utc=gpmf.origin_utc,
+        telemetry_export=args.telemetry_export,
+        time_scale=gpmf.time_scale,
+        extra={"distance_interval_m": args.distance,
+               "time_base": args.time_base})
     result["entries"] = [{k: v for k, v in record.items()
                           if k not in ("point", "naming_time")}
                          for record in written]
@@ -4307,7 +4631,16 @@ virb_MSG_GPS_METADATA = 160
 virb_MSG_CAMERA_EVENT = 161
 virb_MSG_GYROSCOPE = 164
 virb_MSG_ACCELEROMETER = 165
+virb_MSG_SENSOR_CALIBRATION = 167
 virb_MSG_MAGNETOMETER = 208
+
+virb_IMU_MESSAGES = {
+    virb_MSG_GYROSCOPE: "GYRO",
+    virb_MSG_ACCELEROMETER: "ACCL",
+    virb_MSG_MAGNETOMETER: "MAGN",
+}
+virb_SENSOR_TYPES = {0: "ACCL", 1: "GYRO", 2: "MAGN"}
+virb_IMU_UNITS = {"ACCL": "g", "GYRO": "deg/s", "MAGN": "G"}
 
 virb_CAMERA_EVENT_TYPES = {
     0: "video_start", 1: "video_split", 2: "video_end", 3: "photo_taken",
@@ -4487,6 +4820,9 @@ class virb_Telemetry(object):
         self.utc_offset_s = None   # device time -> UTC correction
         self.track_distance = None
         self.imu_available = False
+        self.imu = {}              # {ACCL/GYRO/MAGN: [sample dicts]}
+        self.sensor_calibration = {}
+        self._raw_imu = {}
         self._load()
 
     def _load(self):
@@ -4500,6 +4836,8 @@ class virb_Telemetry(object):
                 self._add_device(msg.fields)
             elif num == virb_MSG_FILE_ID:
                 self._add_file_id(msg.fields)
+            elif num == virb_MSG_SENSOR_CALIBRATION:
+                self._add_sensor_calibration(msg.fields)
             elif num == virb_MSG_RECORD:
                 fit_s = virb__num(msg.get(253))
                 distance = msg.get(5)
@@ -4507,8 +4845,8 @@ class virb_Telemetry(object):
                     continue
                 self.records.append({"t": fit_s, "distance": distance / 100.0})
                 self.track_distance = distance / 100.0
-            elif num in (virb_MSG_ACCELEROMETER, virb_MSG_GYROSCOPE, virb_MSG_MAGNETOMETER):
-                self.imu_available = True
+            elif num in virb_IMU_MESSAGES:
+                self._add_imu(num, msg.fields)
 
         self.samples.sort(key=lambda s: s["t"])
         self._dedupe()
@@ -4517,6 +4855,7 @@ class virb_Telemetry(object):
             if sample["utc_fit"] is not None:
                 self.utc_offset_s = sample["utc_fit"] - sample["fit_s"]
                 break
+        self._finalize_imu()
 
     def _add_gps(self, fields):
         fit_s = virb__num(fields.get(253))
@@ -4590,6 +4929,75 @@ class virb_Telemetry(object):
         created = virb__num(fields.get(4))
         if created is not None:
             self.time_created_utc = virb_FIT_EPOCH + dt.timedelta(seconds=created)
+
+    def _add_sensor_calibration(self, fields):
+        """Remember the calibration that converts raw IMU counts to units."""
+        key = virb_SENSOR_TYPES.get(virb__num(fields.get(0)))
+        if key is None:
+            return
+        calibration = {
+            "factor": virb__num(fields.get(1)),
+            "divisor": virb__num(fields.get(2)),
+            "level_shift": virb__num(fields.get(3)),
+            "unit": virb_IMU_UNITS.get(key),
+        }
+        offset = fields.get(4)
+        matrix = fields.get(5)
+        if isinstance(offset, (tuple, list)):
+            calibration["offset_cal"] = list(offset)
+        if isinstance(matrix, (tuple, list)):
+            calibration["orientation_matrix"] = list(matrix)
+        self.sensor_calibration[key] = calibration
+
+    def _add_imu(self, num, fields):
+        """Collect one IMU message (up to 30 samples) as raw ADC counts."""
+        key = virb_IMU_MESSAGES.get(num)
+        if key is None:
+            return
+        timestamp = virb__num(fields.get(253))
+        if timestamp is None:
+            return
+        millis = virb__num(fields.get(0), 0) or 0
+        offsets = fields.get(1)
+        if not isinstance(offsets, (tuple, list)):
+            offsets = ()
+        axes = [fields.get(2), fields.get(3), fields.get(4)]
+        if any(not isinstance(axis, (tuple, list)) for axis in axes):
+            return
+        count = min(len(axes[0]), len(axes[1]), len(axes[2]))
+        rows = self._raw_imu.setdefault(key, [])
+        for index in range(count):
+            offset = offsets[index] if index < len(offsets) else 0
+            fit_s = timestamp + (millis + (offset or 0)) / 1000.0
+            rows.append({"fit_s": fit_s,
+                         "raw": [axes[0][index], axes[1][index],
+                                 axes[2][index]]})
+
+    def _finalize_imu(self):
+        """Apply the FIT 3D-sensor calibration to the collected raw counts."""
+        raw = self._raw_imu
+        self._raw_imu = {}
+        for key, rows in raw.items():
+            calibration = self.sensor_calibration.get(key, {})
+            factor = calibration.get("factor")
+            divisor = calibration.get("divisor")
+            shift = calibration.get("level_shift")
+            factor = 1.0 if factor is None else float(factor)
+            divisor = 1.0 if not divisor else float(divisor)
+            shift = 0.0 if shift is None else float(shift)
+            points = []
+            for row in rows:
+                values = [((value - shift) / divisor) * factor
+                          for value in row["raw"]]
+                points.append({
+                    "fit_s": row["fit_s"],
+                    "utc": self.utc_of(row["fit_s"]),
+                    "raw": list(row["raw"]),
+                    "values": values,
+                })
+            points.sort(key=lambda point: point["fit_s"])
+            self.imu[key] = points
+        self.imu_available = bool(self.imu)
 
     def _dedupe(self):
         out = []
@@ -5299,9 +5707,26 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
         write_metadata(pairs)
 
     export_samples = (track.samples if track is not None else [])
+    export_imu = telemetry.imu if telemetry is not None else None
+    if export_imu and video_start_utc is not None and duration:
+        window_start = video_start_utc - dt.timedelta(seconds=1.0)
+        window_end = video_start_utc + dt.timedelta(seconds=duration + 1.0)
+
+        def in_window(row):
+            utc = row.get("utc")
+            return utc is None or window_start <= utc <= window_end
+
+        export_imu = {key: [row for row in rows if in_window(row)]
+                      for key, rows in export_imu.items()}
     export_track_files(
         sequence_dir, sequence, export_samples, records,
-        track_export=args.track_export, camera=CAMERA_VIRB, video=name)
+        track_export=args.track_export, camera=CAMERA_VIRB, video=name,
+        imu=export_imu, video_start_utc=video_start_utc,
+        telemetry_export=args.telemetry_export,
+        calibration=(telemetry.sensor_calibration if telemetry else None),
+        units=virb_IMU_UNITS,
+        extra={"distance_interval_m": args.distance,
+               "time_base": args.time_base})
 
     if args.sidecars:
         os.makedirs(sequence_dir, exist_ok=True)
@@ -5395,6 +5820,8 @@ def hero_build_track(info: hero_VideoInfo, args):
     LOG.info("  GPMF device: %s; streams: %s", data.device_name,
              ", ".join(sorted(data.streams)) or "none")
     if not data.has_gps:
+        data.origin_utc = info.creation_time
+        _anchor_imu_utc(data.imu, data.origin_utc)
         return None, data
 
     origin = info.creation_time
@@ -5421,6 +5848,8 @@ def hero_build_track(info: hero_VideoInfo, args):
     track = Track(samples, args.distance_mode)
     LOG.info("  telemetry: %d GPS sample(s), %.1f m of travel",
              len(samples), track.length)
+    data.origin_utc = origin
+    data.time_scale = 1.0
     return track, data
 
 
@@ -5654,7 +6083,12 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 
     export_track_files(
         sequence_dir, sequence, track.samples if track else [], records,
-        track_export=args.track_export, camera=CAMERA_HERO, video=name)
+        track_export=args.track_export, camera=CAMERA_HERO, video=name,
+        imu=gpmf.imu if gpmf else None,
+        video_start_utc=gpmf.origin_utc if gpmf else None,
+        telemetry_export=args.telemetry_export,
+        extra={"distance_interval_m": args.distance,
+               "time_base": args.time_base})
     result["entries"] = [{k: v for k, v in record.items()
                           if k not in ("point", "naming_time")}
                          for record in written]
