@@ -572,9 +572,6 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                         help="auto-level images from IMU roll/pitch (default); "
                              "MAX uses GPano pose, flat frames are rotated, "
                              "use --no-level-horizon to keep the source tilt")
-    parser.add_argument("--virb-accel-sign", choices=["plus", "minus"], default="minus",
-                        help="VIRB accelerometer sign convention: 'plus' for +body, 'minus' for -body (default). "
-                             "The sign is automatically determined from the camera's internal data.")
     parser.add_argument("--track-export", choices=("both", "gpx", "geojson", "none"),
                         default="both",
                         help="write a GPX/GeoJSON track per sequence (default both)")
@@ -1591,9 +1588,15 @@ def _flat_level_filter(roll_deg: float) -> str:
 
     The canvas is expanded so no corner content is cropped; the new corners
     are filled with black.
+
+    ``rotw``/``roth`` take the *angle* as their argument.  Passing ``iw`` or
+    ``ih`` there (as an earlier version did) silently treats the pixel size as
+    radians and produces a wildly oversized canvas, so the angle expression is
+    repeated in all three places.
     """
-    return ("rotate=a=%.6f*PI/180:ow=rotw(iw):oh=roth(ih):"
-            "fillcolor=black" % float(roll_deg))
+    angle = "%.6f*PI/180" % float(roll_deg)
+    return ("rotate=a=%s:ow=rotw(%s):oh=roth(%s):"
+            "fillcolor=black" % (angle, angle, angle))
 
 
 def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
@@ -2766,6 +2769,22 @@ def _fit_sensor_to_body(values: Sequence[float], calibration: dict
         m[3] * x + m[4] * y + m[5] * z,
         m[6] * x + m[7] * y + m[8] * z,
     ]
+
+
+def _virb_image_up(body: Sequence[float], orientation_deg: Optional[float]
+                   ) -> List[float]:
+    """Rotate a device-frame up vector into the stored video's image frame.
+
+    Garmin cameras rotate the sensor image by the FIT camera orientation so
+    the recorded video is upright.  Applying the same rotation to the
+    accelerometer's up vector makes roll/pitch relative to the exported image.
+    """
+    x, y, z = body[:3]
+    if not orientation_deg:
+        return [x, y, z]
+    theta = math.radians(float(orientation_deg))
+    c, s = math.cos(theta), math.sin(theta)
+    return [x * c + z * s, y, -x * s + z * c]
 
 
 def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
@@ -5142,10 +5161,29 @@ class virb_Telemetry(object):
             factor = 1.0 if factor is None else float(factor)
             divisor = 1.0 if not divisor else float(divisor)
             shift = 0.0 if shift is None else float(shift)
-            points = []
+            converted = []
             for row in rows:
                 values = [((value - shift) / divisor) * factor
                           for value in row["raw"]]
+                converted.append((row, values))
+
+            # The accelerometer's up/down sign is a device property, not a
+            # user setting.  The camera's own orientation events tell us how
+            # the stored image is rotated, so choose the sign that puts the
+            # image-frame up vector above the horizon for most samples.
+            sign = 1.0
+            if key == "ACCL":
+                score = 0.0
+                for row, values in converted:
+                    body = _fit_sensor_to_body(values, calibration)
+                    up = _virb_image_up(
+                        body, self.orientation_at(row["fit_s"]))
+                    score += up[2]
+                if score < 0:
+                    sign = -1.0
+
+            points = []
+            for row, values in converted:
                 point = {
                     "fit_s": row["fit_s"],
                     "utc": self.utc_of(row["fit_s"]),
@@ -5153,13 +5191,14 @@ class virb_Telemetry(object):
                     "values": values,
                 }
                 if key == "ACCL":
-                    # FIT body axes are X right, Y forward, Z up; the shared
-                    # gravity helper expects (right, back, up), so Y flips.
                     body = _fit_sensor_to_body(values, calibration)
-                    if args.virb_accel_sign == "plus":
-                        roll, pitch = _gravity_roll_pitch((body[0], body[2], -body[1]))
-                    else:
-                        roll, pitch = _gravity_roll_pitch((-body[0], -body[2], body[1]))
+                    up = _virb_image_up(
+                        [sign * component for component in body],
+                        self.orientation_at(row["fit_s"]))
+                    # FIT body Y points forward; the shared helper expects
+                    # (right, back, up), so the Y component flips.
+                    roll, pitch = _roll_pitch_from_body(
+                        up[0], -up[1], up[2])
                     if roll is not None and pitch is not None:
                         point["roll_deg"] = round(roll, 3)
                         point["pitch_deg"] = round(pitch, 3)
@@ -5217,10 +5256,24 @@ class virb_Telemetry(object):
         return None
 
     def camera_orientation(self):
-        for _t, _name, orient in sorted(self.camera_events):
+        for _t, _name, orient in sorted(getattr(self, "camera_events", ())):
             if orient is not None:
                 return orient
         return None
+
+    def orientation_at(self, fit_seconds):
+        """Camera orientation (degrees) of the segment covering *fit_seconds*.
+
+        The orientation is recorded on the video-start events; the latest one
+        at or before the sample applies.  Falls back to the first known value.
+        """
+        current = self.camera_orientation()
+        for when, name, orient in sorted(getattr(self, "camera_events", ())):
+            if orient is None or when > fit_seconds:
+                continue
+            if name in virb_VIDEO_START_EVENTS or name == "video_second_stream_start":
+                current = orient
+        return current
 
     def segments(self):
         """Video segments recorded inside this FIT as {start, end} FIT seconds."""

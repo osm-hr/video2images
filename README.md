@@ -26,16 +26,34 @@ Everything lives in `v2i.py`: camera detection, all four pipelines, GPMF/FIT/NME
 - Each sequence writes `<sequence>.gpx` and `<sequence>.geojson` by default (`--track-export {both,gpx,geojson,none}`, `--save-telemetry` alias)
 - Detailed telemetry is written to `<sequence>.telemetry.json` (every GPS/IMU sample) and `<sequence>.image-telemetry.json` (snapshot per exported image); see [Detailed telemetry](#detailed-telemetry)
 
+## Horizon leveling
+
+Images are **auto-leveled by default** from the camera's own orientation data; use `--no-level-horizon` to keep the source tilt. Leveling never asks for the mounting angle.
+
+| Camera | Leveling method |
+|---|---|
+| GoPro MAX 360 | `GPano:PoseRollDegrees` / `GPano:PosePitchDegrees` are filled from the per-image `GRAV` sample. The equirectangular pixels are **not** resampled; compliant panorama viewers level the sphere from the pose |
+| GoPro HERO | Flat frames are rotated clockwise by `roll_deg` with an expanded canvas (`rotate=...:ow=rotw(iw):oh=roth(ih)`) |
+| Garmin VIRB Ultra 30 | `ACCL` is converted with the FIT message 167 calibration and orientation matrix, then rotated into the stored video's image frame using the camera's own orientation events. Flat frames are rotated like HERO |
+| BlackVue DR900 | No IMU, so images stay unrotated; telemetry still exports GPS |
+
+Details:
+
+- Positive roll is a **clockwise / right-side-down** tilt; positive pitch means the camera is tilted **down**. MAX pose pitch is negated (`GPano` pitch is positive above the horizon).
+- Roll/pitch come from `GRAV` when present (`angle_source: "GRAV"`), otherwise from VIRB `ACCL` (`angle_source: "ACCL"`). Every image entry in the telemetry JSON repeats the value.
+- VIRB's accelerometer up/down sign is **derived from the camera data**: the FIT camera-orientation events (0/90/180/270) are applied to the accelerometer vector, and the sign that puts the image-frame up vector above the horizon is chosen automatically. No `--virb-accel-sign` input is required.
+- Rotations below `0.05°` are skipped so level footage is not resampled.
+- Rotation happens during extraction. Existing images are skipped on re-runs, so use `--overwrite` after changing leveling options to re-level them.
+- Pixel rotation expands the canvas and fills the new corners with black; it does not correct lens distortion or pitch keystone.
+
 ## Detailed telemetry
 
 Each sequence writes two JSON files next to the GPX/GeoJSON. They are independent of `--track-export` and controlled by `--telemetry-export {both,points,images,none}` (default `both`):
 
-- `<sequence>.telemetry.json` — every point in the recording: `streams.gps` holds all GPS fixes (lat/lon, altitude, speed, course, DOP, accuracy, UTC and video-relative `t_s`) and every IMU stream the camera provides (all samples, not a summary)
-- `<sequence>.image-telemetry.json` — one entry per exported image: file name, capture time, export identity fields, the matching `gps` snapshot and, for each IMU stream, the nearest sample plus `delta_s`
-
-Both files share a header: `generator`, `camera`, `camera_label`, `video`, `sequence`, `video_start_utc`, `distance_interval_m` and `time_base`. The points file also records the device `calibration` when available.
-
-IMU stream keys are `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` and `ORIN`; components are named `x`/`y`/`z` (`IORI` uses `x`/`y`). Units are:
+- `<sequence>.telemetry.json` — every GPS and IMU stream. Each stream has `components`, `unit`, `point_count` and `points`
+- `<sequence>.image-telemetry.json` — one entry per exported image with the nearest `gps` and `imu` snapshots
+- Both include `_meta`/header fields such as camera, video, sequence and `video_start_utc`
+- `--telemetry-export points|images|none` selects which file(s) are written; telemetry is written even with `--track-export none`
 
 | Stream | GoPro MAX/HERO | Garmin VIRB Ultra 30 |
 |---|---|---|
@@ -44,7 +62,9 @@ IMU stream keys are `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` and `ORIN`; c
 | `MAGN` | `uT` | `G` |
 | `GRAV` | `g` | — |
 
-Every IMU point carries `utc` and video-relative `t_s` (scaled for MAX TimeWarp), `stmp_us` (GPMF) or `fit_s` (FIT), the converted components and, for VIRB, the raw ADC counts in `raw`. VIRB counts are converted with the FIT message 167 calibration: `(raw - level_shift) / divisor * factor`.
+`GRAV` is the absolute gravity/up vector, so every GRAV point also carries `roll_deg` and `pitch_deg`, and each image entry repeats them at the image position with `angle_source: "GRAV"`. VIRB `ACCL` points carry the same angles after calibration/orientation, with `angle_source: "ACCL"`. Roll is the horizon tilt (positive = clockwise/right side down); pitch is the camera tilt (positive = down). Yaw is not part of gravity: use the image `heading_deg`/`course_deg`, or the `CORI` quaternion when a relative rotation is enough.
+
+Every IMU point carries `utc` and video-relative `t_s` (scaled for MAX TimeWarp), `stmp_us` (GPMF) or `fit_s` (FIT), the converted components and, for VIRB, the raw ADC counts in `raw`. VIRB counts are converted with the FIT message 167 calibration: `(raw - level_shift) / divisor * factor`, with the orientation matrix applied on top.
 
 BlackVue has no IMU, so its points file contains only `gps` and its image file has `imu: {}`. GoPro IMU UTC normally comes from the GPS clock; for an unpositioned HERO the IMU clock is anchored to the container creation time, so per-image IMU snapshots are still provided when that timestamp exists (otherwise they are `null`).
 
@@ -67,6 +87,9 @@ python3 v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-dis
 python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
 # HERO with no GPS, unpositioned time-lapse:
 python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
+
+# Keep the source tilt instead of auto-leveling
+python3 v2i.py -i video/ -o images/ -d 7 --no-level-horizon
 ```
 
 ## Detection
@@ -75,8 +98,8 @@ Cameras are identified from container handlers, GPMF `DVNM`, stream layout and f
 
 Every candidate file is reported during detection:
 
-- `[INFO] camera <camera label>: <file>` for every recognised video (evidence is shown with `-v`/`--log-level DEBUG`),
-- `[WARNING] skipping <file>: <reason>` for unsupported, ambiguous or unreadable files,
+- accepted cameras are logged at `INFO`
+- skipped files are logged at `WARNING` with the reason
 - `[INFO] camera detection summary: BlackVue DR900=N, GoPro MAX 360=N, Garmin VIRB Ultra 30=N, GoPro HERO=N` once per run, counting **all** camera types found under `--input` (an `unsupported=N` entry is added when unknown files are present).
 
 So a single `-i video/` run shows the camera mix of the whole input tree and processes every recognised camera in one pass.
@@ -105,8 +128,9 @@ Measured (evidence-based):
 - All GPS date/time tags are **UTC**
 - Track `*.gpx` is valid GPX 1.1 (UTC `<time>`, namespaced extensions); `*.geojson` RFC 7946 (`LineString` + image `Point` features; `Point` if single-sample track)
 - Midnight crossing keeps images in the same sequence folder with date-based filenames
+- VIRB capture time is `video_start_utc + pts`, including real milliseconds; the telemetry window is `video_start_fit` → `+duration`
 
-## Headings, accuracy, DOP
+## Heading & direction
 
 - Heading source precedence (in `resolve_heading`): `compass_heading` (IMU/MAGN+GRAV) > `metadata_heading` > `course`/`heading` > `gps_course` (computed by `Track` from positions). `heading_source` recorded. `compass_heading` = camera/device pointing direction (tilt-compensated when available); `course`/`heading`/`gps_course` = Course Over Ground (direction of travel). Use `--heading-offset` for mounting angle, `--magnetic-declination` for compass. Per camera: HERO/MAX use GPMF GPS + optional `--imu-heading` compass from MAGN+GRAV; VIRB reads `course/heading` from FIT (usually travel direction) with `camera_orientation_deg` stored separately (not used for `img_direction`); BlackVue uses NMEA RMC/VTG course or Track-computed GPS course.
 - `--heading-offset` (`--offset` alias), `--magnetic-declination` applied to true north. Heading offsets are recalculated to unsigned `000`-`360` degrees (`-90` → `270`, `450` → `090`) and, when explicitly supplied, appended to the camera folder name
@@ -118,6 +142,7 @@ Measured (evidence-based):
 - No hard-coded `Keywords`/`XMP:Subject`; `--keywords "a;b;c"` is **opt-in**
 - Provenance is written to `ImageDescription`/`UserComment`/`XMP:Description`, not keywords
 - **GPano/XMP-GPano** written **only for panoramic (MAX) images** with the full tag set; flat HERO/VIRB/BlackVue have no GPano tags
+- MAX `PoseRollDegrees`/`PosePitchDegrees` are filled when leveling is enabled; both stay `0` with `--no-level-horizon`
 
 ## GoPro specifics
 
@@ -126,27 +151,29 @@ Measured (evidence-based):
 - Backends: `--stitch-backend {auto,ffmpeg,max2sphere}` (default `auto`, ffmpeg preferred). `max2sphere` used only if requested/available
 - Options: `--width/--height` (default 5376×2688), `--interp {cubic,linear,nearest,lanczos}`, `--keep-filter`, `--imu-heading`, TimeWarp handled by scaling GPS span to video span
 - GPMF GPSP raw values used for DOP
+- Orientation: `GRAV` gives absolute roll/pitch; `CORI`/`IORI` are 4-component (`w,x,y,z`) rotation quaternions
 
 ### HERO (flat)
 - Options: `--gpmf-stream INDEX`, `--device-model`, `--allow-missing-gps`, `--imu-heading`, `--fallback-interval`
 - **No GPS telemetry → skipped unless both `--allow-missing-gps` and `--fallback-interval` are provided**; fallback exports an **unpositioned** time-lapse with no GPS tags and `position_source=unpositioned`
 - Supports GPMF GPS5/GPS9/GPSF/GPSP/GPSU/STMP and IMU/MAGN streams via the built-in GPMF reader
+- Flat frames are rotated from `GRAV` roll when leveling is enabled
 
 ## Common options
 
-The unified CLI accepts: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--telemetry-export {both,points,images,none}`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
+The unified CLI accepts: `-i/--input`, `-o/--output`, `-r/--recursive`, `--no-recursive`, `-d/--distance`, `--start-distance`, `--max-position-error`, `--max-images`, `--extensions`, `--heading-offset`/`--offset`, `--magnetic-declination`, `--uere`, `--timezone`/`--tz`, `--time-base {local,utc}`, `--format {jpg,png}`, `--quality 1-100`, `--keywords`, `--level-horizon`/`--no-level-horizon`, `--track-export {both,gpx,geojson,none}`, `--save-telemetry`, `--telemetry-export {both,points,images,none}`, `--overwrite`, `--dry-run`, `--fail-fast`, `--manifest`, `--workers`/`--jobs`, `--threads`, `--no-exif`, `-v/-q`, `--log-level`, `--version`. Track/GPS helpers from `add_gps_filter_arguments`/`add_track_export_arguments`.
 
 Log lines are colourised on a terminal: INFO green, WARNING yellow, ERROR red (CRITICAL bold red, DEBUG grey). Colours are disabled automatically when stderr is redirected; set `NO_COLOR=1` to force them off or `FORCE_COLOR=1` to force them on.
 
 ## Tests
 
-Standard library only (no pytest needed):
+Run the standard-library suite from the repository root:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
+The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, horizon leveling (CLI default, flat rotation filter, MAX pose values, VIRB orientation/sign handling) and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
 
 ## Measured sample evidence (for reference)
 
@@ -157,16 +184,3 @@ The suite covers unified camera detection/grouping, coloured logging, filename m
 | `video/2026-10-05-virb-1080-24fps/VIRB0996.MP4` + `GMetrix/2026-10-05-07-53-07.fit` | 9108 GPS, IMU; camera events align segment, offset +02:00 |
 | `video/2026-10-18-virb-090-4k-30fps/VIRB0782.MP4` / `video/2026-10-18-virb-270-4k-24fps/VIRB0008.MP4` | VIRB Ultra 30; filenames carry real capture milliseconds (e.g. `2026-10-18_16-18-37-111.jpg`) |
 | BlackVue samples | NMEA in `free` atoms, GGA/RMC/VTG/GSA parsed, clock reconciliation to GPS, course from RMC/VTG |
-
-
-
-## VIRB Ultra 30 specifics
-
-- **Accelerometer sign convention**: By default, the accelerometer data is interpreted with a negative sign (`--virb-accel-sign minus`). This assumes the camera is mounted upright. If the camera is mounted upside down, use `--virb-accel-sign plus`.
-
-- **Camera mounting**: The default assumption is that the camera is mounted upright. To determine the correct mounting orientation:
-  1. Check the camera's physical mounting position
-  2. If the camera is mounted upside down, use `--virb-accel-sign plus`
-  3. If the camera is mounted in any other orientation, consult the camera's documentation for the correct accelerometer sign convention
-
-- **Leveling**: The `--level-horizon` option (default: enabled) auto-levels images using the accelerometer data. The leveling may not be perfect, especially for VIRB cameras, due to potential inaccuracies in the accelerometer data and dynamic acceleration.
