@@ -28,22 +28,23 @@ Everything lives in `v2i.py`: camera detection, all four pipelines, GPMF/FIT/NME
 
 ## Horizon leveling
 
-Images are **auto-leveled by default** from the camera's own orientation data; use `--no-level-horizon` to keep the source tilt. Leveling never asks for the mounting angle.
+Images are leveled **only when `--level-horizon` is passed**; without it the source tilt is kept. Leveling never asks for the mounting angle.
 
 | Camera | Leveling method |
 |---|---|
-| GoPro MAX 360 | `GPano:PoseRollDegrees` / `GPano:PosePitchDegrees` are filled from the per-image `GRAV` sample. The equirectangular pixels are **not** resampled; compliant panorama viewers level the sphere from the pose |
+| GoPro MAX 360 | The equirectangular sphere is **rotated on the pixels** with ffmpeg `v360` from the per-image `GRAV` roll/pitch, correcting only pitch and roll (yaw/heading is left untouched). `GPano:PoseRollDegrees` / `GPano:PosePitchDegrees` are written as `0` so viewers do not apply the tilt twice; the original angles remain in the telemetry |
 | GoPro HERO | Flat frames are rotated clockwise by `roll_deg` with an expanded canvas (`rotate=...:ow=rotw(iw):oh=roth(ih)`) |
 | Garmin VIRB Ultra 30 | `ACCL` is converted with the FIT message 167 calibration and orientation matrix, then rotated into the stored video's image frame using the camera's own orientation events. Flat frames are rotated like HERO |
 | BlackVue DR900 | No IMU, so images stay unrotated; telemetry still exports GPS |
 
 Details:
 
-- Positive roll is a **clockwise / right-side-down** tilt; positive pitch means the camera is tilted **down**. MAX pose pitch is negated (`GPano` pitch is positive above the horizon).
-- Roll/pitch come from `GRAV` when present (`angle_source: "GRAV"`), otherwise from VIRB `ACCL` (`angle_source: "ACCL"`). Every image entry in the telemetry JSON repeats the value.
+- Positive roll is a **clockwise / right-side-down** tilt; positive pitch means the camera is tilted **down**. MAX `v360` leveling applies the inverse rotation (`roll=-roll_deg`, `pitch=-pitch_deg`) without changing the output dimensions.
+- Roll/pitch come from `GRAV` when present (`angle_source: "GRAV"`), otherwise from VIRB `ACCL` (`angle_source: "ACCL"`). Every image entry in the telemetry JSON repeats the raw value, while `level_roll_deg`/`level_pitch_deg` show the smoothed value actually applied.
+- The applied angle is a **centered moving average over up to two exported positions before and after** (five images total). This smooths sensor noise and stops the horizon rotation from jumping between consecutive images; genuine sustained tilt is preserved.
 - VIRB's accelerometer up/down sign is **derived from the camera data**: the FIT camera-orientation events (0/90/180/270) are applied to the accelerometer vector, and the sign that puts the image-frame up vector above the horizon is chosen automatically. No `--virb-accel-sign` input is required.
 - Rotations below `0.05°` are skipped so level footage is not resampled.
-- Rotation happens during extraction. Existing images are skipped on re-runs, so use `--overwrite` after changing leveling options to re-level them.
+- Rotation happens during export. Existing images are skipped on re-runs, so use `--overwrite` after changing leveling options to re-level them.
 - Pixel rotation expands the canvas and fills the new corners with black; it does not correct lens distortion or pitch keystone.
 
 ## Detailed telemetry
@@ -88,8 +89,9 @@ python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
 # HERO with no GPS, unpositioned time-lapse:
 python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
 
-# Keep the source tilt instead of auto-leveling
-python3 v2i.py -i video/ -o images/ -d 7 --no-level-horizon
+# Keep the source tilt (default) and level it on request
+python3 v2i.py -i video/ -o images/ -d 7
+python3 v2i.py -i video/ -o images/ -d 7 --level-horizon
 ```
 
 ## Detection
@@ -142,7 +144,7 @@ Measured (evidence-based):
 - No hard-coded `Keywords`/`XMP:Subject`; `--keywords "a;b;c"` is **opt-in**
 - Provenance is written to `ImageDescription`/`UserComment`/`XMP:Description`, not keywords
 - **GPano/XMP-GPano** written **only for panoramic (MAX) images** with the full tag set; flat HERO/VIRB/BlackVue have no GPano tags
-- MAX `PoseRollDegrees`/`PosePitchDegrees` are filled when leveling is enabled; both stay `0` with `--no-level-horizon`
+- MAX `PoseRollDegrees`/`PosePitchDegrees` stay `0` because the sphere pixels are either already leveled (`--level-horizon`) or deliberately left untouched (the default); the original `roll_deg`/`pitch_deg` remain in the image telemetry
 
 ## GoPro specifics
 
@@ -173,7 +175,7 @@ Run the standard-library suite from the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, horizon leveling (CLI default, flat rotation filter, MAX pose values, VIRB orientation/sign handling) and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
+The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, horizon leveling (CLI opt-in, neighbour smoothing, flat rotation filter, MAX `v360` pixel rotation and level pose values, VIRB orientation/sign handling) and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
 
 ## Measured sample evidence (for reference)
 

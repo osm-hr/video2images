@@ -568,10 +568,11 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                         help="opt-in keywords to write to Keywords/XMP:Subject, "
                              "semicolon- or comma-separated")
     parser.add_argument("--level-horizon", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="auto-level images from IMU roll/pitch (default); "
-                             "MAX uses GPano pose, flat frames are rotated, "
-                             "use --no-level-horizon to keep the source tilt")
+                        default=False,
+                        help="level images from the camera's own IMU roll/pitch "
+                             "(off by default); MAX rotates the equirectangular "
+                             "sphere, flat frames are rotated, and nearby "
+                             "positions are averaged to avoid jitter")
     parser.add_argument("--track-export", choices=("both", "gpx", "geojson", "none"),
                         default="both",
                         help="write a GPX/GeoJSON track per sequence (default both)")
@@ -1581,6 +1582,27 @@ def select_expression(frames: Sequence[int]) -> str:
 # kept comfortably below that limit.  Used by the MAX360 EAC stitcher, which
 # still decodes a bounded batch per ffmpeg call.
 EXTRACT_CHUNK_SIZE = 60
+
+# Leveled MAX frames are stitched to lossless PNG intermediates and then
+# rotated by a second v360 pass.  Smaller batches bound the temporary disk
+# use (a 5376x2688 RGB PNG is roughly 40 MB).
+MAX360_LEVEL_CHUNK_SIZE = 8
+
+
+def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
+                        height: int, interp: str = "cubic") -> str:
+    """Return the v360 filter that levels an equirectangular MAX frame.
+
+    ``roll_deg``/``pitch_deg`` use the same camera convention as the flat
+    images: positive roll is clockwise (right side down) and positive pitch
+    means the camera was tilted down.  v360 applies the inverse screen
+    rotation, so both angles are negated.  Only roll and pitch are corrected;
+    yaw is deliberately left alone.
+    """
+    return ("v360=e:e:roll=%.6f:pitch=%.6f:w=%d:h=%d:interp=%s"
+            % (-float(roll_deg), -float(pitch_deg), int(width), int(height),
+               interp))
+
 
 
 def _flat_level_filter(roll_deg: float) -> str:
@@ -2785,6 +2807,42 @@ def _virb_image_up(body: Sequence[float], orientation_deg: Optional[float]
     theta = math.radians(float(orientation_deg))
     c, s = math.cos(theta), math.sin(theta)
     return [x * c + z * s, y, -x * s + z * c]
+
+
+def _smooth_angles(records: Sequence[dict],
+                   angles: Mapping[int, Tuple[float, float]],
+                   radius: int = 2) -> Dict[int, Tuple[float, float]]:
+    """Average each image's roll/pitch over nearby capture positions.
+
+    Sensor-derived orientation is noisy, and applying the raw value to every
+    image makes the horizon rotation jump between consecutive exports.  A
+    centered moving average over up to two positions on each side removes
+    that jitter while keeping genuine changes in tilt.  Roll is averaged as a
+    circular quantity so values near +-180 degrees do not cancel out; pitch
+    is averaged normally.
+    """
+    if not angles or radius < 1:
+        return dict(angles)
+    keys = [record.get("frame_index") for record in records]
+    source = [angles.get(key) for key in keys]
+    smoothed: Dict[int, Tuple[float, float]] = {}
+    for index, key in enumerate(keys):
+        if key is None or source[index] is None:
+            continue
+        lo = max(0, index - radius)
+        hi = min(len(keys), index + radius + 1)
+        rolls = [source[pos][0] for pos in range(lo, hi)
+                 if source[pos] is not None]
+        pitches = [source[pos][1] for pos in range(lo, hi)
+                   if source[pos] is not None]
+        if not rolls:
+            continue
+        sin_sum = sum(math.sin(math.radians(value)) for value in rolls)
+        cos_sum = sum(math.cos(math.radians(value)) for value in rolls)
+        roll = math.degrees(math.atan2(sin_sum, cos_sum))
+        pitch = sum(pitches) / len(pitches)
+        smoothed[int(key)] = (round(roll, 3), round(pitch, 3))
+    return smoothed
 
 
 def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
@@ -4285,14 +4343,48 @@ def max360__kept_filter_path(base: str, index: int, total: int) -> str:
     return "%s.%02d%s" % (root, index, ext or ".filter")
 
 
+def max360__level_image(src: str, dest: str, roll_deg: float, pitch_deg: float,
+                        *, width: int, height: int, image_format: str,
+                        quality: int, interp: str, threads: int) -> None:
+    """Level one stitched equirectangular image and write the final file."""
+    rotate = (abs(float(roll_deg)) >= 0.05
+              or abs(float(pitch_deg)) >= 0.05)
+    same_format = (os.path.splitext(src)[1].lower()
+                   == os.path.splitext(dest)[1].lower())
+    if not rotate and same_format:
+        shutil.copyfile(src, dest)
+        return
+    cmd = [FFMPEG, "-v", "error", "-y", "-i", src]
+    if rotate:
+        cmd += ["-vf", max360_level_filter(
+            roll_deg, pitch_deg, width, height, interp)]
+    cmd += ["-frames:v", "1",
+            "-pix_fmt", "rgb24" if image_format == "png" else "yuvj420p"]
+    cmd += ffmpeg_quality_args(image_format, quality)
+    if threads:
+        cmd += ["-threads", str(threads)]
+    cmd.append(dest)
+    max360__run(cmd)
+
+
 def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
                   by_frame: Dict[int, str], temp_dir: str, batch_index: int,
                   *, width: int, height: int, quality: int,
                   image_format: str, interp: str, threads: int,
                   keep_filter: Optional[str], total_batches: int,
-                  seek_time: Optional[float]) -> None:
-    """Run one bounded EAC/v360 batch and copy its images to their targets."""
+                  seek_time: Optional[float],
+                  levels: Optional[Mapping[int, Tuple[float, float]]] = None,
+                  workers: int = 1) -> None:
+    """Run one bounded EAC/v360 batch and copy its images to their targets.
+
+    When *levels* contains a roll/pitch pair for any selected frame, the batch
+    is stitched to lossless PNG intermediates and each frame is then remapped
+    on the sphere with its own v360 rotation.  The video is still decoded only
+    once per batch.
+    """
     ordered = [int(frame) for frame in frames]
+    leveled = (levels is not None
+               and any(levels.get(frame) is not None for frame in ordered))
     selected = ordered if seek_time is None else\
         [frame - ordered[0] for frame in ordered]
     select = select_expression(selected)
@@ -4312,10 +4404,13 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
             os.makedirs(parent, exist_ok=True)
         shutil.copyfile(script_path, dest)
 
-    ext = "png" if image_format == "png" else "jpg"
+    # A leveled frame needs a lossless intermediate so the sphere remap is the
+    # only lossy step in the final encode.
+    encode_format = "png" if leveled else image_format
+    ext = "png" if encode_format == "png" else "jpg"
     prefix = "img_%03d_%s_" % (batch_index, attempt)
     pattern = os.path.join(temp_dir, prefix + "%06d." + ext)
-    pix_fmt = "rgb24" if image_format == "png" else "yuvj420p"
+    pix_fmt = "rgb24" if encode_format == "png" else "yuvj420p"
     cmd = [FFMPEG, "-v", "error", "-y"]
     if seek_time is not None:
         cmd += ["-ss", "%.6f" % seek_time]
@@ -4323,7 +4418,7 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
             "-map", "[OUT]", "-an", "-sn", "-dn", "-vsync", "0",
             "-frames:v", str(len(ordered)),
             "-pix_fmt", pix_fmt]
-    cmd += ffmpeg_quality_args(image_format, quality)
+    cmd += ffmpeg_quality_args(encode_format, quality)
     if threads:
         cmd += ["-threads", str(threads)]
     cmd.append(pattern)
@@ -4334,19 +4429,40 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
         raise max360_BackendError(
             "ffmpeg produced %d image(s) for %d selected frames"
             % (len(temp_files), len(ordered)))
-    for frame, temp in zip(ordered, temp_files):
+
+    def finish(item: Tuple[int, str]) -> None:
+        frame, temp = item
         dest = by_frame[frame]
         parent = os.path.dirname(dest)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        shutil.copyfile(temp, dest)
+        if leveled:
+            angle = levels.get(frame) if levels else None
+            roll, pitch = angle if angle is not None else (0.0, 0.0)
+            max360__level_image(
+                temp, dest, roll, pitch, width=width, height=height,
+                image_format=image_format, quality=quality, interp=interp,
+                threads=threads)
+        else:
+            shutil.copyfile(temp, dest)
+
+    items = list(zip(ordered, temp_files))
+    if leveled and workers > 1 and len(items) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+            list(pool.map(finish, items))
+    else:
+        for item in items:
+            finish(item)
+
 
 
 def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
                   outputs: Sequence[str], *, width: int, height: int,
                   quality: int, image_format: str, interp: str,
                   threads: int, keep_filter: Optional[str],
-                  timeline: Optional[FrameTimeline] = None) -> None:
+                  timeline: Optional[FrameTimeline] = None,
+                  levels: Optional[Mapping[int, Tuple[float, float]]] = None,
+                  workers: int = 1) -> None:
     """Stitch selected frames in bounded batches (seek-assisted when possible).
 
     A single ``select`` expression cannot hold hundreds of frame numbers, so
@@ -4359,7 +4475,9 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
         return
     # outputs correspond to the original (already increasing) choices
     by_frame = {int(frame): output for frame, output in zip(frames, outputs)}
-    size = EXTRACT_CHUNK_SIZE
+    # A leveled batch stitches to lossless PNG intermediates, so keep those
+    # batches smaller to bound temporary disk use.
+    size = MAX360_LEVEL_CHUNK_SIZE if levels else EXTRACT_CHUNK_SIZE
     chunks = [ordered_frames[i:i + size]
               for i in range(0, len(ordered_frames), size)]
     temp_dir = tempfile.mkdtemp(prefix="max360_")
@@ -4376,7 +4494,8 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
                         width=width, height=height, quality=quality,
                         image_format=image_format, interp=interp,
                         threads=threads, keep_filter=keep_filter,
-                        total_batches=len(chunks), seek_time=seek_time)
+                        total_batches=len(chunks), seek_time=seek_time,
+                        levels=levels, workers=workers)
                     continue
                 except max360_BackendError as exc:
                     LOG.warning("seek-based stitching failed for frames "
@@ -4387,35 +4506,61 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
                 width=width, height=height, quality=quality,
                 image_format=image_format, interp=interp, threads=threads,
                 keep_filter=keep_filter, total_batches=len(chunks),
-                seek_time=None)
+                seek_time=None, levels=levels, workers=workers)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def max360_stitch_max2sphere(info: max360_VideoInfo, frames: Sequence[int],
                       outputs: Sequence[str], *, width: int, height: int,
-                      quality: int, image_format: str, threads: int) -> None:
+                      quality: int, image_format: str, interp: str,
+                      threads: int,
+                      levels: Optional[Mapping[int, Tuple[float, float]]] = None,
+                      workers: int = 1) -> None:
     """Stitch with the optional max2sphere binary, then extract frames."""
     temp_dir = tempfile.mkdtemp(prefix="max360_m2s_")
     video_out = os.path.join(temp_dir, "equirect.mp4")
+    leveled = levels is not None and any(
+        levels.get(int(frame)) is not None for frame in frames)
     try:
         max360__run(max360_max2sphere_command(info.path, video_out, width, height, info.fps))
         timeline = probe_frame_timeline(
             video_out, fps_hint=info.fps, duration_hint=info.duration,
             logger=LOG)
+        # Leveled frames go through a lossless PNG intermediate before the
+        # v360 sphere rotation, mirroring the ffmpeg backend.
         extracted = extract_frames_by_index(
             video_out, frames, os.path.join(temp_dir, "frames"),
-            image_format=image_format, quality=quality, threads=threads,
+            image_format="png" if leveled else image_format,
+            quality=quality, workers=workers, threads=threads,
             timeline=timeline)
-        for frame, dest in zip(frames, outputs):
+
+        def finish(pair: Tuple[int, str]) -> None:
+            frame, dest = pair
             temp = extracted.get(int(frame))
             if temp is None:
-                raise max360_BackendError("max2sphere/ffmpeg did not produce frame %d"
-                                   % frame)
+                raise max360_BackendError(
+                    "max2sphere/ffmpeg did not produce frame %d" % frame)
             parent = os.path.dirname(dest)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            shutil.copyfile(temp, dest)
+            if leveled:
+                angle = levels.get(int(frame)) if levels else None
+                roll, pitch = angle if angle is not None else (0.0, 0.0)
+                max360__level_image(
+                    temp, dest, roll, pitch, width=width, height=height,
+                    image_format=image_format, quality=quality, interp=interp,
+                    threads=threads)
+            else:
+                shutil.copyfile(temp, dest)
+
+        pairs = list(zip(frames, outputs))
+        if leveled and workers > 1 and len(pairs) > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, len(pairs))) as pool:
+                list(pool.map(finish, pairs))
+        else:
+            for pair in pairs:
+                finish(pair)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -4521,18 +4666,12 @@ def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, 
 # Records
 # ---------------------------------------------------------------------------
 def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
+    # MAX frames are physically rotated on the sphere when leveling is enabled
+    # (and left untouched otherwise), so the GPano pose must stay level:
+    # writing the tilt here as well would correct it twice.  The original
+    # angles remain available in the per-image telemetry.
     pose_roll = 0.0
     pose_pitch = 0.0
-    if getattr(args, "level_horizon", False):
-        roll = record.get("roll_deg")
-        pitch = record.get("pitch_deg")
-        if roll is not None and pitch is not None:
-            pose_roll = float(roll) % 360.0
-            if pose_roll > 180.0:
-                pose_roll -= 360.0
-            # GPano pitch is positive above the horizon; our pitch is
-            # positive when the camera is tilted down.
-            pose_pitch = max(-90.0, min(90.0, -float(pitch)))
     return FrameMetadata(
         camera=CAMERA_LABELS[CAMERA_MAX], video=record["video"],
         sequence=record["sequence"], frame_index=record["frame_index"],
@@ -4659,14 +4798,18 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     records = [max360__record(c, track, args, info, tz_offset, tz_known, sequence,
                        name) for c in choices]
-    if getattr(args, "level_horizon", True):
+    if getattr(args, "level_horizon", False):
         angles = _image_angles(records, gpmf.imu)
+        smoothed = _smooth_angles(records, angles)
         for record in records:
             angle = angles.get(record["frame_index"])
             if angle is not None:
                 record["roll_deg"], record["pitch_deg"] = angle
-        LOG.debug("  horizon: IMU pose for %d/%d image(s)",
-                  len(angles), len(records))
+            level = smoothed.get(record["frame_index"])
+            if level is not None:
+                record["level_roll_deg"], record["level_pitch_deg"] = level
+        LOG.debug("  horizon: IMU pose for %d/%d image(s), smoothed over "
+                  "neighbouring positions", len(smoothed), len(records))
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         args.output, CAMERA_MAX, sequence, first_time,
@@ -4700,6 +4843,14 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     backend = max360__resolve_backend(args.stitch_backend)
     LOG.info("  stitching backend: %s", backend)
+    levels = None
+    if getattr(args, "level_horizon", False):
+        levels = {}
+        for record in to_extract:
+            roll = record.get("level_roll_deg")
+            pitch = record.get("level_pitch_deg")
+            if roll is not None and pitch is not None:
+                levels[record["frame_index"]] = (float(roll), float(pitch))
     if to_extract:
         outputs = [record["path"] for record in to_extract]
         frames = [record["frame_index"] for record in to_extract]
@@ -4708,13 +4859,16 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
         if backend == "max2sphere":
             max360_stitch_max2sphere(info, frames, outputs, width=args.width,
                               height=args.height, quality=args.quality,
-                              image_format=args.format, threads=args.threads)
+                              image_format=args.format, interp=args.interp,
+                              threads=args.threads, levels=levels,
+                              workers=args.workers)
         else:
             max360_stitch_ffmpeg(info, frames, outputs, width=args.width,
                           height=args.height, quality=args.quality,
                           image_format=args.format, interp=args.interp,
                           threads=args.threads, keep_filter=keep_filter,
-                          timeline=timeline)
+                          timeline=timeline, levels=levels,
+                          workers=args.workers)
         for record in to_extract:
             record["written"] = os.path.exists(record["path"])
     if (args.start_distance == 0 and records
@@ -5868,13 +6022,17 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
     if args.level_horizon:
         angles = _image_angles(
             records, telemetry.imu if telemetry is not None else None)
+        smoothed = _smooth_angles(records, angles)
         for record in records:
             angle = angles.get(record["frame_index"])
             if angle is not None:
                 record["roll_deg"], record["pitch_deg"] = angle
-                levels[record["frame_index"]] = angle[0]
-        LOG.debug("  horizon: IMU roll for %d/%d image(s)",
-                  len(levels), len(records))
+            level = smoothed.get(record["frame_index"])
+            if level is not None:
+                record["level_roll_deg"], record["level_pitch_deg"] = level
+                levels[record["frame_index"]] = level[0]
+        LOG.debug("  horizon: IMU roll for %d/%d image(s), smoothed over "
+                  "neighbouring positions", len(levels), len(records))
 
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
@@ -6249,13 +6407,17 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
     levels = {}
     if args.level_horizon:
         angles = _image_angles(records, gpmf.imu if gpmf else None)
+        smoothed = _smooth_angles(records, angles)
         for record in records:
             angle = angles.get(record["frame_index"])
             if angle is not None:
                 record["roll_deg"], record["pitch_deg"] = angle
-                levels[record["frame_index"]] = angle[0]
-        LOG.debug("  horizon: IMU roll for %d/%d image(s)",
-                  len(levels), len(records))
+            level = smoothed.get(record["frame_index"])
+            if level is not None:
+                record["level_roll_deg"], record["level_pitch_deg"] = level
+                levels[record["frame_index"]] = level[0]
+        LOG.debug("  horizon: IMU roll for %d/%d image(s), smoothed over "
+                  "neighbouring positions", len(levels), len(records))
 
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
