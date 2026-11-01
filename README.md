@@ -125,7 +125,7 @@ Measured (evidence-based):
 ## Time base & timestamps
 
 - Default `--time-base local` with detected camera offset; `--timezone OFFSET` or `--tz` override
-- **MAX/HERO** carry no local wall clock: if offset unknown, filenames/EXIF use **UTC** and a warning is logged (never host timezone)
+- **MAX** writes the camera-local wall clock into the container on some firmware; the GPS clock stays authoritative, and the difference (rounded to a 15-minute step, with STMP used so later chapters still compare against the recording's start) is used as the camera's UTC offset for filenames/EXIF. A HERO clip without GPS has no local wall clock: if the offset is unknown, filenames/EXIF use **UTC** and a warning is logged (never host timezone)
 - EXIF: `DateTimeOriginal`/`CreateDate`/`ModifyDate` are camera-local when known, else UTC; `OffsetTimeOriginal` written **only when offset known**
 - All GPS date/time tags are **UTC**
 - Track `*.gpx` is valid GPX 1.1 (UTC `<time>`, namespaced extensions); `*.geojson` RFC 7946 (`LineString` + image `Point` features; `Point` if single-sample track)
@@ -175,7 +175,7 @@ Run the standard-library suite from the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, horizon leveling (CLI opt-in, neighbour smoothing, flat rotation filter, MAX `v360` pixel rotation and level pose values, VIRB orientation/sign handling) and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
+The suite covers unified camera detection/grouping, coloured logging, filename milliseconds and collision handling, VIRB capture-time naming and FIT calibration, MAX container-clock timezone detection, MAX batch command construction, seek-based frame extraction compared against a `select` decode pass, horizon leveling (CLI opt-in, neighbour smoothing, flat rotation filter, MAX `v360` pixel rotation and level pose values, VIRB orientation/sign handling) and the detailed GPS/IMU telemetry exporters (stream contents, per-image nearest-sample matching, null/no-GPS handling and `--telemetry-export`).
 
 ## Measured sample evidence (for reference)
 

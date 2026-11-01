@@ -869,14 +869,33 @@ def local_from_utc(utc: Optional[dt.datetime],
             + dt.timedelta(seconds=offset_s or 0)).replace(tzinfo=None)
 
 
+def timezone_from_clock_skew(skew_s: Optional[float]) -> Optional[int]:
+    """Infer a camera UTC offset from ``wall clock - GPS UTC``.
+
+    GoPro firmware may write the camera's *local* wall clock into the MP4
+    ``creation_time`` even though the field looks like UTC.  Compared with the
+    authoritative GPS clock the difference is the UTC offset plus a few seconds
+    of GPS-lock/stream-start delay, so round it to the nearest quarter hour
+    (every real-world offset is a multiple of 15 minutes).  Skews outside the
+    real-world UTC offset range are treated as a broken clock, not a timezone.
+    """
+    if skew_s is None:
+        return None
+    offset = int(round(float(skew_s) / 900.0) * 900)
+    if abs(offset) > 14 * 3600:
+        return None
+    return offset
+
+
 def resolve_timezone(args: argparse.Namespace, detected: Optional[int], *,
                      camera: str, logger: logging.Logger) -> Tuple[int, bool]:
     """Return ``(offset_seconds, known)`` for naming and EXIF.
 
     Rules: explicit ``--timezone`` wins; ``--time-base utc`` uses UTC; otherwise
-    the camera-detected offset is used.  MAX/HERO carry no local wall clock, so
-    without an explicit offset they fall back to UTC (never the host timezone)
-    and say so in the log.
+    the camera-detected offset is used.  A MAX recording reports the offset via
+    its container clock vs GPS (see :func:`timezone_from_clock_skew`), other
+    GoPro files may carry none, in which case they fall back to UTC (never the
+    host timezone) and say so in the log.
     """
     explicit = parse_timezone(getattr(args, "timezone", None))
     if explicit is not None:
@@ -2947,6 +2966,7 @@ class GpmfData:
     clock_spread_s: float = 0.0
     origin_utc: Optional[dt.datetime] = None
     time_scale: float = 1.0
+    camera_utc_offset: Optional[int] = None
 
 
 def _anchor_imu_utc(imu: Dict[str, List[dict]],
@@ -4597,23 +4617,40 @@ def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, 
     timed = [s for s in data.gps_samples if s.get("utc") is not None]
     if not timed:
         raise max360_BackendError("GPMF GPS samples have no usable timestamps")
-    first_gps = min(s["utc"] for s in timed)
+    first_sample = min(timed, key=lambda sample: sample["utc"])
+    first_gps = first_sample["utc"]
     last_gps = max(s["utc"] for s in timed)
     gps_span = (last_gps - first_gps).total_seconds()
 
     # GoPro MAX writes creation_time as camera-local wall clock in some
     # firmware, even though the field looks like UTC.  The GPMF GPS clock is
     # authoritative, so use the first fix unless creation_time agrees with it
-    # to within five minutes.
+    # to within five minutes.  The difference is also the camera's UTC offset
+    # (plus a short GPS-lock delay), which is what local file names need.
+    # STMP keeps counting across the chapters of one recording, so add it back
+    # to compare against the recording's start rather than a later chapter's.
     origin = info.creation_time
+    skew_s = None
+    if origin is not None:
+        skew_s = (origin - first_gps).total_seconds()
+        stmp_us = first_sample.get("stmp_us")
+        if stmp_us is not None and 0 <= stmp_us <= 12 * 3600 * 1000000:
+            skew_s += stmp_us / 1e6
     origin_is_gps = False
-    if origin is None or abs((first_gps - origin).total_seconds()) > 300:
+    if skew_s is None or abs(skew_s) > 300:
         if origin is not None:
-            LOG.warning("  container creation_time is %.0f s from GPS; using "
-                        "the first GPS fix as the video clock",
-                        (first_gps - origin).total_seconds())
+            detected = timezone_from_clock_skew(skew_s)
+            if detected is not None:
+                data.camera_utc_offset = detected
+                LOG.info("  using the first GPS fix as the video clock")
+            else:
+                LOG.warning("  container creation_time is %.0f s from GPS; "
+                            "using the first GPS fix as the video clock",
+                            (first_gps - origin).total_seconds())
         origin = first_gps
         origin_is_gps = True
+    else:
+        data.camera_utc_offset = 0
 
     # TimeWarp (and some slow-motion modes) record real GPS time but play the
     # video back at a different rate.  Map the GPS span onto the video span so
@@ -4780,9 +4817,11 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
              len(timeline), timeline.source)
 
     track, gpmf = max360_build_track(path, info, args)
-    detected_offset = None       # GoPro MAX stores UTC, not local wall clock
+    detected_offset = gpmf.camera_utc_offset
     tz_offset, tz_known = resolve_timezone(
         args, detected_offset, camera=CAMERA_MAX, logger=LOG)
+    if tz_known:
+        LOG.info("  camera-local time offset: %s", offset_string(tz_offset))
 
     choices, skipped = select_unique_frames(
         track, timeline, args.distance, start_distance=args.start_distance,
