@@ -84,10 +84,10 @@ python3 v2i.py -i video/2026-10-26-max360-000-timelapse05-30fps -o images/ -d 2 
 # BlackVue DR900
 python3 v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-distance 0
 
-# GoPro HERO flat (no GPS → skipped unless fallback)
+# GoPro HERO flat (no GPS → skipped unless a fallback interval is given)
 python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ -d 5 --dry-run
-# HERO with no GPS, unpositioned time-lapse:
-python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --allow-missing-gps --fallback-interval 30
+# Any camera without a usable GPS fix: unpositioned time-lapse
+python3 v2i.py -i video/ -o images/ --fallback-interval 30
 
 # Keep the source tilt (default) and level it on request
 python3 v2i.py -i video/ -o images/ -d 7
@@ -152,12 +152,13 @@ Measured (evidence-based):
 - Correct EAC layout: three 1344-wide faces at x=0,1376,2752 per hemisphere, drop 32px gaps, hstack faces → 4032, vstack hemispheres → 4032×2688, `v360=eac:equirect`
 - Backends: `--stitch-backend {auto,ffmpeg,max2sphere}` (default `auto`, ffmpeg preferred). `max2sphere` used only if requested/available
 - Options: `--width/--height` (default 5376×2688), `--interp {cubic,linear,nearest,lanczos}`, `--keep-filter`, `--imu-heading`, TimeWarp handled by scaling GPS span to video span
+- If GPS has no valid fix (for example indoors), `--fallback-interval SECONDS` exports an **unpositioned** time grid; GPMF IMU and the camera clock are still used, the GPS track is empty and images carry `position_source=unpositioned`
 - GPMF GPSP raw values used for DOP
 - Orientation: `GRAV` gives absolute roll/pitch; `CORI`/`IORI` are 4-component (`w,x,y,z`) rotation quaternions
 
 ### HERO (flat)
-- Options: `--gpmf-stream INDEX`, `--device-model`, `--allow-missing-gps`, `--imu-heading`, `--fallback-interval`
-- **No GPS telemetry → skipped unless both `--allow-missing-gps` and `--fallback-interval` are provided**; fallback exports an **unpositioned** time-lapse with no GPS tags and `position_source=unpositioned`
+- Options: `--gpmf-stream INDEX`, `--device-model`, `--imu-heading`, `--fallback-interval` (`--allow-missing-gps` is still accepted as a compatibility alias)
+- **No usable GPS telemetry → skipped unless `--fallback-interval SECONDS` is provided**; fallback exports an **unpositioned** time-lapse with no GPS tags and `position_source=unpositioned`. The same rule applies to every camera (MAX, VIRB and BlackVue included)
 - Supports GPMF GPS5/GPS9/GPSF/GPSP/GPSU/STMP and IMU/MAGN streams via the built-in GPMF reader
 - Flat frames are rotated from `GRAV` roll when leveling is enabled
 

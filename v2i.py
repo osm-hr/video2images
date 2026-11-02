@@ -637,8 +637,9 @@ def add_track_export_arguments(parser: argparse.ArgumentParser) -> None:
                         help="legacy: also write a <sequence>.track.jsonl manifest")
     parser.add_argument("--fallback-interval", type=float, default=0.0,
                         metavar="SECONDS",
-                        help="if a video has no telemetry, sample every N seconds "
-                             "instead of skipping it (default 0 = skip)")
+                        help="if a video has no usable GPS position, sample every "
+                             "N seconds instead of skipping it, for any camera "
+                             "(default 0 = skip)")
 
 
 def resolve_extensions(args: argparse.Namespace) -> Tuple[str, ...]:
@@ -4604,7 +4605,14 @@ def max360__smooth(values: Sequence[float], window: int) -> List[float]:
     return out
 
 
-def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, GpmfData]:
+def max360_build_track(path: str, info: max360_VideoInfo,
+                       args) -> Tuple[Optional[Track], Optional[GpmfData]]:
+    """Return ``(track, gpmf)`` and ``(None, gpmf)`` when GPS is unusable.
+
+    The caller decides whether an unpositioned time-lapse export is allowed;
+    ``gpmf`` still carries the IMU streams, camera clock and detected timezone
+    for that fallback.
+    """
     if info.gpmd is None:
         raise max360_BackendError("no GPMF (gpmd) telemetry track in file")
     payload = extract_gpmf(path, info.gpmd, ffmpeg=FFMPEG)
@@ -4612,11 +4620,15 @@ def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, 
     LOG.info("  GPMF device: %s; streams: %s", data.device_name,
              ", ".join(sorted(data.streams)))
     if not data.has_gps:
-        raise max360_BackendError("no GPS5/GPS9 data found in the GPMF stream")
+        data.origin_utc = info.creation_time
+        _anchor_imu_utc(data.imu, data.origin_utc)
+        return None, data
 
     timed = [s for s in data.gps_samples if s.get("utc") is not None]
     if not timed:
-        raise max360_BackendError("GPMF GPS samples have no usable timestamps")
+        data.origin_utc = info.creation_time
+        _anchor_imu_utc(data.imu, data.origin_utc)
+        return None, data
     first_sample = min(timed, key=lambda sample: sample["utc"])
     first_gps = first_sample["utc"]
     last_gps = max(s["utc"] for s in timed)
@@ -4681,7 +4693,11 @@ def max360_build_track(path: str, info: max360_VideoInfo, args) -> Tuple[Track, 
         apply_accuracy(item, args.uere)
         samples.append(item)
     if not samples:
-        raise max360_BackendError("no GPMF GPS sample has a valid fix")
+        # No usable fix (for example an indoor recording).  Keep the clock and
+        # IMU so the caller can still export an unpositioned time-lapse.
+        data.origin_utc = origin
+        data.time_scale = scale
+        return None, data
     samples.sort(key=lambda s: s["t"])
 
     if args.smooth and args.smooth > 1:
@@ -4737,16 +4753,29 @@ def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
     )
 
 
+def max360__unpositioned_choices(timeline, interval, duration, max_images):
+    """Frames on a time grid for clips whose GPS has no usable fix."""
+    frames = select_time_grid_frames(
+        timeline, interval, duration=duration, max_images=max_images)
+    out = []
+    for index in frames:
+        pts = timeline.pts(index)
+        out.append(FrameChoice(
+            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
+            point={}, position_error=None, clamped=False, estimated=True))
+    return out
+
+
 def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
-            video_name):
+            video_name, start_utc=None, time_scale=1.0):
     point = choice.point or {}
     pts = max(0.0, float(choice.pts))
     utc = point.get("utc")
     if utc is None:
-        origin = info.creation_time
-        utc = (origin + dt.timedelta(seconds=pts)
+        origin = start_utc or info.creation_time
+        utc = (origin + dt.timedelta(seconds=pts / (time_scale or 1.0))
                if origin is not None else None)
-    if utc.tzinfo is None:
+    if utc is not None and utc.tzinfo is None:
         utc = utc.replace(tzinfo=dt.timezone.utc)
     local = local_from_utc(utc, tz_offset) if tz_known else None
     if args.time_base == "utc" and utc is not None:
@@ -4767,12 +4796,13 @@ def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
     speed = point.get("speed")
     if speed is None:
         speed = point.get("speed2d")
+    unpositioned = point.get("lat") is None
     return {
         "sequence": sequence, "video": video_name, "camera": CAMERA_MAX,
         "image": image_filename(naming, args.format),
         "frame_index": int(choice.frame_index), "pts_seconds": round(pts, 3),
         "datetime_local": local.isoformat() if local else None,
-        "datetime_utc": fmt_utc(utc),
+        "datetime_utc": fmt_utc(utc) if utc else None,
         "utc_offset_s": tz_offset if tz_known else None,
         "latitude": point.get("lat"), "longitude": point.get("lon"),
         "altitude_m": point.get("alt"), "speed_m_s": speed,
@@ -4782,11 +4812,13 @@ def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
         "accuracy_source": accuracy_source,
         "hdop": point.get("hdop"), "vdop": point.get("vdop"),
         "pdop": point.get("pdop"),
-        "distance_m": float(choice.target_distance),
+        "distance_m": None if unpositioned else float(choice.target_distance),
         "track_distance_m": point.get("distance"),
-        "position_source": point.get("position_source", "none"),
+        "position_source": point.get(
+            "position_source", "unpositioned" if unpositioned else "none"),
         "clamped": bool(point.get("clamped")),
         "estimated": bool(point.get("estimated")),
+        "unpositioned": unpositioned,
         "naming_time": naming, "point": point,
     }
 
@@ -4816,29 +4848,55 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     LOG.info("  frame timeline: %d frame(s), source=%s",
              len(timeline), timeline.source)
 
-    track, gpmf = max360_build_track(path, info, args)
-    detected_offset = gpmf.camera_utc_offset
+    track = None
+    gpmf = None
+    try:
+        track, gpmf = max360_build_track(path, info, args)
+    except (Fatal, GpmfError) as exc:
+        if args.fallback_interval <= 0:
+            LOG.error("  %s", exc)
+            result["failed"] = True
+            return result
+        LOG.warning("  %s", exc)
+
+    detected_offset = gpmf.camera_utc_offset if gpmf else None
     tz_offset, tz_known = resolve_timezone(
         args, detected_offset, camera=CAMERA_MAX, logger=LOG)
     if tz_known:
         LOG.info("  camera-local time offset: %s", offset_string(tz_offset))
 
-    choices, skipped = select_unique_frames(
-        track, timeline, args.distance, start_distance=args.start_distance,
-        max_position_error=args.max_position_error, max_images=args.max_images,
-        mode=args.distance_mode, logger=LOG)
-    if skipped:
-        LOG.info("  skipped %d target(s) with no acceptable unused frame",
-                 len(skipped))
-    if not choices:
-        LOG.error("  no capture point could be matched to a unique frame")
-        result["failed"] = True
-        return result
+    if track is None:
+        if args.fallback_interval <= 0:
+            LOG.error("  no usable GPS telemetry; use --fallback-interval "
+                      "SECONDS to export unpositioned frames")
+            result["failed"] = True
+            return result
+        choices = max360__unpositioned_choices(
+            timeline, args.fallback_interval, info.duration, args.max_images)
+        LOG.warning("  exporting %d unpositioned frame(s) on a %g s time grid",
+                    len(choices), args.fallback_interval)
+        skipped = []
+    else:
+        choices, skipped = select_unique_frames(
+            track, timeline, args.distance, start_distance=args.start_distance,
+            max_position_error=args.max_position_error,
+            max_images=args.max_images, mode=args.distance_mode, logger=LOG)
+        if skipped:
+            LOG.info("  skipped %d target(s) with no acceptable unused frame",
+                     len(skipped))
+        if not choices:
+            LOG.error("  no capture point could be matched to a unique frame")
+            result["failed"] = True
+            return result
 
-    records = [max360__record(c, track, args, info, tz_offset, tz_known, sequence,
-                       name) for c in choices]
+    fallback_start = gpmf.origin_utc if (track is None and gpmf) else None
+    records = [max360__record(
+                   c, track, args, info, tz_offset, tz_known, sequence, name,
+                   start_utc=fallback_start,
+                   time_scale=gpmf.time_scale if gpmf else 1.0)
+               for c in choices]
     if getattr(args, "level_horizon", False):
-        angles = _image_angles(records, gpmf.imu)
+        angles = _image_angles(records, gpmf.imu if gpmf else None)
         smoothed = _smooth_angles(records, angles)
         for record in records:
             angle = angles.get(record["frame_index"])
@@ -4864,12 +4922,15 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     if args.dry_run:
         for record in records:
-            LOG.info("    frame=%d pts=%.3fs %sZ %.6f,%.6f hdg=%s d=%.1fm -> %s",
+            position = ("unpositioned" if record.get("unpositioned")
+                        else "%.6f,%.6f" % (record["latitude"],
+                                            record["longitude"]))
+            distance = ("-" if record.get("distance_m") is None
+                        else "%.1fm" % record["distance_m"])
+            LOG.info("    frame=%d pts=%.3fs %sZ %s hdg=%s d=%s -> %s",
                      record["frame_index"], record["pts_seconds"],
-                     (record["datetime_utc"] or "")[11:23],
-                     record["latitude"] or 0.0, record["longitude"] or 0.0,
-                     record["heading_deg"], record["distance_m"],
-                     record["image"])
+                     (record["datetime_utc"] or "no-utc")[11:23], position,
+                     record["heading_deg"], distance, record["image"])
         return result
 
     to_extract = []
@@ -4928,11 +4989,12 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
         write_metadata(pairs)
 
     export_track_files(
-        sequence_dir, sequence, track.samples, records,
+        sequence_dir, sequence, track.samples if track else [], records,
         track_export=args.track_export, camera=CAMERA_MAX, video=name,
-        imu=gpmf.imu, video_start_utc=gpmf.origin_utc,
+        imu=gpmf.imu if gpmf else None,
+        video_start_utc=(gpmf.origin_utc if gpmf else fallback_start),
         telemetry_export=args.telemetry_export,
-        time_scale=gpmf.time_scale,
+        time_scale=(gpmf.time_scale if gpmf else 1.0),
         extra={"distance_interval_m": args.distance,
                "time_base": args.time_base})
     result["entries"] = [{k: v for k, v in record.items()
@@ -6411,14 +6473,9 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
         args, None, camera=CAMERA_HERO, logger=LOG)
 
     if track is None:
-        if not args.allow_missing_gps:
-            LOG.error("  no GPS telemetry; use --allow-missing-gps "
-                      "--fallback-interval SECONDS to export unpositioned frames")
-            result["failed"] = True
-            return result
         if args.fallback_interval <= 0:
-            LOG.error("  --allow-missing-gps requires a positive "
-                      "--fallback-interval")
+            LOG.error("  no GPS telemetry; use --fallback-interval SECONDS "
+                      "to export unpositioned frames")
             result["failed"] = True
             return result
         choices = hero__unpositioned_choices(
@@ -6564,7 +6621,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=("Examples:\n"
                 "  %(prog)s -i video/ -o images/ -d 7\n"
                 "  %(prog)s -i video/2026-10-18-virb-4k -o images/ -d 8\n"
-                "  %(prog)s -i video/hero -o images/ --allow-missing-gps "
+                "  %(prog)s -i video/hero -o images/ "
                 "--fallback-interval 1\n\n"
                 "Only files recorded by a supported camera are processed; "
                 "everything else found under --input is skipped with a logged "
@@ -6582,8 +6639,8 @@ def build_parser() -> argparse.ArgumentParser:
     hero.add_argument("--device-model", default=None, metavar="NAME",
                       help="override the EXIF camera model for HERO videos")
     hero.add_argument("--allow-missing-gps", action="store_true",
-                      help="export unpositioned time-lapse frames when a HERO "
-                           "video has no GPS (requires --fallback-interval)")
+                      help="deprecated alias; unpositioned export is enabled by "
+                           "--fallback-interval SECONDS")
 
     geometry = parser.add_argument_group("GoPro MAX 360 output geometry")
     geometry.add_argument("--width", type=int, default=max360_DEFAULT_WIDTH,
