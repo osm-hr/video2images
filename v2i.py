@@ -55,7 +55,7 @@ class Fatal(Exception):
 # Shared helpers: CLI, detection, timelines, extraction and tracks
 # =========================================================================
 
-__version__ = "3.0.0"
+__version__ = "0.0.3"
 
 FFPROBE = os.environ.get("V2I_FFPROBE", "ffprobe")
 FFMPEG = os.environ.get("V2I_FFMPEG", "ffmpeg")
