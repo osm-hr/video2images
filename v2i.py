@@ -587,6 +587,15 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                              "are level; 'exif' keeps the pixels untouched and "
                              "writes the roll/pitch into the XMP-GPano Pose "
                              "tags instead; ignored for classic flat videos")
+    parser.add_argument("--level-window", type=float,
+                        default=LEVEL_WINDOW_DEFAULT, metavar="SECONDS",
+                        help="real-time window over which IMU gravity samples "
+                             "are combined (median) for each leveled image "
+                             "(default %g); a vehicle's turns and braking "
+                             "swing GoPro's gravity estimate by several "
+                             "degrees, so keep this long for mounted cameras "
+                             "and use 0 (nearest sample) for handheld footage"
+                             % LEVEL_WINDOW_DEFAULT)
     parser.add_argument("--track-export", choices=("both", "gpx", "geojson", "none"),
                         default="both",
                         help="write a GPX/GeoJSON track per sequence (default both)")
@@ -735,6 +744,9 @@ def validate_common_args(parser: argparse.ArgumentParser,
                      "degrees (got %g)" % args.magnetic_declination)
     if args.uere <= 0:
         parser.error("--uere must be greater than zero (got %g)" % args.uere)
+    if args.level_window < 0:
+        parser.error("--level-window must not be negative (got %g)"
+                     % args.level_window)
     try:
         parse_timezone(args.timezone)
     except ValueError as exc:
@@ -1027,6 +1039,22 @@ class Track(object):
                     sample["gps_course"] = initial_bearing_deg(
                         a["lat"], a["lon"], b["lat"], b["lon"])
                     break
+        # A mounted camera keeps facing the same way while the vehicle is
+        # parked (typically at the start of a recording), so give samples
+        # without a course the nearest known one instead of leaving the
+        # image direction undefined.
+        known = [i for i, s in enumerate(self.samples)
+                 if s.get("gps_course") is not None]
+        if known and len(known) < n:
+            for i, sample in enumerate(self.samples):
+                if sample.get("gps_course") is not None:
+                    continue
+                pos = bisect.bisect_left(known, i)
+                candidates = [known[j] for j in (pos - 1, pos)
+                              if 0 <= j < len(known)]
+                nearest = min(candidates, key=lambda j: abs(j - i))
+                sample["gps_course"] = self.samples[nearest]["gps_course"]
+                sample["gps_course_filled"] = True
 
     def _locate_time(self, t):
         times = self.times
@@ -1071,7 +1099,16 @@ class Track(object):
             if key in ("t", "lat", "lon"):
                 continue
             if key in ("utc",):
-                out[key] = a.get(key) if a.get(key) is not None else b.get(key)
+                # Interpolate the wall clock too: with sparse GPS (TimeWarp
+                # keeps ~2 Hz of real time) reusing the earlier sample's UTC
+                # would mis-time the frame by up to one sample, which is a
+                # whole exported frame in timelapse footage.
+                ua, ub = a.get(key), b.get(key)
+                if (isinstance(ua, dt.datetime) and isinstance(ub, dt.datetime)
+                        and (ua.tzinfo is None) == (ub.tzinfo is None)):
+                    out[key] = ua + (ub - ua) * fraction
+                else:
+                    out[key] = ua if ua is not None else ub
                 continue
             out[key] = _interp_value(a, b, fraction, key)
         out["lat"] = a["lat"] + fraction * (b["lat"] - a["lat"])
@@ -1627,14 +1664,17 @@ def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
                         height: int, interp: str = "cubic") -> str:
     """Return the v360 filter that levels an equirectangular MAX frame.
 
-    ``roll_deg``/``pitch_deg`` use the same camera convention as the flat
-    images: positive roll is clockwise (right side down) and positive pitch
-    means the camera was tilted down.  v360 applies the inverse screen
-    rotation, so both angles are negated.  Only roll and pitch are corrected;
-    yaw is deliberately left alone.
+    ``roll_deg``/``pitch_deg`` use the camera convention: positive roll is
+    clockwise (right side down) and positive pitch means the camera was
+    tilted down.  v360's signs were established empirically on deliberately
+    tilted GoPro MAX footage: ``roll=+R`` turns the picture clockwise, so a
+    clockwise camera roll is undone with ``roll=-roll_deg``; ``pitch=+P``
+    makes the view look *up* by P (content moves down), which is exactly what
+    levels a camera tilted down, so pitch is passed through unchanged.  Only
+    roll and pitch are corrected; yaw is deliberately left alone.
     """
     return ("v360=e:e:roll=%.6f:pitch=%.6f:w=%d:h=%d:interp=%s"
-            % (-float(roll_deg), -float(pitch_deg), int(width), int(height),
+            % (-float(roll_deg), float(pitch_deg), int(width), int(height),
                interp))
 
 
@@ -1642,19 +1682,35 @@ def gpano_pose(roll_deg: float, pitch_deg: float) -> Tuple[float, float]:
     """Convert camera roll/pitch to XMP-GPano ``PoseRollDegrees``/``PosePitchDegrees``.
 
     The camera convention used throughout this file is positive roll =
-    clockwise (right side down) and positive pitch = camera tilted down.  The
-    Photo Sphere spec defines ``PoseRollDegrees`` so that increasing roll
-    rotates the horizon counter-clockwise in the image -- which is what a
-    clockwise camera roll does -- so roll passes through unchanged.
-    ``PosePitchDegrees`` is the elevation of the image centre *above* the
-    horizon, so a camera tilted down is a negative pose pitch.  Values are
+    clockwise (right side down) and positive pitch = camera tilted down, both
+    measured as independent ``atan2`` angles of the gravity vector:
+    ``roll = atan2(right, down)`` and ``pitch = atan2(forward, down)``.
+
+    The Photo Sphere spec fixes the Euler order ``R_Z(-heading) * R_X(pitch)
+    * R_Y(roll)`` with the sphere centre facing north and Z up.  Under that
+    order the world-up vector seen from the camera is ``(-sin r cos p,
+    sin p, cos r cos p)`` in (right, forward, up), so ``PoseRollDegrees`` is
+    the same ``atan2(right, down)`` as ours (positive = camera top leans
+    right = horizon turns counter-clockwise in the image, as the spec says),
+    while ``PosePitchDegrees`` is ``asin`` of the forward component, i.e. the
+    elevation of the image centre above the horizon.  Converting the
+    ``atan2`` pitch exactly matters once tilts reach tens of degrees; for the
+    few degrees of a vehicle mount both give the same number.  Values are
     clamped to the ranges the spec allows (roll in (-180, 180], pitch in
     [-90, 90]).
     """
+    r = math.radians(float(roll_deg))
+    q = math.radians(float(pitch_deg))
+    if abs(math.cos(r)) < 1e-9 or abs(math.cos(q)) < 1e-9:
+        pose_pitch = -90.0 if q > 0 else 90.0
+    else:
+        tr, tq = math.tan(r), math.tan(q)
+        forward = tq / math.sqrt(1.0 + tr * tr + tq * tq)
+        pose_pitch = -math.degrees(math.asin(max(-1.0, min(1.0, forward))))
     roll = (float(roll_deg) + 180.0) % 360.0 - 180.0
     if roll == -180.0:
         roll = 180.0
-    pitch = max(-90.0, min(90.0, -float(pitch_deg)))
+    pitch = max(-90.0, min(90.0, pose_pitch))
     return round(roll, 3), round(pitch, 3)
 
 
@@ -2878,11 +2934,19 @@ def _gravity_roll_pitch(values: Sequence[float]
                         ) -> Tuple[Optional[float], Optional[float]]:
     """Derive absolute roll/pitch from a GoPro ``GRAV`` sample.
 
-    GoPro stores GRAV as ``(X, Z, Y)``: +X is right, +Z is up and +Y points
-    backwards, with a level camera reading approximately ``[0, 1, 0]``.
-    Positive roll is a clockwise roll (right side down); positive pitch means
-    the camera is tilted down.  Gravity has no yaw component, so heading still
-    comes from the magnetometer or GPS course.
+    Verified on deliberately tilted MAX footage: GRAV behaves as the *down*
+    direction in a ``(right, down, forward)`` camera frame, so a level camera
+    reads approximately ``[0, 1, 0]``, the first component goes negative when
+    the camera's left side dips, and the third goes positive when the lens
+    tilts down.  Fed to :func:`_roll_pitch_from_body` as ``(x, forward,
+    down)`` this yields positive roll = clockwise (right side down) and
+    positive pitch = camera tilted down.  Gravity has no yaw component, so
+    heading still comes from the magnetometer or GPS course.
+
+    Note that GRAV is GoPro's low-passed *apparent* gravity: in a moving
+    vehicle it also contains the vehicle's own acceleration (turns, braking),
+    which is why the leveling code takes a windowed median over time instead
+    of trusting a single sample.
     """
     if len(values) < 3:
         return None, None
@@ -2926,53 +2990,83 @@ def _virb_image_up(body: Sequence[float], orientation_deg: Optional[float]
     return [x * c + z * s, y, -x * s + z * c]
 
 
-def _smooth_angles(records: Sequence[dict],
-                   angles: Mapping[int, Tuple[float, float]],
-                   radius: int = 2) -> Dict[int, Tuple[float, float]]:
-    """Average each image's roll/pitch over nearby capture positions.
+# Default real-time window (seconds) over which gravity samples are combined
+# for one image.  GoPro's GRAV is low-passed *apparent* gravity, so in a
+# vehicle it swings by several degrees through every turn and braking phase;
+# a 20 s median averages those out while a rigid mount's true tilt survives.
+LEVEL_WINDOW_DEFAULT = 20.0
 
-    Sensor-derived orientation is noisy, and applying the raw value to every
-    image makes the horizon rotation jump between consecutive exports.  A
-    centered moving average over up to two positions on each side removes
-    that jitter while keeping genuine changes in tilt.  Roll is averaged as a
-    circular quantity so values near +-180 degrees do not cancel out; pitch
-    is averaged normally.
+
+def _angle_unit_vector(row: dict, key: str) -> Optional[Tuple[float, float, float]]:
+    """Return the (right, down, forward) unit vector behind one IMU sample.
+
+    GRAV rows carry the vector directly; rows that only know ``roll_deg`` /
+    ``pitch_deg`` (VIRB ``ACCL`` after calibration) are rebuilt from the two
+    ``atan2`` angles, which is exact for the (roll, pitch) convention used
+    throughout this file.
     """
-    if not angles or radius < 1:
-        return dict(angles)
-    keys = [record.get("frame_index") for record in records]
-    source = [angles.get(key) for key in keys]
-    smoothed: Dict[int, Tuple[float, float]] = {}
-    for index, key in enumerate(keys):
-        if key is None or source[index] is None:
-            continue
-        lo = max(0, index - radius)
-        hi = min(len(keys), index + radius + 1)
-        rolls = [source[pos][0] for pos in range(lo, hi)
-                 if source[pos] is not None]
-        pitches = [source[pos][1] for pos in range(lo, hi)
-                   if source[pos] is not None]
-        if not rolls:
-            continue
-        sin_sum = sum(math.sin(math.radians(value)) for value in rolls)
-        cos_sum = sum(math.cos(math.radians(value)) for value in rolls)
-        roll = math.degrees(math.atan2(sin_sum, cos_sum))
-        pitch = sum(pitches) / len(pitches)
-        smoothed[int(key)] = (round(roll, 3), round(pitch, 3))
-    return smoothed
+    values = row.get("values") or ()
+    if key == "GRAV" and len(values) >= 3:
+        x, down, forward = float(values[0]), float(values[1]), float(values[2])
+    else:
+        roll = row.get("roll_deg")
+        pitch = row.get("pitch_deg")
+        if roll is None or pitch is None:
+            return None
+        r, q = math.radians(float(roll)), math.radians(float(pitch))
+        if abs(math.cos(r)) < 1e-9 or abs(math.cos(q)) < 1e-9:
+            return None
+        x, down, forward = math.tan(r), 1.0, math.tan(q)
+    norm = math.sqrt(x * x + down * down + forward * forward)
+    if norm < 1e-9:
+        return None
+    return x / norm, down / norm, forward / norm
+
+
+def _median_vector_angles(vectors: Sequence[Tuple[float, float, float]]
+                          ) -> Optional[Tuple[float, float]]:
+    """Roll/pitch of the component-wise median of unit gravity vectors.
+
+    The median is robust against the transient swings that vehicle dynamics
+    put into the gravity estimate, and working on vector components rather
+    than on angles avoids any wrap-around trouble near +-180 degrees.
+    """
+    if not vectors:
+        return None
+    x = statistics.median(v[0] for v in vectors)
+    down = statistics.median(v[1] for v in vectors)
+    forward = statistics.median(v[2] for v in vectors)
+    roll, pitch = _roll_pitch_from_body(x, forward, down)
+    if roll is None or pitch is None:
+        return None
+    return round(roll, 3), round(pitch, 3)
 
 
 def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
-                  *, max_delta_s: float = 1.0
-                  ) -> Dict[int, Tuple[float, float]]:
-    """Map ``frame_index`` to ``(roll, pitch)`` for horizon leveling.
+                  *, window_s: float = LEVEL_WINDOW_DEFAULT,
+                  max_delta_s: float = 1.0
+                  ) -> Tuple[Dict[int, Tuple[float, float]],
+                             Dict[int, Tuple[float, float]]]:
+    """Map ``frame_index`` to raw and leveling ``(roll, pitch)`` per image.
 
-    ``GRAV`` is preferred because it is absolute; VIRB only has ``ACCL`` and
-    its FIT orientation matrix has already been applied when the stream was
-    parsed.  Missing or stale samples are simply omitted.
+    Returns ``(raw, level)``.  ``raw`` is the single IMU sample nearest to the
+    capture time (within ``max_delta_s``), kept for the telemetry exports.
+    ``level`` is what the horizon correction actually uses: the roll/pitch of
+    the median gravity vector over all samples within ``window_s`` *real*
+    seconds centred on the capture time.  Working in real (UTC) time rather
+    than in exported-image neighbours makes this independent of the frame
+    spacing, so TimeWarp/timelapse footage -- where consecutive images are
+    seconds of real time apart -- is handled the same way as normal video.
+    With ``window_s == 0`` the raw sample is used as is.
+
+    ``GRAV`` is preferred because it is absolute; the ``ACCL`` fallback covers
+    streams that only provide calibrated roll/pitch.  Images without any
+    sample in reach are omitted from both maps.
     """
+    raw: Dict[int, Tuple[float, float]] = {}
+    level: Dict[int, Tuple[float, float]] = {}
     if not imu:
-        return {}
+        return raw, level
     indexes: Dict[str, Tuple[List[dt.datetime], List[dict]]] = {}
     for key in ("GRAV", "ACCL"):
         timed = []
@@ -2984,16 +3078,18 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
             timed.sort(key=lambda item: item[0])
             indexes[key] = ([item[0] for item in timed],
                             [item[1] for item in timed])
-    angles: Dict[int, Tuple[float, float]] = {}
+    half = max(0.0, float(window_s)) / 2.0
     for record in records:
         target = _as_utc(record.get("datetime_utc"))
         if target is None:
             continue
+        frame = int(record["frame_index"])
         for key in ("GRAV", "ACCL"):
             index = indexes.get(key)
             if index is None:
                 continue
-            match = _nearest_timed(index[0], index[1], target, max_delta_s)
+            times, rows = index
+            match = _nearest_timed(times, rows, target, max_delta_s)
             if match is None:
                 continue
             row, _delta = match
@@ -3003,9 +3099,19 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
                 roll, pitch = _gravity_roll_pitch(row.get("values") or [])
             if roll is None or pitch is None:
                 continue
-            angles[int(record["frame_index"])] = (float(roll), float(pitch))
+            raw[frame] = (float(roll), float(pitch))
+            if half <= 0.0:
+                level[frame] = (round(float(roll), 3), round(float(pitch), 3))
+                break
+            lo = bisect.bisect_left(times, target - dt.timedelta(seconds=half))
+            hi = bisect.bisect_right(times, target + dt.timedelta(seconds=half))
+            vectors = [v for v in (_angle_unit_vector(rows[i], key)
+                                   for i in range(lo, hi)) if v is not None]
+            angles = _median_vector_angles(vectors)
+            if angles is not None:
+                level[frame] = angles
             break
-    return angles
+    return raw, level
 
 
 def _tilt_compensated_heading(magnetic: Sequence[float],
@@ -3343,7 +3449,7 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
         height = meta.image_height or 0
         heading = meta.pose_heading
         if heading is None:
-            heading = meta.img_direction or 0.0
+            heading = meta.img_direction
         first_date = _fmt_local(local) or _fmt_utc(meta.captured_utc)
         pose_roll = round(
             (float(meta.pose_roll or 0.0) + 180.0) % 360.0 - 180.0, 3)
@@ -3356,10 +3462,8 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
             "-XMP-GPano:CaptureSoftware=%s" % (meta.model or ""),
             "-XMP-GPano:StitchingSoftware=%s" % SOFTWARE_TAG,
             "-XMP-GPano:ProjectionType=equirectangular",
-            "-XMP-GPano:PoseHeadingDegrees=%r" % (heading % 360.0),
             "-XMP-GPano:PosePitchDegrees=%r" % pose_pitch,
             "-XMP-GPano:PoseRollDegrees=%r" % pose_roll,
-            "-XMP-GPano:InitialViewHeadingDegrees=%r" % (heading % 360.0),
             "-XMP-GPano:InitialViewPitchDegrees=0",
             "-XMP-GPano:InitialViewRollDegrees=0",
             "-XMP-GPano:InitialHorizontalFOVDegrees=0",
@@ -3374,6 +3478,11 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
             "-XMP-GPano:LastPhotoDate=%s" % first_date,
             "-XMP-GPano:SourcePhotosCount=2",
         ]
+        # An unknown heading must stay absent: 0 would claim "facing north".
+        if heading is not None:
+            tags += ["-XMP-GPano:PoseHeadingDegrees=%r" % (heading % 360.0),
+                     "-XMP-GPano:InitialViewHeadingDegrees=%r"
+                     % (heading % 360.0)]
     return tags
 
 
@@ -5009,18 +5118,22 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                for c in choices]
     level_mode = getattr(args, "level_horizon", LEVEL_NONE)
     if level_mode != LEVEL_NONE:
-        angles = _image_angles(records, gpmf.imu if gpmf else None)
-        smoothed = _smooth_angles(records, angles)
+        window_s = float(getattr(args, "level_window", LEVEL_WINDOW_DEFAULT))
+        angles, leveled = _image_angles(records, gpmf.imu if gpmf else None,
+                                        window_s=window_s)
         for record in records:
             angle = angles.get(record["frame_index"])
             if angle is not None:
                 record["roll_deg"], record["pitch_deg"] = angle
-            level = smoothed.get(record["frame_index"])
+            level = leveled.get(record["frame_index"])
             if level is not None:
                 record["level_roll_deg"], record["level_pitch_deg"] = level
                 record["level_mode"] = level_mode
-        LOG.info("  horizon: IMU pose for %d/%d image(s), smoothed over "
-                 "neighbouring positions; %s", len(smoothed), len(records),
+                record["level_window_s"] = window_s
+        LOG.info("  horizon: IMU pose for %d/%d image(s) (%s); %s",
+                 len(leveled), len(records),
+                 "median over a %g s real-time window" % window_s
+                 if window_s > 0 else "nearest sample, no smoothing",
                  "sphere pixels will be rotated"
                  if level_mode == LEVEL_MODE_ROTATE
                  else "written to XMP-GPano pose tags, pixels untouched")

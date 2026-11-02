@@ -139,7 +139,7 @@ run manifest JSON
 | Extraction | `extract_frames_by_index`, `_extract_one` | Accurate per-frame seek and parallel ffmpeg workers |
 | MAX 360 | `max360_probe`, `max360_build_eac_filter`, `max360_stitch_*` | EAC layout assembly, v360 reprojection, optional sphere rotation |
 | Telemetry | `parse_gpmf`, `virb_Telemetry`, `blackvue_parse_telemetry` | Decode GPMF, FIT and NMEA samples |
-| Leveling (360 only) | `_image_angles`, `_smooth_angles`, `max360_level_filter`, `gpano_pose` | Derive smoothed roll/pitch and apply it to the sphere pixels or the GPano pose |
+| Leveling (360 only) | `_image_angles`, `_median_vector_angles`, `max360_level_filter`, `gpano_pose` | Derive a windowed-median roll/pitch and apply it to the sphere pixels or the GPano pose |
 | Metadata | `FrameMetadata`, `build_exiftool_args`, `write_metadata`, `SOFTWARE_TAG` | Build and apply EXIF/XMP tags, including the exporter version |
 | Export | `write_gpx`, `write_geojson`, `write_points_telemetry`, `write_images_telemetry`, `write_manifest` | Serialise GPX/GeoJSON tracks, GeoJSON telemetry and run summaries |
 | Runtime | `build_parser`, `validate`, `process_group`, `main` | CLI, validation, orchestration and exit codes |
@@ -284,7 +284,7 @@ These are tested operating modes, not hard-coded rejections. Any container whose
 | `CORI`, `IORI` | quaternion `[w,x,y,z]` | Camera/image rotation quaternions |
 | `ORIN` | 3 components | Orientation vector |
 
-GoPro stores `GRAV` in `(X, Z, Y)` order: +X right, +Z up, +Y backwards. A level camera reads approximately `[0, 1, 0]`.
+GoPro's `GRAV` behaves as the *down* direction in a `(right, down, forward)` camera frame (verified on deliberately tilted MAX footage): a level camera reads approximately `[0, 1, 0]`, the first component goes negative when the camera's left side dips, and the third goes positive when the lens tilts down. It is a low-passed **apparent** gravity, so in a moving vehicle it also contains the vehicle's own acceleration (turns, braking) — see §6.5.
 
 ### 4.3 Temporal data
 
@@ -392,6 +392,7 @@ An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regard
 | `--magnetic-declination DEGREES` | float | `0.0` | `-180`–`+180` | East-positive declination added to compass/IMU headings to obtain true north. |
 | `--uere METERS` | float | `5.0` | `> 0` | User-equivalent range error used to estimate accuracy as `HDOP × UERE` when no measured accuracy exists. |
 | `--level-horizon {no,rotate,exif}` | enum | `no` | `no`, `rotate`, `exif` | IMU-based horizon leveling for **360 (MAX) videos only**. `no` preserves the source tilt and pose. `rotate` physically remaps the equirectangular sphere so the pixels are level and writes a zero GPano pose. `exif` keeps the pixels untouched and writes the smoothed roll/pitch into `XMP-GPano:PoseRollDegrees`/`PosePitchDegrees` so viewers level the sphere themselves. Classic flat videos (VIRB, HERO, BlackVue) ignore `rotate`/`exif` and log that they export as recorded. |
+| `--level-window SECONDS` | float | `20.0` | `>= 0` | Real-time window over which IMU gravity samples are combined (median) for each leveled image. Vehicle turns and braking swing GoPro's gravity estimate by several degrees, so keep it long for mounted cameras; `0` uses the nearest single sample (handheld footage). |
 | `--imu-heading` | flag | off | on/off | Derive a tilt-compensated compass heading from `MAGN` + `GRAV` instead of GPS course (MAX/HERO). |
 
 ### 5.3 Export and logging
@@ -494,7 +495,7 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 1. `compass_heading` — tilt-compensated IMU/MAGN heading (`heading_source = "compass"`).
 2. `metadata_heading` — camera/container heading (`heading_source = "metadata"`).
 3. `course` or `heading` — recorded course over ground (`heading_source = "gps_course"`).
-4. `gps_course` — computed from neighbouring track positions (`heading_source = "gps_course"`).
+4. `gps_course` — computed from neighbouring track positions (`heading_source = "gps_course"`). Samples with no course of their own (vehicle parked, typically at the start of a recording) take the nearest known course, since a mounted camera keeps facing the same way; such samples carry `gps_course_filled = true`.
 5. `none`.
 
 `--magnetic-declination` is added only to compass headings. `--heading-offset` is added to every resolved heading and then normalised. The EXIF `GPSImgDirection` uses the final true-north value; `GPSTrack` carries course over ground.
@@ -508,7 +509,7 @@ For MAX, the value chooses **where** the correction lives. The tilt is written t
 | Value | Pixels | `XMP-GPano:PoseRollDegrees` / `PosePitchDegrees` | When to use |
 |---|---|---|---|
 | `no` (default) | Untouched — the stitched frame is encoded directly with its source tilt. | `0` / `0` | Source is already level, or you want raw output. No IMU angles are applied; raw `roll_deg`/`pitch_deg` still appear in telemetry. |
-| `rotate` | Two-pass: stitch to a lossless equirectangular PNG, then rotate the sphere with `v360=e:e:roll=-roll:pitch=-pitch`. Yaw is untouched. | `0` / `0` | Output must look level in every viewer, including ones that ignore GPano pose. Costs one extra `v360` pass per frame. |
+| `rotate` | Two-pass: stitch to a lossless equirectangular PNG, then rotate the sphere with `v360=e:e:roll=-roll:pitch=+pitch`. Yaw is untouched. | `0` / `0` | Output must look level in every viewer, including ones that ignore GPano pose. Costs one extra `v360` pass per frame. |
 | `exif` | Untouched — the stitched frame is encoded directly, exactly like `no`. | smoothed roll / smoothed pitch, converted to the Photo Sphere convention | Fastest leveled option; keeps the original pixels for later reprocessing; relies on the viewer (Mapillary, Panoramax, Google Photo Sphere) applying the pose. |
 
 | Camera | Behaviour |
@@ -521,15 +522,19 @@ For MAX, the value chooses **where** the correction lives. The tilt is written t
 **Angle convention**
 
 - Camera roll: positive = clockwise / right side down. Camera pitch: positive = camera tilted down.
-- `rotate` mode: `v360` uses the inverse screen rotation, so MAX applies `roll=-roll_deg` and `pitch=-pitch_deg`.
-- `exif` mode (`gpano_pose()`): the Photo Sphere spec defines `PoseRollDegrees` so that increasing roll turns the horizon counter-clockwise in the image, which is exactly what a clockwise camera roll does, so `PoseRollDegrees = roll_deg`. `PosePitchDegrees` is the elevation of the image centre *above* the horizon, so `PosePitchDegrees = -pitch_deg`. Values are clamped to the spec ranges (roll in `(-180, 180]`, pitch in `[-90, 90]`).
+- Both angles are independent `atan2` angles of the gravity vector: `roll = atan2(right, down)`, `pitch = atan2(forward, down)`.
+- `rotate` mode: `v360`'s signs were established empirically on deliberately tilted MAX footage. `roll=+R` turns the picture clockwise, so a clockwise camera roll is undone with `roll=-roll_deg`; `pitch=+P` makes the view look *up* (content moves down), which is what levels a camera tilted down, so `pitch=+pitch_deg` is passed through unchanged.
+- `exif` mode (`gpano_pose()`): the Photo Sphere spec fixes the Euler order `R = R_Z(-heading) · R_X(pitch) · R_Y(roll)` with the sphere centre facing north and Z up. Under that order `PoseRollDegrees` is the same `atan2(right, down)` as ours (positive = camera top leans right = horizon turns counter-clockwise in the image), while `PosePitchDegrees` is the **asin** of the forward component of the up vector — the elevation of the image centre above the horizon — so a camera tilted down gets a negative pose pitch. The exact conversion matters once tilts reach tens of degrees (a 19.3° `atan2` pitch is a 15.1° pose pitch at 39° roll); for the few degrees of a vehicle mount both agree. Values are clamped to the spec ranges (roll in `(-180, 180]`, pitch in `[-90, 90]`).
+- `PoseHeadingDegrees`/`InitialViewHeadingDegrees` are written only when a heading is known; an unknown heading is left absent rather than written as `0` (north).
 
-**Smoothing (`rotate` and `exif`)**
+**Time-windowed median (`--level-window`, `rotate` and `exif`)**
 
-- `_smooth_angles()` computes a centered moving average over up to two exported positions before and after the current one (five images total).
-- Roll is averaged as a circular quantity; pitch uses an arithmetic mean.
-- Images without their own IMU sample are omitted from the average.
-- Raw `roll_deg`/`pitch_deg` remain in telemetry; `level_roll_deg`/`level_pitch_deg` record the applied value and `level_mode` records `rotate` or `exif`.
+`GRAV` is GoPro's low-passed *apparent* gravity. In a vehicle it also contains the vehicle's own acceleration: a 0.8 m/s² turn or braking phase shows up as a 4–9° "tilt" that lasts a few seconds, even though a dashboard-mounted camera has not moved at all. One sample per image is therefore not a usable tilt, and averaging over neighbouring *images* does not help either — in TimeWarp/timelapse footage consecutive images are seconds of real time apart and each catches a different moment of the vehicle's dynamics.
+
+- For every image, all `GRAV` samples within `--level-window SECONDS` of **real (UTC) time** centred on the capture time are combined by a component-wise **median of the unit gravity vectors**; roll/pitch come from the median vector. A rigid mount's true tilt survives the median; turn- and braking-induced swings, which alternate in sign, do not.
+- The window is in real time, not image count, so TimeWarp and normal video behave identically. Default `20` s. Use `--level-window 0` (nearest sample, no smoothing) for handheld footage where the tilt genuinely changes from frame to frame.
+- Raw `roll_deg`/`pitch_deg` (nearest single sample) remain in telemetry; `level_roll_deg`/`level_pitch_deg` record the applied value, `level_mode` records `rotate` or `exif` and `level_window_s` the window used.
+- Capture times are interpolated between GPS samples, so the IMU window is centred on the true frame instant (with ~2 Hz real-time GPS in TimeWarp, reusing the earlier sample's clock was off by up to a whole exported frame).
 - In `rotate` mode, rotations below `0.05°` are skipped to avoid needless resampling.
 - Leveling happens during export. Existing images are skipped unless `--overwrite` is used; switch values with `--overwrite` to regenerate.
 
@@ -935,6 +940,9 @@ python3 v2i.py -i video/2026-10-31-max360-000-horizont -o images/ -d 2 --level-h
 # Leveled MAX, option B: keep the pixels, write roll/pitch into XMP-GPano Pose tags
 python3 v2i.py -i video/2026-10-31-max360-000-horizont -o images/ -d 2 --level-horizon exif
 
+# Handheld footage whose tilt genuinely changes every frame: no time-window median
+python3 v2i.py -i video/2026-10-31-max360-000-horizont-nogps -o images/ --fallback-interval 0.2 --level-horizon rotate --level-window 0
+
 # Dry run and manifest
 python3 v2i.py -i video/ -o images/ -d 7 --dry-run
 python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
@@ -986,6 +994,8 @@ python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
 | `exiftool not found on PATH` | Metadata tool not installed | Install exiftool or pass `--no-exif` |
 | `the FIT file this video references … was not found` | MP4 points at a missing FIT | Place the FIT in the expected folder or pass `--fit` |
 | Images keep the old tilt | Existing files were skipped | Re-run with `--overwrite` |
+| Leveled vehicle images tilt by a few degrees, differently per image (worst in TimeWarp) | GoPro `GRAV` contains the vehicle's own acceleration from turns/braking | Keep `--level-window` at the default or raise it (e.g. `30`); never use `0` for a mounted camera |
+| Leveled handheld images under-correct | The time-window median flattens genuine per-frame tilt | Use `--level-window 0` |
 | `--level-horizon applies to 360 videos only` | `--level-horizon rotate`/`exif` passed for a flat VIRB/HERO/BlackVue video | Expected; flat frames are exported as recorded and the IMU angles stay in telemetry |
 | 360 image looks tilted in a simple viewer after `--level-horizon exif` | The viewer ignores `XMP-GPano:PoseRollDegrees`/`PosePitchDegrees` | Re-run with `--level-horizon rotate --overwrite` |
 | Local filenames are UTC | Camera has no local clock evidence | Pass `--timezone +HH:MM` |
@@ -1011,7 +1021,7 @@ Coverage includes:
 - MAX container-clock timezone detection, including STMP chapter correction.
 - MAX EAC batch command construction and fallback records.
 - Seek-based extraction compared against a decode/select pass.
-- Horizon leveling: `--level-horizon {no,rotate,exif}` parsing, 360-only gating (flat cameras ignore it), neighbour smoothing, MAX sphere rotation with zero pose values (`rotate`), GPano pose conversion with untouched pixels (`exif`), VIRB orientation/sign handling in telemetry.
+- Horizon leveling: `--level-horizon {no,rotate,exif}` parsing, 360-only gating (flat cameras ignore it), real-time windowed median (`--level-window`), MAX sphere rotation with zero pose values (`rotate`), exact GPano pose conversion with untouched pixels (`exif`), VIRB orientation/sign handling in telemetry. Sign conventions were validated visually on `video/2026-10-31-max360-000-horizont-nogps` (camera deliberately rolled to ±40° and pitched down ~10–19°).
 - Detailed GPS/IMU telemetry GeoJSON exporters: FeatureCollection structure, track LineString, IMU samples positioned on the track, null-geometry handling, per-image nearest-sample matching and `--telemetry-export`.
 - EXIF `Software`/`XMP:CreatorTool`/`XMP-GPano:StitchingSoftware` carry `v2i.py v<__version__>`.
 
@@ -1081,10 +1091,10 @@ Speed conversion: knots × `0.514444` = m/s.
 | Pitch | Positive = camera tilted down |
 | Heading / course | Degrees clockwise from true north |
 | Magnetic declination | East-positive |
-| GoPro `GRAV` | `(X, Z, Y)`: +X right, +Z up, +Y backwards |
+| GoPro `GRAV` | Down direction in `(right, down, forward)`; level = `[0, 1, 0]`, left side down → first component negative, lens down → third component positive |
 | VIRB `ACCL` | Raw counts → `(raw − level_shift) / divisor × factor`, then orientation matrix |
-| MAX `v360` leveling (`rotate`) | Inverse rotation: `roll=-roll_deg`, `pitch=-pitch_deg` |
-| MAX GPano pose (`exif`) | `PoseRollDegrees = roll_deg` (clamped to `(-180, 180]`), `PosePitchDegrees = -pitch_deg` (clamped to `[-90, 90]`) |
+| MAX `v360` leveling (`rotate`) | `roll=-roll_deg`, `pitch=+pitch_deg` (empirically verified) |
+| MAX GPano pose (`exif`) | `PoseRollDegrees = roll_deg` (clamped to `(-180, 180]`), `PosePitchDegrees = -asin(forward)` of the unit up vector, i.e. `-pitch_deg` for small tilts (clamped to `[-90, 90]`) |
 | Flat images | Never rotated; `--level-horizon` is ignored for non-360 cameras |
 
 ### 10.5 Selection and naming constants
@@ -1094,6 +1104,7 @@ Speed conversion: knots × `0.514444` = m/s.
 | `DEFAULT_EXTENSIONS` | `.mp4,.mov,.m4v,.360` | Files scanned by default |
 | `SOFTWARE_TAG` | `v2i.py v0.0.3` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
 | `LEVEL_MODES` | `no`, `rotate`, `exif` | Valid `--level-horizon` values (default `no`) |
+| `LEVEL_WINDOW_DEFAULT` | `20.0` | Default `--level-window` in real-time seconds |
 | `EXTRACT_CHUNK_SIZE` | `60` | MAX `no` / `exif` batch size |
 | `MAX360_LEVEL_CHUNK_SIZE` | `8` | MAX `rotate`-leveled batch size |
 | `max360_DEFAULT_WIDTH` | `5376` | Default equirectangular width |
