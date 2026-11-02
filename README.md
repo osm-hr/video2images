@@ -1,6 +1,6 @@
 # video2images (`v2i.py`)
 
-`v2i.py` turns action-camera footage into a distance-spaced, geotagged still-image sequence. It is a single-file, standard-library-only CLI that reads the camera's own telemetry, selects one unique frame per distance target, optionally levels the horizon from the IMU, and writes EXIF/XMP metadata plus GPX, GeoJSON and detailed JSON telemetry.
+`v2i.py` turns action-camera footage into a distance-spaced, geotagged still-image sequence. It is a single-file, standard-library-only CLI that reads the camera's own telemetry, selects one unique frame per distance target, optionally levels 360 photospheres from the IMU (by rotating the pixels or by writing the XMP-GPano pose), and writes EXIF/XMP metadata plus GPX and GeoJSON tracks and detailed GeoJSON telemetry.
 
 No separate per-camera modules, no database, no service dependencies. `ffmpeg`, `ffprobe` and `exiftool` are external tools; `max2sphere` is optional.
 
@@ -35,9 +35,9 @@ No separate per-camera modules, no database, no service dependencies. `ffmpeg`, 
 6. **Builds a time-indexed track**, interpolates positions and measures cumulative travel distance.
 7. **Selects unique frames** at fixed distance intervals, never reusing a frame and never going backwards.
 8. **Extracts stills** with accurate input seek, or stitches MAX 360 hemispheres to equirectangular in bounded batches.
-9. **Optionally levels** the horizon using smoothed IMU roll/pitch from the camera.
-10. **Writes metadata** (EXIF/XMP, GPS, provenance, GPano pose) with `exiftool`.
-11. **Exports tracks and telemetry** as GPX, GeoJSON and two JSON files per sequence.
+9. **Optionally levels** 360 photospheres using smoothed IMU roll/pitch from the camera — either by rotating the sphere pixels or by writing the pose into XMP-GPano tags. Classic flat videos are never rotated.
+10. **Writes metadata** (EXIF/XMP, GPS, provenance, exporter version in `Software`, GPano pose) with `exiftool`.
+11. **Exports tracks and telemetry** as GPX plus three GeoJSON files per sequence (track, raw telemetry points, per-image snapshots).
 12. **Optionally writes a run manifest** covering every exported image and video summary.
 
 ### Design principles
@@ -50,7 +50,7 @@ No separate per-camera modules, no database, no service dependencies. `ffmpeg`, 
 | Camera-authoritative clocks | GPS/FIT/clip clocks are used; the host timezone is never consulted |
 | Deterministic selection | Targets are distance-based; frame indices strictly increase |
 | Idempotent runs | Existing images are skipped unless `--overwrite` is passed |
-| Explicit opt-in | Horizon leveling and keywords are off by default |
+| Explicit opt-in | Horizon leveling (360 only) and keywords are off by default |
 | Bounded resource use | MAX batches, parallel workers, temporary files cleaned up |
 
 ### Non-goals
@@ -102,14 +102,16 @@ plan_shots() ──► select_unique_frames()
       ▼
 FrameChoice[]  ── frame index, PTS, interpolated point, distance, error
       │
-      ├── flat cameras: extract_frames_by_index()  (one accurate seek per frame)
+      ├── flat cameras: extract_frames_by_index()  (one accurate seek per frame, never rotated)
       └── MAX 360: max360_stitch_ffmpeg() / max360_stitch_max2sphere()
-      │
-      │ optional horizon leveling (smoothed IMU roll/pitch)
+                   │ --level-horizon {no,rotate,exif} (smoothed IMU roll/pitch)
+                   ├── no:     pixels and GPano pose untouched (default)
+                   ├── rotate: v360 sphere rotation, GPano pose = 0
+                   └── exif:   pixels untouched, GPano pose = roll/pitch
       ▼
 JPEG/PNG files
       │
-      │ exiftool batch
+      │ exiftool batch  (Software = "v2i.py v0.0.3")
       ▼
 EXIF + XMP + GPano tags
       │
@@ -117,8 +119,8 @@ EXIF + XMP + GPano tags
       ▼
 <sequence>.gpx
 <sequence>.geojson
-<sequence>.telemetry.json
-<sequence>.image-telemetry.json
+<sequence>.telemetry.geojson
+<sequence>.image-telemetry.geojson
       │
       │ --manifest
       ▼
@@ -137,16 +139,16 @@ run manifest JSON
 | Extraction | `extract_frames_by_index`, `_extract_one` | Accurate per-frame seek and parallel ffmpeg workers |
 | MAX 360 | `max360_probe`, `max360_build_eac_filter`, `max360_stitch_*` | EAC layout assembly, v360 reprojection, optional sphere rotation |
 | Telemetry | `parse_gpmf`, `virb_Telemetry`, `blackvue_parse_telemetry` | Decode GPMF, FIT and NMEA samples |
-| Leveling | `_image_angles`, `_smooth_angles`, `max360_level_filter`, `_flat_level_filter` | Derive and apply smoothed roll/pitch |
-| Metadata | `FrameMetadata`, `build_exiftool_args`, `write_metadata` | Build and apply EXIF/XMP tags |
-| Export | `write_gpx`, `write_geojson`, `write_points_telemetry`, `write_images_telemetry`, `write_manifest` | Serialise tracks, telemetry and run summaries |
+| Leveling (360 only) | `_image_angles`, `_smooth_angles`, `max360_level_filter`, `gpano_pose` | Derive smoothed roll/pitch and apply it to the sphere pixels or the GPano pose |
+| Metadata | `FrameMetadata`, `build_exiftool_args`, `write_metadata`, `SOFTWARE_TAG` | Build and apply EXIF/XMP tags, including the exporter version |
+| Export | `write_gpx`, `write_geojson`, `write_points_telemetry`, `write_images_telemetry`, `write_manifest` | Serialise GPX/GeoJSON tracks, GeoJSON telemetry and run summaries |
 | Runtime | `build_parser`, `validate`, `process_group`, `main` | CLI, validation, orchestration and exit codes |
 
 ### 2.3 Execution model
 
 - **Sequential videos, parallel frames.** Videos are processed one at a time. Within a video, `--workers N` runs up to `N` independent ffmpeg extraction jobs.
-- **MAX batch decode.** MAX stitches frames in bounded batches (`EXTRACT_CHUNK_SIZE = 60`; `MAX360_LEVEL_CHUNK_SIZE = 8` when leveling). Each batch decodes the source once; a failed seek batch retries from the start of the file.
-- **Leveled MAX two-pass.** The EAC → equirectangular result is written as a lossless PNG, then each frame is rotated on the sphere with its own `v360` filter and encoded to the requested format. This keeps the sphere remap as the only lossy step.
+- **MAX batch decode.** MAX stitches frames in bounded batches (`EXTRACT_CHUNK_SIZE = 60`; `MAX360_LEVEL_CHUNK_SIZE = 8` when leveling in `rotate` mode). Each batch decodes the source once; a failed seek batch retries from the start of the file.
+- **Leveled MAX two-pass (`--level-horizon rotate`).** The EAC → equirectangular result is written as a lossless PNG, then each frame is rotated on the sphere with its own `v360` filter and encoded to the requested format. This keeps the sphere remap as the only lossy step. With `--level-horizon exif` the second pass is skipped entirely and the pose goes into XMP instead.
 - **Telemetry caching.** VIRB FIT files are parsed once and reused across videos in the same run (`telemetry_cache`).
 - **Failure isolation.** A `Fatal` error fails one video, not the run. `--fail-fast` stops at the first failure.
 
@@ -158,10 +160,10 @@ run manifest JSON
 
 | Class | Camera | Container / media | Video | Telemetry carrier | IMU | 360 | Leveling |
 |---|---|---|---|---|---|---|---|
-| `garmin-virb-ultra-30` | Garmin VIRB Ultra 30 | MP4/MOV, H.264 | Flat 4K/1080 | Sibling `.FIT` in `GMetrix/` or matched by name/time | `ACCL`, `GYRO`, `MAGN` in FIT | No | Flat frame rotation |
-| `gopro-max-360` | GoPro MAX 360 | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Pixel-level sphere rotation |
+| `garmin-virb-ultra-30` | Garmin VIRB Ultra 30 | MP4/MOV, H.264 | Flat 4K/1080 | Sibling `.FIT` in `GMetrix/` or matched by name/time | `ACCL`, `GYRO`, `MAGN` in FIT | No | None (`--level-horizon` ignored) |
+| `gopro-max-360` | GoPro MAX 360 | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation **or** XMP-GPano pose |
 | `blackvue-dr900` | BlackVue DR900 series | MP4, H.264 | Flat dashcam | NMEA sentences in top-level `free` atoms | None | No | None |
-| `gopro-hero` | GoPro HERO (flat) | MP4/MOV, H.264/H.265 | Single flat stream | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | No | Flat frame rotation |
+| `gopro-hero` | GoPro HERO (flat) | MP4/MOV, H.264/H.265 | Single flat stream | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | No | None (`--level-horizon` ignored) |
 
 ### 3.2 Garmin VIRB Ultra 30
 
@@ -173,7 +175,7 @@ run manifest JSON
   4. The only FIT candidate, if exactly one exists.
 - **Segment alignment:** One FIT file may describe several recorded clips. Camera events (`video_start`, `video_split`, `video_end`) define segments. The segment whose local start time is closest to the MP4 creation time wins; duration proximity is the fallback.
 - **Per-video timeline:** Video start is `video_start_fit`; capture time is `video_start_utc + pts`, including real milliseconds. The active telemetry window is `video_start_fit → video_start_fit + duration`.
-- **Camera orientation:** FIT camera-orientation events (0/90/180/270) are applied to the accelerometer vector so exported flat frames are leveled in the stored video's image frame. The accelerometer up/down sign is derived automatically from the camera data.
+- **Camera orientation:** FIT camera-orientation events (0/90/180/270) are applied to the accelerometer vector so the exported `ACCL` telemetry is expressed in the stored video's image frame. The accelerometer up/down sign is derived automatically from the camera data. Frames themselves are never rotated: `--level-horizon` is ignored for this flat camera.
 - **Validated frame rates:** 24 and 30 fps classic recording. Variable-frame-rate sources are handled because selection uses real PTS.
 - **Filename convention:** `VIRB[0-9]+.(mp4|mov)`.
 
@@ -186,7 +188,7 @@ run manifest JSON
 - **Stitching:** The filter cross-blends the overlapping side seams, assembles a 3×2 EAC net, and reprojects with `v360=eac:equirect`. Default output is 5376×2688.
 - **TimeWarp / rate changes:** GPS span and video span are compared. A ratio outside 0.8–1.2 maps real GPS time onto playback time (`scale = video_span / gps_span`), so frame selection and timestamps stay aligned and no frame is emitted twice.
 - **Validated frame rates:** 24 and 30 fps, plus TimeWarp/timelapse recordings that play back at 30 fps.
-- **Leveling:** Pixel-level rotation of the equirectangular sphere from `GRAV` roll/pitch. Yaw is never changed. Pose EXIF angles are written as zero to avoid double correction.
+- **Leveling:** The only camera that honours `--level-horizon`. Roll/pitch come from `GRAV`; yaw is never changed. `--level-horizon no` (default) keeps the source tilt; `--level-horizon rotate` remaps the equirectangular sphere and writes a zero GPano pose; `--level-horizon exif` leaves the pixels untouched and writes the smoothed angles into `XMP-GPano:PoseRollDegrees`/`PosePitchDegrees`. The tilt is never written to both places.
 - **No valid GPS fix:** `--fallback-interval SECONDS` exports an unpositioned time grid while retaining the GPMF IMU, camera clock and TimeWarp scale.
 - **Filename convention:** `GS[0-9A-Z]+.(360|mp4|mov)`; device name usually contains `MAX`.
 
@@ -207,6 +209,7 @@ run manifest JSON
 - **Clock anchoring:** GPS UTC is authoritative. Without GPS, `STMP` is anchored to the container `creation_time`; if no local offset is known, filenames and EXIF use UTC.
 - **Validated frame rates:** 24 and 30 fps classic recording.
 - **No GPS:** `--fallback-interval SECONDS` exports an unpositioned time grid with IMU snapshots when the clock is available.
+- **Leveling:** None. `--level-horizon` is accepted but ignored for this flat camera; IMU roll/pitch still appear in the telemetry exports.
 - **Filename convention:** `(GX|GH|GOPR|GOPRO)[0-9A-Z]*.(mp4|mov)`; device name usually contains `HERO`.
 
 ### 3.6 Detection evidence
@@ -388,16 +391,16 @@ An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regard
 | `--offset DEGREES` | float | none | finite number | Alias for `--heading-offset`. |
 | `--magnetic-declination DEGREES` | float | `0.0` | `-180`–`+180` | East-positive declination added to compass/IMU headings to obtain true north. |
 | `--uere METERS` | float | `5.0` | `> 0` | User-equivalent range error used to estimate accuracy as `HDOP × UERE` when no measured accuracy exists. |
-| `--level-horizon` / `--no-level-horizon` | bool | off | on/off | Enable or disable IMU-based horizon leveling. Off preserves the source tilt. |
+| `--level-horizon {no,rotate,exif}` | enum | `no` | `no`, `rotate`, `exif` | IMU-based horizon leveling for **360 (MAX) videos only**. `no` preserves the source tilt and pose. `rotate` physically remaps the equirectangular sphere so the pixels are level and writes a zero GPano pose. `exif` keeps the pixels untouched and writes the smoothed roll/pitch into `XMP-GPano:PoseRollDegrees`/`PosePitchDegrees` so viewers level the sphere themselves. Classic flat videos (VIRB, HERO, BlackVue) ignore `rotate`/`exif` and log that they export as recorded. |
 | `--imu-heading` | flag | off | on/off | Derive a tilt-compensated compass heading from `MAGN` + `GRAV` instead of GPS course (MAX/HERO). |
 
 ### 5.3 Export and logging
 
 | Option | Type | Default | Valid range / values | Functional description |
 |---|---|---|---|---|
-| `--track-export {both,gpx,geojson,none}` | enum | `both` | `both`, `gpx`, `geojson`, `none` | Select the spatial track files written per sequence. `none` still allows telemetry JSON. |
+| `--track-export {both,gpx,geojson,none}` | enum | `both` | `both`, `gpx`, `geojson`, `none` | Select the spatial track files written per sequence. `none` still allows the detailed telemetry GeoJSON. |
 | `--save-telemetry` | flag | off | on/off | Legacy alias for `--track-export both`. |
-| `--telemetry-export {both,points,images,none}` | enum | `both` | `both`, `points`, `images`, `none` | Write every telemetry point, per-image snapshots, both, or neither. |
+| `--telemetry-export {both,points,images,none}` | enum | `both` | `both`, `points`, `images`, `none` | Write the detailed telemetry as GeoJSON: every GPS/IMU point (`<sequence>.telemetry.geojson`), per-image snapshots (`<sequence>.image-telemetry.geojson`), both, or neither. |
 | `--sidecars` | flag | off | on/off | Legacy: also write `<sequence>.track.jsonl` (one JSON header plus one JSON object per image). |
 | `--no-exif` | flag | off | on/off | Skip the `exiftool` pass entirely. Images still export. |
 | `-v`, `--verbose` | flag | off | on/off | Set log level to `DEBUG`. |
@@ -496,29 +499,39 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 
 `--magnetic-declination` is added only to compass headings. `--heading-offset` is added to every resolved heading and then normalised. The EXIF `GPSImgDirection` uses the final true-north value; `GPSTrack` carries course over ground.
 
-### 6.5 Horizon leveling
+### 6.5 Horizon leveling (360 only)
 
-| Camera | Method |
+`--level-horizon {no,rotate,exif}` is honoured only for 360 photospheres (GoPro MAX). Classic flat videos — VIRB, HERO and BlackVue — accept `rotate`/`exif`, log `--level-horizon applies to 360 videos only`, and export their frames exactly as recorded. Flat frames are never rotated or re-canvassed.
+
+For MAX, the value chooses **where** the correction lives. The tilt is written to exactly one place, never both, so a viewer cannot correct it twice:
+
+| Value | Pixels | `XMP-GPano:PoseRollDegrees` / `PosePitchDegrees` | When to use |
+|---|---|---|---|
+| `no` (default) | Untouched — the stitched frame is encoded directly with its source tilt. | `0` / `0` | Source is already level, or you want raw output. No IMU angles are applied; raw `roll_deg`/`pitch_deg` still appear in telemetry. |
+| `rotate` | Two-pass: stitch to a lossless equirectangular PNG, then rotate the sphere with `v360=e:e:roll=-roll:pitch=-pitch`. Yaw is untouched. | `0` / `0` | Output must look level in every viewer, including ones that ignore GPano pose. Costs one extra `v360` pass per frame. |
+| `exif` | Untouched — the stitched frame is encoded directly, exactly like `no`. | smoothed roll / smoothed pitch, converted to the Photo Sphere convention | Fastest leveled option; keeps the original pixels for later reprocessing; relies on the viewer (Mapillary, Panoramax, Google Photo Sphere) applying the pose. |
+
+| Camera | Behaviour |
 |---|---|
-| MAX 360 | Two-pass: stitch to equirectangular PNG, then rotate the sphere with `v360=e:e:roll=-roll:pitch=-pitch`. Yaw is untouched. EXIF pose roll/pitch stay `0`. |
-| HERO | Rotate the flat frame clockwise by roll using an expanded canvas: `rotate=a=…:ow=rotw(…):oh=roth(…):fillcolor=black`. |
-| VIRB | Calibrate `ACCL` with FIT message 167, apply the orientation matrix, rotate into the stored video frame, then rotate the flat image like HERO. |
-| BlackVue | No IMU; images stay unrotated. |
+| MAX 360 | Leveled per the mode above. |
+| HERO | Flag ignored; IMU roll/pitch still appear in telemetry. |
+| VIRB | Flag ignored; calibrated `ACCL` (FIT message 167 + orientation matrix) still appears in telemetry. |
+| BlackVue | No IMU; flag ignored. |
 
 **Angle convention**
 
-- Positive roll = clockwise / right side down.
-- Positive pitch = camera tilted down.
-- `v360` uses the inverse screen rotation, so MAX applies `roll=-roll_deg` and `pitch=-pitch_deg`.
+- Camera roll: positive = clockwise / right side down. Camera pitch: positive = camera tilted down.
+- `rotate` mode: `v360` uses the inverse screen rotation, so MAX applies `roll=-roll_deg` and `pitch=-pitch_deg`.
+- `exif` mode (`gpano_pose()`): the Photo Sphere spec defines `PoseRollDegrees` so that increasing roll turns the horizon counter-clockwise in the image, which is exactly what a clockwise camera roll does, so `PoseRollDegrees = roll_deg`. `PosePitchDegrees` is the elevation of the image centre *above* the horizon, so `PosePitchDegrees = -pitch_deg`. Values are clamped to the spec ranges (roll in `(-180, 180]`, pitch in `[-90, 90]`).
 
-**Smoothing**
+**Smoothing (`rotate` and `exif`)**
 
 - `_smooth_angles()` computes a centered moving average over up to two exported positions before and after the current one (five images total).
 - Roll is averaged as a circular quantity; pitch uses an arithmetic mean.
 - Images without their own IMU sample are omitted from the average.
-- Raw `roll_deg`/`pitch_deg` remain in telemetry; `level_roll_deg`/`level_pitch_deg` record the applied value.
-- Rotations below `0.05°` are skipped to avoid needless resampling.
-- Leveling happens during export. Existing images are skipped unless `--overwrite` is used.
+- Raw `roll_deg`/`pitch_deg` remain in telemetry; `level_roll_deg`/`level_pitch_deg` record the applied value and `level_mode` records `rotate` or `exif`.
+- In `rotate` mode, rotations below `0.05°` are skipped to avoid needless resampling.
+- Leveling happens during export. Existing images are skipped unless `--overwrite` is used; switch values with `--overwrite` to regenerate.
 
 ### 6.6 MAX 360 stitching pipeline
 
@@ -531,8 +544,8 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 3. Process selected frames in batches:
    - Seek to the first PTS of each batch when the timeline allows it.
    - Retry the batch from the start of the file if the seek produces a bad result.
-4. Without leveling, encode directly to the target format.
-5. With leveling, write lossless PNG intermediates and run one `v360=e:e` sphere rotation per frame, then encode.
+4. With `--level-horizon no` or `exif`, encode directly to the target format (with `exif` the smoothed roll/pitch are written to the XMP-GPano pose tags in the exiftool pass instead).
+5. With `--level-horizon rotate`, write lossless PNG intermediates and run one `v360=e:e` sphere rotation per frame, then encode.
 6. `--workers` parallelises the per-frame sphere rotations.
 7. `max2sphere` shares the same two-pass leveled path after it produces the equirectangular video.
 
@@ -545,10 +558,11 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 - `OffsetTimeOriginal`/`OffsetTime` are written only when the offset is known.
 - All GPS date/time tags are UTC.
 - `GPSHPositioningError` is written when an accuracy exists.
+- **Exporter version:** EXIF `Software`, `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.3`. The EXIF `Software` tag names the program that generated the still, which is this script; the camera firmware is kept in the provenance string as `firmware=…`.
 - Provenance goes to `ImageDescription`, `UserComment`, `XPComment` and `XMP:Description`; it never goes to keywords.
 - `Keywords`/`XMP:Subject` are written only when `--keywords` is passed.
 - GPano/XMP-GPano tags are written only for MAX panoramic images.
-- `PoseRollDegrees`/`PosePitchDegrees` are always `0`; the pixels are either already leveled or deliberately untouched.
+- `PoseRollDegrees`/`PosePitchDegrees` are `0` unless `--level-horizon exif` is used, in which case they carry the smoothed camera tilt (see §6.5). The tilt is never present in both the pixels and the pose.
 
 ---
 
@@ -563,9 +577,9 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
         ├── YYYY-MM-DD_HH-MM-SS-mmm.jpg
         ├── YYYY-MM-DD_HH-MM-SS-mmm.png
         ├── <sequence>.gpx
-        ├── <sequence>.geojson
-        ├── <sequence>.telemetry.json
-        ├── <sequence>.image-telemetry.json
+        ├── <sequence>.geojson                 # positions only (track + image points)
+        ├── <sequence>.telemetry.geojson       # every GPS and IMU sample
+        ├── <sequence>.image-telemetry.geojson # per-image GPS/IMU snapshot
         ├── <sequence>.track.jsonl        # only with --sidecars
         └── <sequence>.filter[.NN]        # only with --keep-filter
 ```
@@ -582,11 +596,11 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 | Format | File | When written | Content |
 |---|---|---|---|
 | JPEG / PNG | `*.jpg`, `*.png` | Always (subject to skip/overwrite) | Geotagged still image |
-| EXIF/XMP | Inside image | Unless `--no-exif` or exiftool missing | Camera, GPS, time, provenance, GPano |
+| EXIF/XMP | Inside image | Unless `--no-exif` or exiftool missing | Camera, GPS, time, provenance, `Software = v2i.py v<version>`, GPano |
 | GPX 1.1 | `<sequence>.gpx` | `--track-export both\|gpx` | Track points with UTC time, elevation, speed/course extensions |
 | GeoJSON RFC 7946 | `<sequence>.geojson` | `--track-export both\|geojson` | LineString track plus one Point feature per image |
-| Points telemetry | `<sequence>.telemetry.json` | `--telemetry-export both\|points` | Every GPS and IMU sample |
-| Image telemetry | `<sequence>.image-telemetry.json` | `--telemetry-export both\|images` | Per-image GPS/IMU snapshots |
+| Points telemetry (GeoJSON) | `<sequence>.telemetry.geojson` | `--telemetry-export both\|points` | FeatureCollection: GPS LineString, one Point per GPS sample, one feature per IMU sample positioned on the track |
+| Image telemetry (GeoJSON) | `<sequence>.image-telemetry.geojson` | `--telemetry-export both\|images` | FeatureCollection: one Point feature per image with GPS/IMU snapshot properties |
 | Run manifest | `--manifest FILE` | `--manifest` and not `--dry-run` | Every exported entry and video summary |
 | Legacy sidecar | `<sequence>.track.jsonl` | `--sidecars` | JSON-lines header plus one record per image |
 
@@ -670,82 +684,84 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 
 A one-point track is emitted as a `Point` feature. An empty track emits no geometry feature but still emits image features when positions exist.
 
-### 7.5 Points telemetry schema
+### 7.5 Points telemetry GeoJSON schema
+
+`<sequence>.telemetry.geojson` is an RFC 7946 `FeatureCollection`. Run metadata is carried as top-level foreign members (allowed by RFC 7946 §6.1), so standard GIS tools load the file as-is while the summary stays available.
+
+- **GPS stream:** one `LineString` feature (`kind = "track"`, only when ≥ 2 positions exist) followed by one `Point` feature per raw GPS sample (`kind = "sample"`).
+- **IMU streams** (`ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI`, `ORIN`): one feature per sample. Each sample is placed on the GPS track by interpolating the position at its `t_s` (`position_source = "interpolated"`). Samples that fall outside the GPS time span, or sequences without a GPS track (fallback export), are written as **unlocated** features with `"geometry": null`, which the RFC permits.
+- **`streams`** summarises each stream: `unit`, `components`, `point_count` and, for IMU, `located_point_count`.
 
 ```json
 {
+  "type": "FeatureCollection",
   "generator": "v2i.py",
+  "generator_version": "0.0.3",
   "camera": "gopro-max-360",
   "camera_label": "GoPro MAX 360",
   "video": "GS013338.360",
   "sequence": "GS013338",
   "video_start_utc": "2026-10-31T10:13:24.821Z",
   "streams": {
-    "gps": {
-      "point_count": 1,
-      "points": [
-        {
-          "lat": 46.12345678,
-          "lon": 16.12345678,
-          "alt": 123.45,
-          "speed": 5.2,
-          "speed2d": 5.2,
-          "speed3d": 5.3,
-          "fix": 3,
-          "hdop": 0.5,
-          "vdop": 0.7,
-          "pdop": null,
-          "dop": 0.5,
-          "utc": "2026-10-31T10:13:24.821Z",
-          "stmp_us": 1234567,
-          "t_s": 0.0
-        }
-      ]
+    "gps":  {"point_count": 2, "track_point_count": 2},
+    "GRAV": {"unit": "g", "components": ["x", "y", "z"], "point_count": 1, "located_point_count": 1},
+    "ACCL": {"unit": "m/s^2", "components": ["x", "y", "z"], "point_count": 1, "located_point_count": 0}
+  },
+  "distance_interval_m": 5.0,
+  "time_base": "local",
+  "feature_count": 5,
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {"type": "LineString", "coordinates": [[16.12345678, 46.12345678, 123.45], [16.12351234, 46.12350123, 123.6]]},
+      "properties": {"stream": "gps", "kind": "track", "name": "GS013338", "point_count": 2}
     },
-    "ACCL": {
-      "unit": "m/s^2",
-      "components": ["x", "y", "z"],
-      "point_count": 1,
-      "points": [
-        {
-          "utc": "2026-10-31T10:13:24.821Z",
-          "t_s": 0.0,
-          "stmp_us": 1234567,
-          "x": 0.12,
-          "y": 9.79,
-          "z": -0.04
-        }
-      ]
+    {
+      "type": "Feature",
+      "geometry": {"type": "Point", "coordinates": [16.12345678, 46.12345678, 123.45]},
+      "properties": {
+        "stream": "gps", "kind": "sample",
+        "t": 0.0, "lat": 46.12345678, "lon": 16.12345678, "alt": 123.45,
+        "speed": 5.2, "speed2d": 5.2, "speed3d": 5.3, "fix": 3,
+        "hdop": 0.5, "vdop": 0.7, "pdop": null, "dop": 0.5,
+        "utc": "2026-10-31T10:13:24.821Z", "stmp_us": 1234567, "t_s": 0.0
+      }
     },
-    "GRAV": {
-      "unit": "g",
-      "components": ["x", "y", "z"],
-      "point_count": 1,
-      "points": [
-        {
-          "utc": "2026-10-31T10:13:24.821Z",
-          "t_s": 0.0,
-          "stmp_us": 1234567,
-          "x": 0.01,
-          "y": 0.02,
-          "z": 0.99,
-          "roll_deg": -1.157,
-          "pitch_deg": 0.579,
-          "angle_source": "GRAV"
-        }
-      ]
+    {
+      "type": "Feature",
+      "geometry": {"type": "Point", "coordinates": [16.12348456, 46.12347901, 123.52]},
+      "properties": {
+        "stream": "GRAV", "kind": "sample", "unit": "g",
+        "utc": "2026-10-31T10:13:25.321Z", "t_s": 0.5, "stmp_us": 1734567,
+        "x": 0.01, "y": 0.02, "z": 0.99,
+        "roll_deg": -1.157, "pitch_deg": 0.579, "angle_source": "GRAV",
+        "position_source": "interpolated"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "stream": "ACCL", "kind": "sample", "unit": "m/s^2",
+        "utc": "2026-10-31T10:13:30.000Z", "t_s": 5.179,
+        "x": 0.12, "y": 9.79, "z": -0.04
+      }
     }
-  }
+  ]
 }
 ```
 
-VIRB files add a `calibration` object keyed by sensor (`ACCL`, `GYRO`, `MAGN`) with `factor`, `divisor`, `level_shift`, `unit`, optional `offset_cal` and optional `orientation_matrix`.
+VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) with `factor`, `divisor`, `level_shift`, `unit`, optional `offset_cal` and optional `orientation_matrix`.
 
-### 7.6 Image telemetry schema
+### 7.6 Image telemetry GeoJSON schema
+
+`<sequence>.image-telemetry.geojson` is a `FeatureCollection` with exactly one `Point` feature per exported image. The feature `properties` hold the image record, the nearest GPS sample (`gps`) and the IMU snapshot nearest to the capture time (`imu`). Unpositioned images (fallback time grid) are written with `"geometry": null`.
 
 ```json
 {
+  "type": "FeatureCollection",
   "generator": "v2i.py",
+  "generator_version": "0.0.3",
   "camera": "gopro-max-360",
   "camera_label": "GoPro MAX 360",
   "video": "GS013338.360",
@@ -754,74 +770,80 @@ VIRB files add a `calibration` object keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
   "image_count": 1,
   "distance_interval_m": 5.0,
   "time_base": "local",
-  "images": [
+  "feature_count": 1,
+  "features": [
     {
-      "sequence": "GS013338",
-      "video": "GS013338.360",
-      "camera": "gopro-max-360",
-      "image": "2026-10-31_12-13-24-821.jpg",
-      "frame_index": 0,
-      "pts_seconds": 0.0,
-      "datetime_local": "2026-10-31T12:13:24.821",
-      "datetime_utc": "2026-10-31T10:13:24.821Z",
-      "utc_offset_s": 7200,
-      "latitude": 46.12345678,
-      "longitude": 16.12345678,
-      "altitude_m": 123.45,
-      "speed_m_s": 5.2,
-      "course_deg": 87.4,
-      "heading_deg": 87.4,
-      "heading_source": "gps_course",
-      "img_direction_deg": 87.4,
-      "accuracy_m": 2.5,
-      "accuracy_estimated": true,
-      "accuracy_source": "hdop*uere",
-      "hdop": 0.5,
-      "vdop": 0.7,
-      "pdop": null,
-      "distance_m": 0.0,
-      "track_distance_m": 0.0,
-      "position_source": "interpolated",
-      "clamped": false,
-      "estimated": true,
-      "gps": {
-        "lat": 46.12345678,
-        "lon": 16.12345678,
-        "utc": "2026-10-31T10:13:24.821Z",
-        "t_s": 0.0
-      },
-      "imu": {
-        "GRAV": {
+      "type": "Feature",
+      "geometry": {"type": "Point", "coordinates": [16.12345678, 46.12345678, 123.45]},
+      "properties": {
+        "sequence": "GS013338",
+        "video": "GS013338.360",
+        "camera": "gopro-max-360",
+        "image": "2026-10-31_12-13-24-821.jpg",
+        "frame_index": 0,
+        "pts_seconds": 0.0,
+        "datetime_local": "2026-10-31T12:13:24.821",
+        "datetime_utc": "2026-10-31T10:13:24.821Z",
+        "utc_offset_s": 7200,
+        "latitude": 46.12345678,
+        "longitude": 16.12345678,
+        "altitude_m": 123.45,
+        "speed_m_s": 5.2,
+        "course_deg": 87.4,
+        "heading_deg": 87.4,
+        "heading_source": "gps_course",
+        "img_direction_deg": 87.4,
+        "accuracy_m": 2.5,
+        "accuracy_estimated": true,
+        "accuracy_source": "hdop*uere",
+        "hdop": 0.5,
+        "vdop": 0.7,
+        "pdop": null,
+        "distance_m": 0.0,
+        "track_distance_m": 0.0,
+        "position_source": "interpolated",
+        "clamped": false,
+        "estimated": true,
+        "gps": {
+          "lat": 46.12345678,
+          "lon": 16.12345678,
           "utc": "2026-10-31T10:13:24.821Z",
-          "t_s": 0.0,
-          "x": 0.01,
-          "y": 0.02,
-          "z": 0.99,
-          "roll_deg": -1.157,
-          "pitch_deg": 0.579,
-          "angle_source": "GRAV",
-          "delta_s": 0.012
+          "t_s": 0.0
         },
-        "ACCL": {
-          "utc": "2026-10-31T10:13:24.821Z",
-          "t_s": 0.0,
-          "x": 0.12,
-          "y": 9.79,
-          "z": -0.04,
-          "delta_s": 0.012
-        }
-      },
-      "roll_deg": -1.157,
-      "pitch_deg": 0.579,
-      "angle_source": "GRAV",
-      "level_roll_deg": -1.2,
-      "level_pitch_deg": 0.6
+        "imu": {
+          "GRAV": {
+            "utc": "2026-10-31T10:13:24.821Z",
+            "t_s": 0.0,
+            "x": 0.01,
+            "y": 0.02,
+            "z": 0.99,
+            "roll_deg": -1.157,
+            "pitch_deg": 0.579,
+            "angle_source": "GRAV",
+            "delta_s": 0.012
+          },
+          "ACCL": {
+            "utc": "2026-10-31T10:13:24.821Z",
+            "t_s": 0.0,
+            "x": 0.12,
+            "y": 9.79,
+            "z": -0.04,
+            "delta_s": 0.012
+          }
+        },
+        "roll_deg": -1.157,
+        "pitch_deg": 0.579,
+        "angle_source": "GRAV",
+        "level_roll_deg": -1.2,
+        "level_pitch_deg": 0.6,
+        "level_mode": "exif"
+      }
     }
   ]
 }
 ```
 
-`level_roll_deg`/`level_pitch_deg` appear only when leveling ran and an angle was applied. IMU snapshots outside a one-second window are `null`. BlackVue uses `"imu": {}` because the hardware has no IMU.
+`level_roll_deg`/`level_pitch_deg`/`level_mode` appear only when leveling ran on a MAX video and an angle was applied; `level_mode` is `rotate` or `exif`. IMU snapshots outside a one-second window are `null`. BlackVue uses `"imu": {}` because the hardware has no IMU.
 
 ### 7.7 Run manifest schema
 
@@ -875,9 +897,9 @@ When `--fallback-interval SECONDS` is active and no usable position exists:
 - Images use the normal `YYYY-MM-DD_HH-MM-SS-mmm.ext` naming.
 - `latitude`, `longitude`, `altitude_m`, `speed_m_s`, `course_deg` and `distance_m` are `null`.
 - `position_source` is `"unpositioned"` and `unpositioned` is `true`.
-- The GPX track is empty.
-- The points telemetry contains an empty GPS stream when the camera has no GPS, plus any available IMU streams.
-- Image telemetry still carries IMU snapshots when the camera clock can anchor them.
+- The GPX track is empty and `<sequence>.geojson` has no geometry feature.
+- `<sequence>.telemetry.geojson` has no GPS features; IMU samples are still exported as unlocated features (`"geometry": null`).
+- `<sequence>.image-telemetry.geojson` features have `"geometry": null` but still carry IMU snapshots when the camera clock can anchor them.
 - MAX retains the GPMF IMU, camera clock and TimeWarp scale.
 - HERO anchors IMU to container `creation_time`; without it, snapshot times are `null`.
 
@@ -903,12 +925,15 @@ python3 v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-dis
 # HERO with no GPS: unpositioned time-lapse
 python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --fallback-interval 30
 
-# Keep the source tilt (default) or level the horizon
+# Keep the source tilt (default, same as --level-horizon no)
+# (flat VIRB/HERO/BlackVue frames always export as recorded)
 python3 v2i.py -i video/ -o images/ -d 7
-python3 v2i.py -i video/ -o images/ -d 7 --level-horizon
 
-# Leveled MAX with parallel sphere rotation
-python3 v2i.py -i video/2026-10-31-max360-000-horizont -o images/ -d 2 --level-horizon --workers 4
+# Leveled MAX, option A: rotate the sphere pixels, parallel v360 passes
+python3 v2i.py -i video/2026-10-31-max360-000-horizont -o images/ -d 2 --level-horizon rotate --workers 4
+
+# Leveled MAX, option B: keep the pixels, write roll/pitch into XMP-GPano Pose tags
+python3 v2i.py -i video/2026-10-31-max360-000-horizont -o images/ -d 2 --level-horizon exif
 
 # Dry run and manifest
 python3 v2i.py -i video/ -o images/ -d 7 --dry-run
@@ -919,7 +944,7 @@ python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
 
 - Without `--overwrite`, an image whose path already exists is skipped and counted in the summary.
 - `--overwrite` rewrites the same path in place; it never creates suffixed duplicates.
-- Run with `--overwrite` after changing leveling options or time base to regenerate existing images.
+- Run with `--overwrite` after changing `--level-horizon` or the time base to regenerate existing images. Switching between `no`, `rotate` and `exif` requires it, because the pose tags and pixels must stay consistent.
 - A `-2`/`-3` suffix is reserved for two frames selected in the same run that share a millisecond.
 
 ### 8.3 Performance tuning
@@ -928,10 +953,10 @@ python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
 |---|---|
 | Faster flat extraction | `--workers N` (one ffmpeg per frame) |
 | Lower CPU | `--workers 1`, `--threads 1` |
-| Faster MAX leveling | `--workers N`; each frame's sphere rotation runs in parallel |
-| Lower temporary disk use | MAX leveling batches at 8 frames; unleveled batches at 60 |
+| Faster MAX leveling | `--level-horizon exif` skips the second `v360` pass entirely; otherwise `--workers N` runs each frame's sphere rotation in parallel |
+| Lower temporary disk use | MAX `rotate` leveling batches at 8 frames; `no` and `exif` batches at 60 |
 | Less ffmpeg memory | `--threads` |
-| Avoid resampling | Leave `--level-horizon` off when the source is already level |
+| Avoid resampling | Keep `--level-horizon no` when the source is already level, or use `--level-horizon exif` |
 | Quick inventory | `--dry-run` still reads telemetry and plans every frame |
 
 ### 8.4 Logging and colours
@@ -961,8 +986,11 @@ python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
 | `exiftool not found on PATH` | Metadata tool not installed | Install exiftool or pass `--no-exif` |
 | `the FIT file this video references … was not found` | MP4 points at a missing FIT | Place the FIT in the expected folder or pass `--fit` |
 | Images keep the old tilt | Existing files were skipped | Re-run with `--overwrite` |
+| `--level-horizon applies to 360 videos only` | `--level-horizon rotate`/`exif` passed for a flat VIRB/HERO/BlackVue video | Expected; flat frames are exported as recorded and the IMU angles stay in telemetry |
+| 360 image looks tilted in a simple viewer after `--level-horizon exif` | The viewer ignores `XMP-GPano:PoseRollDegrees`/`PosePitchDegrees` | Re-run with `--level-horizon rotate --overwrite` |
 | Local filenames are UTC | Camera has no local clock evidence | Pass `--timezone +HH:MM` |
-| MAX leveling is slow | Per-frame `v360` sphere rotation on CPU | Raise `--workers`, reduce output size, or leave leveling off |
+| MAX leveling is slow | Per-frame `v360` sphere rotation on CPU | Use `--level-horizon exif`, raise `--workers`, reduce output size, or use `--level-horizon no` |
+| Looking for `*.telemetry.json` | Telemetry exports switched to GeoJSON | Read `<sequence>.telemetry.geojson` / `<sequence>.image-telemetry.geojson` (RFC 7946 FeatureCollections) |
 
 ---
 
@@ -983,8 +1011,9 @@ Coverage includes:
 - MAX container-clock timezone detection, including STMP chapter correction.
 - MAX EAC batch command construction and fallback records.
 - Seek-based extraction compared against a decode/select pass.
-- Horizon leveling: CLI opt-in, neighbour smoothing, flat rotation filter, MAX sphere rotation and zero pose values, VIRB orientation/sign handling.
-- Detailed GPS/IMU telemetry exporters: stream contents, per-image nearest-sample matching, null/empty handling and `--telemetry-export`.
+- Horizon leveling: `--level-horizon {no,rotate,exif}` parsing, 360-only gating (flat cameras ignore it), neighbour smoothing, MAX sphere rotation with zero pose values (`rotate`), GPano pose conversion with untouched pixels (`exif`), VIRB orientation/sign handling in telemetry.
+- Detailed GPS/IMU telemetry GeoJSON exporters: FeatureCollection structure, track LineString, IMU samples positioned on the track, null-geometry handling, per-image nearest-sample matching and `--telemetry-export`.
+- EXIF `Software`/`XMP:CreatorTool`/`XMP-GPano:StitchingSoftware` carry `v2i.py v<__version__>`.
 
 Representative validation command:
 
@@ -1054,16 +1083,19 @@ Speed conversion: knots × `0.514444` = m/s.
 | Magnetic declination | East-positive |
 | GoPro `GRAV` | `(X, Z, Y)`: +X right, +Z up, +Y backwards |
 | VIRB `ACCL` | Raw counts → `(raw − level_shift) / divisor × factor`, then orientation matrix |
-| MAX `v360` leveling | Inverse rotation: `roll=-roll_deg`, `pitch=-pitch_deg` |
-| Flat image rotation | Clockwise by `roll_deg` with expanded canvas |
+| MAX `v360` leveling (`rotate`) | Inverse rotation: `roll=-roll_deg`, `pitch=-pitch_deg` |
+| MAX GPano pose (`exif`) | `PoseRollDegrees = roll_deg` (clamped to `(-180, 180]`), `PosePitchDegrees = -pitch_deg` (clamped to `[-90, 90]`) |
+| Flat images | Never rotated; `--level-horizon` is ignored for non-360 cameras |
 
 ### 10.5 Selection and naming constants
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `DEFAULT_EXTENSIONS` | `.mp4,.mov,.m4v,.360` | Files scanned by default |
-| `EXTRACT_CHUNK_SIZE` | `60` | MAX unleveled batch size |
-| `MAX360_LEVEL_CHUNK_SIZE` | `8` | MAX leveled batch size |
+| `SOFTWARE_TAG` | `v2i.py v0.0.3` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
+| `LEVEL_MODES` | `no`, `rotate`, `exif` | Valid `--level-horizon` values (default `no`) |
+| `EXTRACT_CHUNK_SIZE` | `60` | MAX `no` / `exif` batch size |
+| `MAX360_LEVEL_CHUNK_SIZE` | `8` | MAX `rotate`-leveled batch size |
 | `max360_DEFAULT_WIDTH` | `5376` | Default equirectangular width |
 | `max360_DEFAULT_HEIGHT` | `2688` | Default equirectangular height |
 | `virb_DEFAULT_FIT_DIR` | `gmetrix` | Default FIT folder name |
@@ -1087,5 +1119,5 @@ Speed conversion: knots × `0.514444` = m/s.
 
 | Version | Highlight |
 |---|---|
-| `0.0.3` | Unified single-file pipelines, per-camera telemetry, smoothed opt-in leveling, MAX sphere rotation, timezone detection, universal unpositioned fallback |
+| `0.0.3` | Unified single-file pipelines, per-camera telemetry, timezone detection, universal unpositioned fallback. Horizon leveling restricted to 360 (MAX) videos via `--level-horizon {no,rotate,exif}`; telemetry exports switched from `*.json` to RFC 7946 `*.geojson`; exporter version written to EXIF `Software` |
 | Earlier | Per-camera scripts and modules, merged into `v2i.py` |

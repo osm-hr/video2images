@@ -57,6 +57,16 @@ class Fatal(Exception):
 
 __version__ = "0.0.3"
 
+# Written to EXIF ``Software``, ``XMP:CreatorTool`` and the GPano
+# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.3``.
+SOFTWARE_TAG = "%s v%s" % (SCRIPT_NAME, __version__)
+
+# ``--level-horizon`` values: how 360 (MAX) imagery is leveled, if at all.
+LEVEL_NONE = "no"                # default: pixels and pose untouched
+LEVEL_MODE_ROTATE = "rotate"     # remap the pixels on the sphere
+LEVEL_MODE_EXIF = "exif"         # leave pixels alone, write XMP-GPano pose
+LEVEL_MODES = (LEVEL_NONE, LEVEL_MODE_ROTATE, LEVEL_MODE_EXIF)
+
 FFPROBE = os.environ.get("V2I_FFPROBE", "ffprobe")
 FFMPEG = os.environ.get("V2I_FFMPEG", "ffmpeg")
 
@@ -567,12 +577,16 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
     parser.add_argument("--keywords", default=None, metavar="LIST",
                         help="opt-in keywords to write to Keywords/XMP:Subject, "
                              "semicolon- or comma-separated")
-    parser.add_argument("--level-horizon", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="level images from the camera's own IMU roll/pitch "
-                             "(off by default); MAX rotates the equirectangular "
-                             "sphere, flat frames are rotated, and nearby "
-                             "positions are averaged to avoid jitter")
+    parser.add_argument("--level-horizon", choices=LEVEL_MODES,
+                        default=LEVEL_NONE,
+                        help="level 360 (MAX) photospheres from the camera's "
+                             "own IMU roll/pitch, averaged over nearby "
+                             "positions to avoid jitter: 'no' leaves the "
+                             "source tilt (default); 'rotate' physically "
+                             "remaps the equirectangular sphere so the pixels "
+                             "are level; 'exif' keeps the pixels untouched and "
+                             "writes the roll/pitch into the XMP-GPano Pose "
+                             "tags instead; ignored for classic flat videos")
     parser.add_argument("--track-export", choices=("both", "gpx", "geojson", "none"),
                         default="both",
                         help="write a GPX/GeoJSON track per sequence (default both)")
@@ -582,9 +596,9 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
     parser.add_argument("--telemetry-export",
                         choices=("both", "points", "images", "none"),
                         default="both",
-                        help="write detailed telemetry JSON next to each "
-                             "sequence: every raw point (points), per-image "
-                             "snapshots (images) or both (default)")
+                        help="write detailed telemetry GeoJSON next to each "
+                             "sequence: every raw GPS/IMU point (points), "
+                             "per-image snapshots (images) or both (default)")
     parser.add_argument("--overwrite", action="store_true",
                         help="overwrite existing images instead of keeping them")
     parser.add_argument("--dry-run", action="store_true",
@@ -1624,27 +1638,29 @@ def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
                interp))
 
 
+def gpano_pose(roll_deg: float, pitch_deg: float) -> Tuple[float, float]:
+    """Convert camera roll/pitch to XMP-GPano ``PoseRollDegrees``/``PosePitchDegrees``.
 
-def _flat_level_filter(roll_deg: float) -> str:
-    """Rotate a flat frame clockwise by ``roll_deg`` to level the horizon.
-
-    The canvas is expanded so no corner content is cropped; the new corners
-    are filled with black.
-
-    ``rotw``/``roth`` take the *angle* as their argument.  Passing ``iw`` or
-    ``ih`` there (as an earlier version did) silently treats the pixel size as
-    radians and produces a wildly oversized canvas, so the angle expression is
-    repeated in all three places.
+    The camera convention used throughout this file is positive roll =
+    clockwise (right side down) and positive pitch = camera tilted down.  The
+    Photo Sphere spec defines ``PoseRollDegrees`` so that increasing roll
+    rotates the horizon counter-clockwise in the image -- which is what a
+    clockwise camera roll does -- so roll passes through unchanged.
+    ``PosePitchDegrees`` is the elevation of the image centre *above* the
+    horizon, so a camera tilted down is a negative pose pitch.  Values are
+    clamped to the ranges the spec allows (roll in (-180, 180], pitch in
+    [-90, 90]).
     """
-    angle = "%.6f*PI/180" % float(roll_deg)
-    return ("rotate=a=%s:ow=rotw(%s):oh=roth(%s):"
-            "fillcolor=black" % (angle, angle, angle))
+    roll = (float(roll_deg) + 180.0) % 360.0 - 180.0
+    if roll == -180.0:
+        roll = 180.0
+    pitch = max(-90.0, min(90.0, -float(pitch_deg)))
+    return round(roll, 3), round(pitch, 3)
 
 
 def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
                  *, image_format: str, quality: int, threads: int,
-                 stream_ordinal: int, level_roll: Optional[float] = None
-                 ) -> Optional[str]:
+                 stream_ordinal: int) -> Optional[str]:
     """Extract one frame with an accurate input seek; return its path."""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
            "-ss", "%.6f" % max(0.0, seek_time)]
@@ -1653,8 +1669,6 @@ def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
     cmd += ["-i", video,
             "-map", "0:v:%d" % stream_ordinal,
             "-frames:v", "1"]
-    if level_roll is not None and abs(level_roll) >= 0.05:
-        cmd += ["-vf", _flat_level_filter(level_roll)]
     cmd += ffmpeg_quality_args(image_format, quality)
     cmd.append(pattern)
     try:
@@ -1676,16 +1690,15 @@ def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
 def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
                             image_format: str, quality: int, workers: int = 1,
                             threads: int = 0, stream_ordinal: int = 0,
-                            timeline: Optional[FrameTimeline] = None,
-                            levels: Optional[Mapping[int, Optional[float]]] = None
+                            timeline: Optional[FrameTimeline] = None
                             ) -> Dict[int, str]:
     """Extract exact frames, one accurate seek per frame.
 
     Seeking to the frame's real PTS (``timeline.pts``) keeps variable frame
     rate sources correct; a uniform ``index / fps`` grid is only used when no
     usable timeline is available.  ``workers`` independent ffmpeg processes
-    are run at a time.  ``levels`` maps a frame index to the clockwise roll
-    (degrees) used to level its horizon.
+    are run at a time.  Flat frames are written exactly as decoded; horizon
+    leveling only exists for 360 imagery.
     """
     unique = sorted({int(f) for f in frames if int(f) >= 0})
     if not unique:
@@ -1714,11 +1727,9 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
         order, frame_index = item
         pattern = os.path.join(tmp_dir,
                                "f_%06d_%%06d.%s" % (order, image_format))
-        level_roll = None if levels is None else levels.get(frame_index)
         path = _extract_one(video, frame_index, seek_for(frame_index), pattern,
                             image_format=image_format, quality=quality,
-                            threads=threads, stream_ordinal=stream_ordinal,
-                            level_roll=level_roll)
+                            threads=threads, stream_ordinal=stream_ordinal)
         return frame_index, path
 
     items = list(enumerate(unique))
@@ -1740,9 +1751,7 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
 
 def extract_frames(video: str, jobs: Sequence[dict], tmp_dir: str, *,
                    image_format: str, quality: int, workers: int, fps: float,
-                   threads: int = 0,
-                   levels: Optional[Mapping[int, Optional[float]]] = None
-                   ) -> Dict[int, str]:
+                   threads: int = 0) -> Dict[int, str]:
     """Compatibility wrapper: jobs carry ``index`` and ``frame``/``pts``."""
     frames = []
     mapping: Dict[int, int] = {}
@@ -1756,7 +1765,7 @@ def extract_frames(video: str, jobs: Sequence[dict], tmp_dir: str, *,
         mapping[job["index"]] = int(frame)
     extracted = extract_frames_by_index(
         video, frames, tmp_dir, image_format=image_format, quality=quality,
-        workers=workers, threads=threads, levels=levels)
+        workers=workers, threads=threads)
     out: Dict[int, str] = {}
     for job in jobs:
         frame = mapping.get(job["index"])
@@ -1775,7 +1784,7 @@ def write_metadata(pairs: Sequence[Tuple[str, Sequence[str]]], *,
         return
     for start in range(0, len(pairs), batch):
         chunk = pairs[start:start + batch]
-        cmd = ["exiftool", "-q", "-q", "-P"]
+        cmd = [EXIFTOOL, "-q", "-q", "-P"]
         for path, tag_args in chunk:
             cmd.append("-overwrite_original")
             cmd += list(tag_args)
@@ -2048,7 +2057,7 @@ def export_track_files(directory: str, sequence: str, samples: Sequence[dict],
     if telemetry_export in ("both", "points", "images"):
         os.makedirs(directory, exist_ok=True)
     if telemetry_export in ("both", "points"):
-        path = os.path.join(directory, sequence + ".telemetry.json")
+        path = os.path.join(directory, sequence + ".telemetry.geojson")
         write_points_telemetry(
             path, camera=camera, video=video, sequence=sequence,
             gps=samples, imu=imu, video_start_utc=video_start_utc,
@@ -2056,7 +2065,7 @@ def export_track_files(directory: str, sequence: str, samples: Sequence[dict],
             extra=extra)
         written.append(path)
     if telemetry_export in ("both", "images"):
-        path = os.path.join(directory, sequence + ".image-telemetry.json")
+        path = os.path.join(directory, sequence + ".image-telemetry.geojson")
         write_images_telemetry(
             path, camera=camera, video=video, sequence=sequence,
             images=images, imu=imu, video_start_utc=video_start_utc,
@@ -2069,11 +2078,15 @@ def export_track_files(directory: str, sequence: str, samples: Sequence[dict],
 
 
 # ---------------------------------------------------------------------------
-# Detailed telemetry JSON writers
+# Detailed telemetry GeoJSON writers
 # ---------------------------------------------------------------------------
-# GPX/GeoJSON only keep positions.  These two writers also export the raw
-# telemetry: one file with every sampled point (GPS and IMU) and one with the
-# GPS/IMU snapshot nearest to each exported image.
+# The plain ``<sequence>.geojson`` track only keeps positions.  These two
+# writers export the raw telemetry as RFC 7946 FeatureCollections: one file
+# with every sampled point (GPS and IMU) and one with the GPS/IMU snapshot
+# nearest to each exported image.  Every sample becomes a ``Feature`` whose
+# ``properties`` carry the measurement; IMU samples are placed on the GPS
+# track at their timestamp and samples without a usable position are
+# written as unlocated features (``"geometry": null``), which the RFC allows.
 _IMU_COMPONENTS = {
     "ACCL": ["x", "y", "z"],
     "GYRO": ["x", "y", "z"],
@@ -2205,6 +2218,62 @@ def _imu_stream_entry(key: str, rows: Sequence[dict], video_start_utc=None,
     }
 
 
+def _feature(geometry: Optional[dict], properties: dict) -> dict:
+    return {"type": "Feature", "geometry": geometry, "properties": properties}
+
+
+def _point_geometry(sample: dict) -> Optional[dict]:
+    coord = _coordinate(sample)
+    return None if coord is None else {"type": "Point", "coordinates": coord}
+
+
+def _feature_collection(features: List[dict], *, camera: str, video: str,
+                        sequence: str, video_start_utc, head: dict,
+                        extra: Optional[dict] = None) -> dict:
+    """Assemble a FeatureCollection with the run metadata as foreign members."""
+    payload = {
+        "type": "FeatureCollection",
+        "generator": SCRIPT_NAME,
+        "generator_version": __version__,
+        "camera": camera,
+        "camera_label": CAMERA_LABELS.get(camera, camera),
+        "video": video,
+        "sequence": sequence,
+        "video_start_utc": fmt_utc(_as_utc(video_start_utc)),
+    }
+    payload.update(head)
+    if extra:
+        payload.update(extra)
+    payload["feature_count"] = len(features)
+    payload["features"] = features
+    return payload
+
+
+def _track_locator(points: Sequence[dict]) -> Optional[Track]:
+    """A :class:`Track` keyed on ``t_s`` so IMU rows can be placed on it."""
+    timed = []
+    for point in points:
+        if (point.get("t_s") is not None and point.get("lat") is not None
+                and point.get("lon") is not None):
+            timed.append({"t": float(point["t_s"]), "lat": point["lat"],
+                          "lon": point["lon"], "alt": point.get("alt")})
+    if len(timed) < 2:
+        return None
+    return Track(timed)
+
+
+def _locate_on_track(locator: Optional[Track], t_s) -> Optional[dict]:
+    """Point geometry for ``t_s`` while it lies inside the GPS track."""
+    if locator is None or t_s is None:
+        return None
+    if not (locator.times[0] <= float(t_s) <= locator.times[-1]):
+        return None
+    point = locator.at_time(float(t_s))
+    if point is None:
+        return None
+    return _point_geometry(point)
+
+
 def write_points_telemetry(path: str, *, camera: str, video: str,
                            sequence: str, gps: Sequence[dict],
                            imu: Optional[Dict[str, List[dict]]] = None,
@@ -2213,32 +2282,63 @@ def write_points_telemetry(path: str, *, camera: str, video: str,
                            units: Optional[Dict[str, str]] = None,
                            time_scale: float = 1.0,
                            extra: Optional[dict] = None) -> None:
-    """Write every telemetry point (GPS and IMU) for one sequence."""
+    """Write every telemetry point (GPS and IMU) as a GeoJSON FeatureCollection.
+
+    The GPS stream becomes one ``LineString`` track feature followed by one
+    ``Point`` feature per sample.  Each IMU stream contributes one feature
+    per sample, positioned by interpolating the GPS track at the sample time
+    (``position_source = "interpolated"``) or unlocated when the sample lies
+    outside the track or no track exists.  The ``streams`` member summarises
+    units, component names and counts per stream.
+    """
+    features: List[dict] = []
     streams: Dict[str, dict] = {}
-    if gps:
-        streams["gps"] = {
-            "point_count": len(gps),
-            "points": [_clean_telemetry_point(point, video_start_utc,
-                                              time_scale) for point in gps],
-        }
+
+    gps_points = [_clean_telemetry_point(point, video_start_utc, time_scale)
+                  for point in gps]
+    if gps_points:
+        coords = [c for c in (_coordinate(p) for p in gps_points)
+                  if c is not None]
+        streams["gps"] = {"point_count": len(gps_points),
+                          "track_point_count": len(coords)}
+        if len(coords) >= 2:
+            features.append(_feature(
+                {"type": "LineString", "coordinates": coords},
+                {"stream": "gps", "kind": "track", "name": sequence,
+                 "point_count": len(coords)}))
+        for point in gps_points:
+            props = {"stream": "gps", "kind": "sample"}
+            props.update(point)
+            features.append(_feature(_point_geometry(point), props))
+    locator = _track_locator(gps_points)
+
     for key in sorted(imu or {}):
         rows = imu[key]
-        if rows:
-            streams[key] = _imu_stream_entry(
-                key, rows, video_start_utc, units, time_scale)
-    payload = {
-        "generator": SCRIPT_NAME,
-        "camera": camera,
-        "camera_label": CAMERA_LABELS.get(camera, camera),
-        "video": video,
-        "sequence": sequence,
-        "video_start_utc": fmt_utc(_as_utc(video_start_utc)),
-        "streams": streams,
-    }
+        if not rows:
+            continue
+        entry = _imu_stream_entry(key, rows, video_start_utc, units,
+                                  time_scale)
+        samples = entry.pop("points")
+        streams[key] = entry
+        located = 0
+        for sample in samples:
+            props = {"stream": key, "kind": "sample"}
+            if entry.get("unit") is not None:
+                props["unit"] = entry["unit"]
+            props.update(sample)
+            geometry = _locate_on_track(locator, sample.get("t_s"))
+            if geometry is not None:
+                props["position_source"] = "interpolated"
+                located += 1
+            features.append(_feature(geometry, props))
+        entry["located_point_count"] = located
+
+    head: dict = {"streams": streams}
     if calibration:
-        payload["calibration"] = calibration
-    if extra:
-        payload.update(extra)
+        head["calibration"] = calibration
+    payload = _feature_collection(
+        features, camera=camera, video=video, sequence=sequence,
+        video_start_utc=video_start_utc, head=head, extra=extra)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=_json_default,
                   sort_keys=False)
@@ -2269,7 +2369,12 @@ def write_images_telemetry(path: str, *, camera: str, video: str,
                            imu: Optional[Dict[str, List[dict]]] = None,
                            video_start_utc=None, time_scale: float = 1.0,
                            extra: Optional[dict] = None) -> None:
-    """Write the GPS/IMU snapshot nearest to every exported image."""
+    """Write one GeoJSON ``Point`` feature per exported image.
+
+    Each feature's ``properties`` hold the image record plus the GPS sample
+    and the IMU snapshot nearest to its capture time.  Unpositioned images
+    (fallback time grid) are written with ``"geometry": null``.
+    """
     indexes: Dict[str, Tuple[List[dt.datetime], List[dict]]] = {}
     for key, rows in (imu or {}).items():
         timed = []
@@ -2313,20 +2418,12 @@ def write_images_telemetry(path: str, *, camera: str, video: str,
             entry["roll_deg"] = gravity["roll_deg"]
             entry["pitch_deg"] = gravity["pitch_deg"]
             entry["angle_source"] = gravity.get("angle_source")
-        entries.append(entry)
+        entries.append(_feature(_point_geometry(entry), entry))
 
-    payload = {
-        "generator": SCRIPT_NAME,
-        "camera": camera,
-        "camera_label": CAMERA_LABELS.get(camera, camera),
-        "video": video,
-        "sequence": sequence,
-        "video_start_utc": fmt_utc(_as_utc(video_start_utc)),
-        "image_count": len(entries),
-        "images": entries,
-    }
-    if extra:
-        payload.update(extra)
+    payload = _feature_collection(
+        entries, camera=camera, video=video, sequence=sequence,
+        video_start_utc=video_start_utc, head={"image_count": len(entries)},
+        extra=extra)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=_json_default,
                   sort_keys=False)
@@ -3058,7 +3155,7 @@ class FrameMetadata:
 
     make: Optional[str] = None
     model: Optional[str] = None
-    software: Optional[str] = None
+    firmware: Optional[str] = None                   # camera firmware string
     serial: Optional[str] = None
 
     captured_utc: Optional[dt.datetime] = None       # aware UTC
@@ -3088,8 +3185,8 @@ class FrameMetadata:
     image_height: Optional[int] = None
     panorama: bool = False
     pose_heading: Optional[float] = None
-    pose_pitch: float = 0.0
-    pose_roll: float = 0.0
+    pose_pitch: float = 0.0                          # XMP-GPano PosePitchDegrees
+    pose_roll: float = 0.0                           # XMP-GPano PoseRollDegrees
 
     keywords: Optional[Sequence[str]] = None
     extra: dict = field(default_factory=dict)
@@ -3130,6 +3227,8 @@ def provenance(meta: FrameMetadata) -> str:
     ]
     if meta.distance is not None:
         parts.append("distance=%.2fm" % meta.distance)
+    if meta.firmware:
+        parts.append("firmware=%s" % meta.firmware)
     parts.append("heading_source=%s" % meta.heading_source)
     if meta.position_source:
         parts.append("position_source=%s" % meta.position_source)
@@ -3169,13 +3268,14 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
         off = offset_string(meta.utc_offset_s)
         tags += ["-OffsetTimeOriginal=" + off, "-OffsetTime=" + off]
 
-    # --- camera identity -------------------------------------------------
+    # --- camera identity and generating software -------------------------
+    # EXIF ``Software`` names the program that produced *this* image, i.e.
+    # the exporter and its version; the camera firmware stays in provenance.
     if meta.make:
         tags.append("-Make=" + meta.make)
     if meta.model:
         tags.append("-Model=" + meta.model)
-    if meta.software:
-        tags.append("-Software=" + meta.software)
+    tags.append("-Software=" + SOFTWARE_TAG)
     if meta.serial:
         tags += ["-SerialNumber=%s" % meta.serial,
                  "-CameraSerialNumber=%s" % meta.serial]
@@ -3222,7 +3322,7 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
              "-UserComment=" + text,
              "-XPComment=" + text,
              "-XMP:Description=" + text,
-             "-XMP:CreatorTool=" + meta.script_name,
+             "-XMP:CreatorTool=" + SOFTWARE_TAG,
              "-XMP:Title=%s %s" % (meta.video,
                                    local.strftime("%Y-%m-%d %H:%M:%S")
                                    if local else "")]
@@ -3245,14 +3345,20 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
         if heading is None:
             heading = meta.img_direction or 0.0
         first_date = _fmt_local(local) or _fmt_utc(meta.captured_utc)
+        pose_roll = round(
+            (float(meta.pose_roll or 0.0) + 180.0) % 360.0 - 180.0, 3)
+        if pose_roll == -180.0:
+            pose_roll = 180.0
+        pose_pitch = round(
+            max(-90.0, min(90.0, float(meta.pose_pitch or 0.0))), 3)
         tags += [
             "-XMP-GPano:UsePanoramaViewer=True",
             "-XMP-GPano:CaptureSoftware=%s" % (meta.model or ""),
-            "-XMP-GPano:StitchingSoftware=%s" % meta.script_name,
+            "-XMP-GPano:StitchingSoftware=%s" % SOFTWARE_TAG,
             "-XMP-GPano:ProjectionType=equirectangular",
             "-XMP-GPano:PoseHeadingDegrees=%r" % (heading % 360.0),
-            "-XMP-GPano:PosePitchDegrees=%r" % meta.pose_pitch,
-            "-XMP-GPano:PoseRollDegrees=%r" % meta.pose_roll,
+            "-XMP-GPano:PosePitchDegrees=%r" % pose_pitch,
+            "-XMP-GPano:PoseRollDegrees=%r" % pose_roll,
             "-XMP-GPano:InitialViewHeadingDegrees=%r" % (heading % 360.0),
             "-XMP-GPano:InitialViewPitchDegrees=0",
             "-XMP-GPano:InitialViewRollDegrees=0",
@@ -3819,7 +3925,7 @@ def blackvue__metadata_for(record, source, args, camera):
         sequence=record["sequence"], frame_index=record["frame_index"],
         pts=record["pts_seconds"], distance=record.get("distance_m"),
         script_name=SCRIPT_NAME, make=source.get("make"),
-        model=source.get("model"), software=source.get("software"),
+        model=source.get("model"), firmware=source.get("software"),
         serial=source.get("serial"),
         captured_utc=parse_utc_timestamp(record.get("datetime_utc")),
         captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
@@ -3837,7 +3943,6 @@ def blackvue__metadata_for(record, source, args, camera):
         position_source=record.get("position_source"),
         clamped=record.get("clamped"), estimated=record.get("estimated"),
         keywords=parse_keywords(getattr(args, "keywords", None)),
-        extra={"firmware": source.get("firmware")},
     )
 
 
@@ -4719,18 +4824,25 @@ def max360_build_track(path: str, info: max360_VideoInfo,
 # Records
 # ---------------------------------------------------------------------------
 def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
-    # MAX frames are physically rotated on the sphere when leveling is enabled
-    # (and left untouched otherwise), so the GPano pose must stay level:
-    # writing the tilt here as well would correct it twice.  The original
-    # angles remain available in the per-image telemetry.
+    # The GPano pose and the pixels must never both carry the tilt.  With
+    # ``--level-horizon rotate`` the sphere is physically remapped (and left
+    # untouched with ``no``), so the pose stays level.  With ``exif`` the
+    # pixels are untouched and the smoothed roll/pitch go into the pose tags
+    # so viewers can level the sphere themselves.  The raw angles remain
+    # available in the per-image telemetry either way.
     pose_roll = 0.0
     pose_pitch = 0.0
+    if record.get("level_mode") == LEVEL_MODE_EXIF:
+        roll = record.get("level_roll_deg")
+        pitch = record.get("level_pitch_deg")
+        if roll is not None and pitch is not None:
+            pose_roll, pose_pitch = gpano_pose(roll, pitch)
     return FrameMetadata(
         camera=CAMERA_LABELS[CAMERA_MAX], video=record["video"],
         sequence=record["sequence"], frame_index=record["frame_index"],
         pts=record["pts_seconds"], distance=record.get("distance_m"),
         script_name=SCRIPT_NAME, make=info.make, model=info.model,
-        software=info.firmware, serial=info.serial,
+        firmware=info.firmware, serial=info.serial,
         captured_utc=parse_utc_timestamp(record.get("datetime_utc")),
         captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
                         if record.get("datetime_local") else None),
@@ -4895,7 +5007,8 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                    start_utc=fallback_start,
                    time_scale=gpmf.time_scale if gpmf else 1.0)
                for c in choices]
-    if getattr(args, "level_horizon", False):
+    level_mode = getattr(args, "level_horizon", LEVEL_NONE)
+    if level_mode != LEVEL_NONE:
         angles = _image_angles(records, gpmf.imu if gpmf else None)
         smoothed = _smooth_angles(records, angles)
         for record in records:
@@ -4905,8 +5018,12 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
             level = smoothed.get(record["frame_index"])
             if level is not None:
                 record["level_roll_deg"], record["level_pitch_deg"] = level
-        LOG.debug("  horizon: IMU pose for %d/%d image(s), smoothed over "
-                  "neighbouring positions", len(smoothed), len(records))
+                record["level_mode"] = level_mode
+        LOG.info("  horizon: IMU pose for %d/%d image(s), smoothed over "
+                 "neighbouring positions; %s", len(smoothed), len(records),
+                 "sphere pixels will be rotated"
+                 if level_mode == LEVEL_MODE_ROTATE
+                 else "written to XMP-GPano pose tags, pixels untouched")
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         args.output, CAMERA_MAX, sequence, first_time,
@@ -4944,7 +5061,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     backend = max360__resolve_backend(args.stitch_backend)
     LOG.info("  stitching backend: %s", backend)
     levels = None
-    if getattr(args, "level_horizon", False):
+    if level_mode == LEVEL_MODE_ROTATE:
         levels = {}
         for record in to_extract:
             roll = record.get("level_roll_deg")
@@ -5900,7 +6017,7 @@ def virb__metadata_for(record, source, args, camera):
         frame_index=record["frame_index"], pts=record["pts_seconds"],
         distance=record.get("distance_m"), script_name=SCRIPT_NAME,
         make=source.get("make"), model=source.get("model"),
-        software=source.get("software"), serial=source.get("serial"),
+        firmware=source.get("software"), serial=source.get("serial"),
         captured_utc=parse_utc_timestamp(record.get("datetime_utc")),
         captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
                         if record.get("datetime_local") else None),
@@ -6119,21 +6236,9 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
             choice, track, args, video_start_utc, tz_offset, tz_known,
             CAMERA_VIRB, sequence, name))
 
-    levels = {}
-    if args.level_horizon:
-        angles = _image_angles(
-            records, telemetry.imu if telemetry is not None else None)
-        smoothed = _smooth_angles(records, angles)
-        for record in records:
-            angle = angles.get(record["frame_index"])
-            if angle is not None:
-                record["roll_deg"], record["pitch_deg"] = angle
-            level = smoothed.get(record["frame_index"])
-            if level is not None:
-                record["level_roll_deg"], record["level_pitch_deg"] = level
-                levels[record["frame_index"]] = level[0]
-        LOG.debug("  horizon: IMU roll for %d/%d image(s), smoothed over "
-                  "neighbouring positions", len(levels), len(records))
+    if args.level_horizon != LEVEL_NONE:
+        LOG.info("  --level-horizon applies to 360 videos only; flat %s "
+                 "frames are exported as recorded", CAMERA_LABELS[CAMERA_VIRB])
 
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
@@ -6167,8 +6272,7 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
         extracted = extract_frames_by_index(
             video, [r["frame_index"] for r in to_extract], temp_dir,
             image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline,
-            levels=levels)
+            workers=args.workers, threads=args.threads, timeline=timeline)
         for record in to_extract:
             temp_path = extracted.get(record["frame_index"])
             if not temp_path:
@@ -6423,7 +6527,7 @@ def hero__metadata_for(record, info: hero_VideoInfo, args):
         sequence=record["sequence"], frame_index=record["frame_index"],
         pts=record["pts_seconds"], distance=record.get("distance_m"),
         script_name=SCRIPT_NAME, make="GoPro", model=model,
-        software=info.firmware, serial=info.serial,
+        firmware=info.firmware, serial=info.serial,
         captured_utc=parse_utc_timestamp(record.get("datetime_utc")),
         captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
                         if record.get("datetime_local") else None),
@@ -6500,20 +6604,9 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
     records = [hero__record(choice, args, info, tz_offset, tz_known, sequence)
                for choice in choices]
 
-    levels = {}
-    if args.level_horizon:
-        angles = _image_angles(records, gpmf.imu if gpmf else None)
-        smoothed = _smooth_angles(records, angles)
-        for record in records:
-            angle = angles.get(record["frame_index"])
-            if angle is not None:
-                record["roll_deg"], record["pitch_deg"] = angle
-            level = smoothed.get(record["frame_index"])
-            if level is not None:
-                record["level_roll_deg"], record["level_pitch_deg"] = level
-                levels[record["frame_index"]] = level[0]
-        LOG.debug("  horizon: IMU roll for %d/%d image(s), smoothed over "
-                  "neighbouring positions", len(levels), len(records))
+    if args.level_horizon != LEVEL_NONE:
+        LOG.info("  --level-horizon applies to 360 videos only; flat %s "
+                 "frames are exported as recorded", CAMERA_LABELS[CAMERA_HERO])
 
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
@@ -6556,8 +6649,7 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
         extracted = extract_frames_by_index(
             path, [record["frame_index"] for record in to_extract], temp_dir,
             image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline,
-            levels=levels)
+            workers=args.workers, threads=args.threads, timeline=timeline)
         for record in to_extract:
             temp = extracted.get(record["frame_index"])
             if not temp:
