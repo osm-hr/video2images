@@ -401,6 +401,23 @@ def detect_camera(path: str, *, ffprobe: str = FFPROBE) -> Detection:
                      % labels, gpmf_device)
 
 
+DETECT_WORKERS = 8
+
+
+def detect_all(videos: Sequence[str]) -> List[Detection]:
+    """Run :func:`detect_camera` for every video, several at a time.
+
+    Detection is dominated by ffprobe/ffmpeg start-up and I/O, so a small
+    thread pool speeds up large folders.  Results keep the input order.
+    """
+    workers = min(DETECT_WORKERS, os.cpu_count() or 1, len(videos))
+    if workers <= 1:
+        return [detect_camera(video, ffprobe=FFPROBE) for video in videos]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(
+            lambda video: detect_camera(video, ffprobe=FFPROBE), videos))
+
+
 def skip_reason(detection: Detection, expected: str) -> Optional[str]:
     """Human-readable reason to skip *detection*, or ``None`` to process it."""
     if detection.camera == expected:
@@ -435,8 +452,7 @@ def detect_videos(videos: Sequence[str], expected: str, *,
     counts: Dict[Optional[str], int] = {camera: 0 for camera in CAMERA_LABELS}
     counts[None] = 0
     accepted: List[str] = []
-    for video in videos:
-        detection = detect_camera(video)
+    for video, detection in zip(videos, detect_all(videos)):
         counts[detection.camera] = counts.get(detection.camera, 0) + 1
         reason = skip_reason(detection, expected)
         if reason:
@@ -1164,6 +1180,27 @@ class Track(object):
         point["estimated"] = True
         return point
 
+    def position_at_time(self, t):
+        """``{lat, lon, alt}`` at *t*, exactly as :meth:`at_time` gives them.
+
+        A cheap variant for callers that only need the position (frame
+        matching, placing IMU samples): no other key is interpolated.
+        """
+        samples = self.samples
+        if not samples:
+            return None
+        if len(samples) == 1:
+            a = samples[0]
+            return {"lat": a["lat"], "lon": a["lon"], "alt": a.get("alt")}
+        lo, fraction, source = self._locate_time(t)
+        if source != "interpolated":
+            a = samples[0] if source == "clamped-start" else samples[-1]
+            return {"lat": a["lat"], "lon": a["lon"], "alt": a.get("alt")}
+        a, b = samples[lo], samples[lo + 1]
+        return {"lat": a["lat"] + fraction * (b["lat"] - a["lat"]),
+                "lon": a["lon"] + fraction * (b["lon"] - a["lon"]),
+                "alt": _interp_value(a, b, fraction, "alt")}
+
     def distance_at_time(self, t):
         if not self.samples:
             return 0.0
@@ -1562,12 +1599,14 @@ def select_unique_frames(track: Track, timeline: FrameTimeline, interval: float,
         candidates = _candidates_by_time(timeline, target_time, last)
         found = None
         for index in candidates:
-            point = track.at_time(timeline.pts(index))
-            if point is None or point.get("lat") is None:
+            # Only the position is needed to accept or reject a candidate;
+            # the full interpolation is done once for the chosen frame.
+            position = track.position_at_time(timeline.pts(index))
+            if position is None or position.get("lat") is None:
                 continue
-            error = _position_error(shot, point, mode)
+            error = _position_error(shot, position, mode)
             if error is not None and error <= max_position_error + 1e-6:
-                found = (index, point, error)
+                found = (index, track.at_time(timeline.pts(index)), error)
                 break
         if found is None:
             skipped.append({"distance": target_distance,
@@ -1588,6 +1627,21 @@ def select_unique_frames(track: Track, timeline: FrameTimeline, interval: float,
         raise SelectionError("could not select the first frame (index 0) for "
                              "--start-distance 0")
     return choices, skipped
+
+
+def unpositioned_choices(timeline: FrameTimeline, interval: float,
+                         duration: Optional[float],
+                         max_images: Optional[int]) -> List[FrameChoice]:
+    """Time-grid frames without a position (the ``--fallback-interval`` path)."""
+    frames = select_time_grid_frames(
+        timeline, interval, duration=duration, max_images=max_images)
+    out = []
+    for index in frames:
+        pts = timeline.pts(index)
+        out.append(FrameChoice(
+            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
+            point={}, position_error=None, clamped=False, estimated=True))
+    return out
 
 
 def _candidates_by_time(timeline: FrameTimeline, target: float,
@@ -1658,6 +1712,63 @@ EXTRACT_CHUNK_SIZE = 60
 # rotated by a second v360 pass.  Smaller batches bound the temporary disk
 # use (a 5376x2688 RGB PNG is roughly 40 MB).
 MAX360_LEVEL_CHUNK_SIZE = 8
+
+# At most this many MAX stitch batches run at the same time (bounded by
+# --workers).  Every batch decodes two 4K hemisphere streams through a large
+# filter graph, so memory rather than CPU count is the limit.
+MAX360_PARALLEL_BATCHES = 2
+
+
+def make_temp_dir(prefix: str, outputs: Sequence[str] = ()) -> str:
+    """Temporary directory, next to the outputs when possible.
+
+    Keeping temporary frames on the same filesystem as their destination
+    lets :func:`move_file` rename them into place instead of copying.
+    """
+    for output in outputs:
+        parent = os.path.dirname(os.path.abspath(output))
+        try:
+            os.makedirs(parent, exist_ok=True)
+            return tempfile.mkdtemp(prefix=".v2i-" + prefix, dir=parent)
+        except OSError:
+            break
+    return tempfile.mkdtemp(prefix=prefix)
+
+
+def move_file(src: str, dest: str) -> None:
+    """Move *src* to *dest*: a rename when possible, else a copy."""
+    try:
+        os.replace(src, dest)
+    except OSError:
+        shutil.copyfile(src, dest)
+
+
+def place_extracted(extracted: Mapping[int, str], records: Sequence[dict]
+                    ) -> Tuple[List[dict], List[int]]:
+    """Move extracted temporary frames to their record paths.
+
+    Returns ``(written_records, failed_frame_indices)`` and marks every
+    written record with ``written = True``.
+    """
+    written: List[dict] = []
+    failed: List[int] = []
+    placed: Dict[int, str] = {}
+    for record in records:
+        frame = record["frame_index"]
+        temp = extracted.get(frame)
+        if not temp:
+            failed.append(frame)
+            continue
+        os.makedirs(os.path.dirname(record["path"]), exist_ok=True)
+        if frame in placed:
+            # Two records on one frame: the temp file has already moved.
+            shutil.copyfile(placed[frame], record["path"])
+        else:
+            move_file(temp, record["path"])
+            placed[frame] = record["path"]
+        record["written"] = True
+        written.append(record)
+    return written, failed
 
 
 def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
@@ -1743,18 +1854,87 @@ def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
     return output if os.path.exists(output) else None
 
 
+def _extract_run(video: str, run: Sequence[int], seek_time: float,
+                 tmp_dir: str, run_index: int, *, image_format: str,
+                 quality: int, threads: int, stream_ordinal: int
+                 ) -> Dict[int, str]:
+    """Extract several nearby frames with one seek and one sequential decode.
+
+    After the accurate input seek the first decoded frame is ``run[0]``, so
+    the ``select`` expression uses frame numbers relative to it.  Returns an
+    empty dict when ffmpeg fails or does not produce every frame, so the
+    caller can fall back to one seek per frame.
+    """
+    first = run[0]
+    prefix = "r_%05d_" % run_index
+    pattern = os.path.join(tmp_dir, prefix + "%06d." + image_format)
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+           "-ss", "%.6f" % max(0.0, seek_time)]
+    if threads:
+        cmd += ["-threads", str(threads)]
+    cmd += ["-i", video,
+            "-map", "0:v:%d" % stream_ordinal,
+            "-vf", "select='%s'" % select_expression(
+                [frame - first for frame in run]),
+            "-vsync", "0",
+            "-frames:v", str(len(run))]
+    cmd += ffmpeg_quality_args(image_format, quality)
+    cmd.append(pattern)
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOG.debug("frames %d-%d batch extraction failed: %s",
+                  run[0], run[-1], exc)
+        return {}
+    outputs = [pattern % (i + 1) for i in range(len(run))]
+    if proc.returncode != 0 or not all(os.path.exists(p) for p in outputs):
+        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        LOG.debug("frames %d-%d batch extraction failed: %s", run[0], run[-1],
+                  err[-1] if err else "missing output")
+        return {}
+    return dict(zip(run, outputs))
+
+
+# Selected frames closer together than this much video time are decoded in
+# one sequential ffmpeg pass: decoding the frames in between is cheaper than
+# starting a new ffmpeg process and re-decoding from the previous keyframe.
+EXTRACT_RUN_GAP_S = 1.0
+
+
+def _plan_extract_runs(frames: Sequence[int], fps: float,
+                       workers: int) -> List[List[int]]:
+    """Split sorted frame indices into runs worth one sequential decode."""
+    gap = max(1, int(round(EXTRACT_RUN_GAP_S * (fps if fps > 0 else 30.0))))
+    max_len = EXTRACT_CHUNK_SIZE
+    if workers > 1:
+        # Keep enough runs to occupy every worker.
+        max_len = max(1, min(max_len, -(-len(frames) // workers)))
+    runs: List[List[int]] = []
+    for frame in frames:
+        if (runs and frame - runs[-1][-1] <= gap
+                and len(runs[-1]) < max_len):
+            runs[-1].append(frame)
+        else:
+            runs.append([frame])
+    return runs
+
+
 def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
                             image_format: str, quality: int, workers: int = 1,
                             threads: int = 0, stream_ordinal: int = 0,
                             timeline: Optional[FrameTimeline] = None
                             ) -> Dict[int, str]:
-    """Extract exact frames, one accurate seek per frame.
+    """Extract exact frames with accurate seeks.
 
     Seeking to the frame's real PTS (``timeline.pts``) keeps variable frame
     rate sources correct; a uniform ``index / fps`` grid is only used when no
-    usable timeline is available.  ``workers`` independent ffmpeg processes
-    are run at a time.  Flat frames are written exactly as decoded; horizon
-    leveling only exists for 360 imagery.
+    usable timeline is available.  Frames that lie close together are
+    decoded as one run (one seek, one sequential decode, ``select`` by frame
+    number); isolated frames get their own seek.  A run that fails is retried
+    frame by frame.  ``workers`` independent ffmpeg processes are run at a
+    time.  Flat frames are written exactly as decoded; horizon leveling only
+    exists for 360 imagery.
     """
     unique = sorted({int(f) for f in frames if int(f) >= 0})
     if not unique:
@@ -1779,22 +1959,36 @@ def extract_frames_by_index(video: str, frames: Sequence[int], tmp_dir: str, *,
             return float(timeline.pts(frame_index))
         return frame_index / fps if fps > 0 else 0.0
 
-    def run(item: Tuple[int, int]) -> Tuple[int, Optional[str]]:
-        order, frame_index = item
+    def single(frame_index: int, tag: str) -> Tuple[int, Optional[str]]:
         pattern = os.path.join(tmp_dir,
-                               "f_%06d_%%06d.%s" % (order, image_format))
+                               "f_%s_%%06d.%s" % (tag, image_format))
         path = _extract_one(video, frame_index, seek_for(frame_index), pattern,
                             image_format=image_format, quality=quality,
                             threads=threads, stream_ordinal=stream_ordinal)
         return frame_index, path
 
-    items = list(enumerate(unique))
+    def run(item: Tuple[int, List[int]]) -> List[Tuple[int, Optional[str]]]:
+        order, frames_in_run = item
+        if len(frames_in_run) == 1:
+            return [single(frames_in_run[0], "%06d" % order)]
+        got = _extract_run(video, frames_in_run, seek_for(frames_in_run[0]),
+                           tmp_dir, order, image_format=image_format,
+                           quality=quality, threads=threads,
+                           stream_ordinal=stream_ordinal)
+        if got:
+            return [(frame, got[frame]) for frame in frames_in_run]
+        LOG.debug("retrying frames %d-%d with one seek per frame",
+                  frames_in_run[0], frames_in_run[-1])
+        return [single(frame, "%06d_%03d" % (order, i))
+                for i, frame in enumerate(frames_in_run)]
+
+    items = list(enumerate(_plan_extract_runs(unique, fps, workers)))
     extracted: Dict[int, str] = {}
     if workers > 1 and len(items) > 1:
         with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
-            results = list(pool.map(run, items))
+            results = [pair for part in pool.map(run, items) for pair in part]
     else:
-        results = [run(item) for item in items]
+        results = [pair for item in items for pair in run(item)]
 
     for frame_index, path in results:
         if path is not None:
@@ -1833,20 +2027,41 @@ def extract_frames(video: str, jobs: Sequence[dict], tmp_dir: str, *,
 # ---------------------------------------------------------------------------
 # Metadata helpers / exiftool batching
 # ---------------------------------------------------------------------------
+def _exiftool_batches(pairs: Sequence[Tuple[str, Sequence[str]]], batch: int,
+                      max_chars: int) -> Iterator[List[str]]:
+    """Group per-file argument lists into ``-execute``-separated commands."""
+    current: List[str] = []
+    files = 0
+    size = 0
+    for path, tag_args in pairs:
+        group = list(tag_args) + [path]
+        group_size = sum(len(arg) + 1 for arg in group) + len("-execute") + 1
+        if current and (files >= batch or size + group_size > max_chars):
+            yield current
+            current, files, size = [], 0, 0
+        if current:
+            current.append("-execute")
+        current += group
+        files += 1
+        size += group_size
+    if current:
+        yield current
+
+
 def write_metadata(pairs: Sequence[Tuple[str, Sequence[str]]], *,
-                   batch: int = 40) -> None:
-    """Write metadata for ``[(path, exiftool_args), ...]``."""
+                   batch: int = 250, max_chars: int = 100_000) -> None:
+    """Write metadata for ``[(path, exiftool_args), ...]``.
+
+    One exiftool process handles up to *batch* files (bounded by the total
+    command-line length).  ``-common_args`` makes the quiet, preserve-date
+    and overwrite options apply to every ``-execute`` group, not only the
+    first one.
+    """
     if not pairs:
         return
-    for start in range(0, len(pairs), batch):
-        chunk = pairs[start:start + batch]
-        cmd = [EXIFTOOL, "-q", "-q", "-P"]
-        for path, tag_args in chunk:
-            cmd.append("-overwrite_original")
-            cmd += list(tag_args)
-            cmd.append(path)
-            cmd.append("-execute")
-        cmd.append("-execute0")
+    for group_args in _exiftool_batches(pairs, batch, max_chars):
+        cmd = ([EXIFTOOL] + group_args
+               + ["-common_args", "-q", "-q", "-P", "-overwrite_original"])
         try:
             proc = subprocess.run(cmd, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, timeout=300)
@@ -2324,7 +2539,7 @@ def _locate_on_track(locator: Optional[Track], t_s) -> Optional[dict]:
         return None
     if not (locator.times[0] <= float(t_s) <= locator.times[-1]):
         return None
-    point = locator.at_time(float(t_s))
+    point = locator.position_at_time(float(t_s))
     if point is None:
         return None
     return _point_geometry(point)
@@ -2396,8 +2611,9 @@ def write_points_telemetry(path: str, *, camera: str, video: str,
         features, camera=camera, video=video, sequence=sequence,
         video_start_utc=video_start_utc, head=head, extra=extra)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, default=_json_default,
-                  sort_keys=False)
+        # Compact: these files hold one feature per raw GPS/IMU sample.
+        json.dump(payload, fh, default=_json_default, sort_keys=False,
+                  separators=(",", ":"))
         fh.write("\n")
 
 
@@ -2481,8 +2697,9 @@ def write_images_telemetry(path: str, *, camera: str, video: str,
         video_start_utc=video_start_utc, head={"image_count": len(entries)},
         extra=extra)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, default=_json_default,
-                  sort_keys=False)
+        # Compact: these files hold one feature per raw GPS/IMU sample.
+        json.dump(payload, fh, default=_json_default, sort_keys=False,
+                  separators=(",", ":"))
         fh.write("\n")
 
 
@@ -2596,14 +2813,18 @@ def iter_elements(buf: bytes, start: int = 0, end: Optional[int] = None,
         pos = (pos + 3) & ~3
 
 
+@lru_cache(maxsize=1024)
+def _big_endian_struct(fmt: str, count: int) -> struct.Struct:
+    return struct.Struct(">%d%s" % (count, fmt))
+
+
 def decode(buf: bytes, elem: Element) -> Union[List, bytes]:
     """Decode an element payload (numbers as a list, strings as bytes)."""
-    data = buf[elem.offset:elem.end]
     if elem.typ in _BYTES:
-        return b"" if elem.typ == TYPE_COMPRESSED else data
+        return b"" if elem.typ == TYPE_COMPRESSED else buf[elem.offset:elem.end]
     fmt, esz = _NUMERIC[elem.typ]
-    n = elem.length // esz
-    return list(struct.unpack(">" + fmt * n, data[:n * esz]))
+    n = min(elem.length, max(0, len(buf) - elem.offset)) // esz
+    return list(_big_endian_struct(fmt, n).unpack_from(buf, elem.offset))
 
 
 def as_text(buf: bytes, elem: Element) -> str:
@@ -2689,8 +2910,14 @@ class _Block:
         self.keys.setdefault(key, []).extend(values)
 
 
-def _collect_blocks(buf: bytes) -> Dict[str, List[_Block]]:
-    """Group every ``STRM`` block by its ``STNM`` stream name."""
+def _collect_blocks(buf: bytes, device_names: Optional[List[str]] = None
+                    ) -> Dict[str, List[_Block]]:
+    """Group every ``STRM`` block by its ``STNM`` stream name.
+
+    When *device_names* is given, the first non-empty ``DVNM`` (the value
+    :func:`read_device_name` returns) is appended to it, so callers do not
+    need a second pass over the buffer.
+    """
     blocks: Dict[str, List[_Block]] = {}
     current: Optional[_Block] = None
     device: Optional[str] = None
@@ -2702,6 +2929,11 @@ def _collect_blocks(buf: bytes) -> Dict[str, List[_Block]]:
         current = None
 
     for elem in iter_elements(buf):
+        if (device_names is not None and not device_names
+                and elem.key == "DVNM"):
+            text = as_text(buf, elem).strip()
+            if text:
+                device_names.append(text)
         if elem.level == 0 and elem.key == "DEVC":
             flush()
             device = None
@@ -2876,11 +3108,12 @@ def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]],
             if not present:
                 continue
             rows_out = imu.setdefault(key, [])
-            for block in present:
-                values = block.keys[key]
+            for bi, block in enumerate(blocks):
+                values = block.keys.get(key)
+                if not values:
+                    continue
                 rows = _group(values, size)
                 scale = block.scale
-                bi = blocks.index(block)
                 period = _block_period(blocks, bi, max(1, len(rows)))
                 for i, row in enumerate(rows):
                     vals = scaled(row, scale) if scale else list(row)
@@ -2961,11 +3194,22 @@ def _fit_sensor_to_body(values: Sequence[float], calibration: dict
     files already store unit-length values, so the scale is detected instead
     of assumed.
     """
+    return _apply_fit_matrix(_fit_matrix(calibration), values)
+
+
+def _fit_matrix(calibration: dict) -> Optional[List[float]]:
+    """The unit-scaled FIT orientation matrix, or ``None`` when absent."""
     matrix = calibration.get("orientation_matrix")
     if not matrix or len(matrix) < 9:
-        return list(values[:3])
+        return None
     scale = 65535.0 if any(abs(float(value)) > 2.0 for value in matrix) else 1.0
-    m = [float(value) / scale for value in matrix]
+    return [float(value) / scale for value in matrix]
+
+
+def _apply_fit_matrix(m: Optional[List[float]], values: Sequence[float]
+                      ) -> List[float]:
+    if m is None:
+        return list(values[:3])
     x, y, z = values[:3]
     return [
         m[0] * x + m[1] * y + m[2] * z,
@@ -3136,8 +3380,61 @@ def _tilt_compensated_heading(magnetic: Sequence[float],
     nn = (nx * nx + ny * ny + nz * nz) ** 0.5
     if en < 1e-9 or nn < 1e-9:
         return None
-    import math
     return (math.degrees(math.atan2(ex, nx)) + 360.0) % 360.0
+
+
+class _NearestImu:
+    """Sorted index over IMU rows answering :func:`_nearest_imu` queries.
+
+    Same result as :func:`_nearest_imu` (which scans every row per query)
+    but O(log n) per lookup, which matters when every GPS sample of a long
+    recording is matched against 200 Hz IMU streams.
+    """
+
+    def __init__(self, rows: Sequence[dict]):
+        self.rows = rows
+        self.has_stmp = bool(rows) and rows[0].get("stmp_us") is not None
+        self.has_utc = bool(rows) and rows[0].get("utc") is not None
+        self._indexes: Dict[str, Tuple[list, List[int]]] = {}
+
+    def _index(self, name: str):
+        if name not in self._indexes:
+            rows = self.rows
+            if name == "stmp":
+                key = lambda i: rows[i].get("stmp_us") or 0  # noqa: E731
+            else:
+                key = lambda i: rows[i]["utc"]               # noqa: E731
+            # Stable sort: equal keys keep row order, like min() does.
+            order = sorted(range(len(rows)), key=key)
+            self._indexes[name] = ([key(i) for i in order], order)
+        return self._indexes[name]
+
+    def _closest(self, name: str, target, distance):
+        keys, order = self._index(name)
+        pos = bisect.bisect_left(keys, target)
+        best = None
+        for j in (pos - 1, pos):
+            if 0 <= j < len(keys):
+                # First row carrying this key, as min() would return.
+                j = bisect.bisect_left(keys, keys[j])
+                delta = distance(keys[j], target)
+                if best is None or delta < best[0]:
+                    best = (delta, order[j])
+        return best
+
+    def nearest(self, stmp_us: Optional[int], utc: Optional[dt.datetime],
+                max_delta_us: int = 500000) -> Optional[dict]:
+        if stmp_us is not None and self.has_stmp:
+            best = self._closest("stmp", stmp_us, lambda a, b: abs(a - b))
+            if best is not None and best[0] <= max_delta_us:
+                return self.rows[best[1]]
+            return None
+        if utc is not None and self.has_utc:
+            best = self._closest(
+                "utc", utc, lambda a, b: abs((a - b).total_seconds()))
+            if best is not None and best[0] <= max_delta_us / 1e6:
+                return self.rows[best[1]]
+        return None
 
 
 def _attach_compass(gps_samples: List[dict], imu: Dict[str, List[dict]]
@@ -3146,9 +3443,11 @@ def _attach_compass(gps_samples: List[dict], imu: Dict[str, List[dict]]
     gravity = imu.get("GRAV") or imu.get("ACCL") or []
     if not mags or not gravity:
         return
+    mag_index = _NearestImu(mags)
+    grav_index = _NearestImu(gravity)
     for sample in gps_samples:
-        mag = _nearest_imu(mags, sample.get("stmp_us"), sample.get("utc"))
-        grav = _nearest_imu(gravity, sample.get("stmp_us"), sample.get("utc"))
+        mag = mag_index.nearest(sample.get("stmp_us"), sample.get("utc"))
+        grav = grav_index.nearest(sample.get("stmp_us"), sample.get("utc"))
         if mag is None or grav is None:
             continue
         heading = _tilt_compensated_heading(mag["values"], grav["values"])
@@ -3196,8 +3495,9 @@ def parse_gpmf(buf: bytes, *, imu_heading: bool = False) -> GpmfData:
     """Parse a raw gpmd payload into GPS samples and IMU streams."""
     if not buf:
         raise GpmfError("empty GPMF payload")
-    device_name = read_device_name(buf)
-    blocks = _collect_blocks(buf)
+    names: List[str] = []
+    blocks = _collect_blocks(buf, names)
+    device_name = names[0] if names else None
     # Some GoPro files contain unrelated Huffman-compressed streams (for
     # example DISP/DisparityMatrix).  They are irrelevant here; ignore them
     # unless the GPS stream itself is compressed, in which case there is no
@@ -3905,43 +4205,27 @@ def blackvue_parse_video_start_local(path):
 # Video probing
 # ===========================================================================
 
-def blackvue_probe_video(path):
-    """Return fps, frame count, duration, dimensions and codec via ffprobe."""
-    try:
-        proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-print_format", "json",
-             "-show_format", "-show_streams", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        raise Fatal("required program not found: ffprobe")
-    if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise Fatal(tail[-1] if tail else "ffprobe failed")
-    try:
-        data = json.loads(proc.stdout.decode("utf-8", "replace"))
-    except ValueError:
-        raise Fatal("ffprobe returned unreadable output for %s" % path)
+def flat_video_info(path):
+    """fps, frame count, duration, dimensions, codec and creation time.
 
-    video = None
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") == "video":
-            video = stream
-            break
-    if video is None:
+    Built from :func:`probe_metadata`, which camera detection has already
+    run (and cached) for this file, so no extra ffprobe call is needed.
+    """
+    try:
+        meta = probe_metadata(path, FFPROBE)
+    except UnreadableVideo as exc:
+        raise Fatal("%s: %s" % (path, exc))
+    videos = meta.video_streams_info()
+    if not videos:
         raise Fatal("no video stream in %s (not a playable video file)" % path)
-
-    rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/0"
-    try:
-        num, den = rate.split("/")
-        fps = float(num) / float(den) if float(den) else 0.0
-    except (ValueError, ZeroDivisionError):
-        fps = 0.0
+    video = videos[0]
+    fps = _parse_rate(video.get("avg_frame_rate") or video.get("r_frame_rate"))
 
     duration = None
     if video.get("duration"):
         duration = float(video["duration"])
-    elif data.get("format", {}).get("duration"):
-        duration = float(data["format"]["duration"])
+    elif meta.duration:
+        duration = meta.duration
 
     return {
         "fps": fps,
@@ -3950,8 +4234,13 @@ def blackvue_probe_video(path):
         "width": video.get("width"),
         "height": video.get("height"),
         "codec": video.get("codec_name"),
-        "creation_time": data.get("format", {}).get("tags", {}).get("creation_time"),
+        "creation_time": meta.format_tags.get("creation_time"),
     }
+
+
+def blackvue_probe_video(path):
+    """Return fps, frame count, duration, dimensions and codec via ffprobe."""
+    return flat_video_info(path)
 
 
 # ===========================================================================
@@ -4016,16 +4305,7 @@ def blackvue__record_from_choice(choice, args, video_start_utc, video_start_loca
     }
 
 
-def blackvue__unpositioned_choices(timeline, interval, duration, max_images):
-    frames = select_time_grid_frames(
-        timeline, interval, duration=duration, max_images=max_images)
-    out = []
-    for index in frames:
-        pts = timeline.pts(index)
-        out.append(FrameChoice(
-            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
-            point={}, position_error=None, clamped=False, estimated=True))
-    return out
+blackvue__unpositioned_choices = unpositioned_choices
 
 
 def blackvue__metadata_for(record, source, args, camera):
@@ -4204,23 +4484,17 @@ def blackvue_process_video(video, sequence, output_dir, args, have_exiftool):
 
     written_paths = []
     failed_frames = []
-    temp_dir = tempfile.mkdtemp(prefix="blackvue_")
-    try:
-        extracted = extract_frames_by_index(
-            video, [r["frame_index"] for r in to_extract], temp_dir,
-            image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline)
-        for record in to_extract:
-            temp_path = extracted.get(record["frame_index"])
-            if not temp_path:
-                failed_frames.append(record["frame_index"])
-                continue
-            os.makedirs(os.path.dirname(record["path"]), exist_ok=True)
-            shutil.copyfile(temp_path, record["path"])
-            record["written"] = True
-            written_paths.append(record["path"])
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    if to_extract:
+        temp_dir = make_temp_dir("blackvue_", [r["path"] for r in to_extract])
+        try:
+            extracted = extract_frames_by_index(
+                video, [r["frame_index"] for r in to_extract], temp_dir,
+                image_format=args.format, quality=args.quality,
+                workers=args.workers, threads=args.threads, timeline=timeline)
+            written, failed_frames = place_extracted(extracted, to_extract)
+            written_paths = [record["path"] for record in written]
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     if (args.start_distance == 0 and records
             and records[0]["frame_index"] == 0
@@ -4300,20 +4574,7 @@ class max360_VideoInfo:
     serial: Optional[str] = None
 
 
-def max360__parse_rate(rate) -> float:
-    if not rate:
-        return 0.0
-    text = str(rate)
-    if "/" in text:
-        try:
-            num, den = text.split("/", 1)
-            return float(num) / float(den) if float(den) else 0.0
-        except ValueError:
-            return 0.0
-    try:
-        return float(text)
-    except ValueError:
-        return 0.0
+max360__parse_rate = _parse_rate
 
 
 def max360__frame_count(stream: dict, duration: float, fps: float) -> int:
@@ -4640,12 +4901,18 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
         shutil.copyfile(script_path, dest)
 
     # A leveled frame needs a lossless intermediate so the sphere remap is the
-    # only lossy step in the final encode.
-    encode_format = "png" if leveled else image_format
-    ext = "png" if encode_format == "png" else "jpg"
+    # only lossy step in the final encode.  The PNG is stored uncompressed
+    # (zlib level 0): it is a throwaway file, so compressing it is wasted time.
+    # (PNG rather than BMP because it keeps the stream's sample aspect ratio,
+    # which ends up in the final JPEG's JFIF/EXIF resolution tags.)
+    if leveled:
+        ext, pix_fmt, quality_args = "png", "rgb24", ["-compression_level", "0"]
+    else:
+        ext = "png" if image_format == "png" else "jpg"
+        pix_fmt = "rgb24" if image_format == "png" else "yuvj420p"
+        quality_args = ffmpeg_quality_args(image_format, quality)
     prefix = "img_%03d_%s_" % (batch_index, attempt)
     pattern = os.path.join(temp_dir, prefix + "%06d." + ext)
-    pix_fmt = "rgb24" if encode_format == "png" else "yuvj420p"
     cmd = [FFMPEG, "-v", "error", "-y"]
     if seek_time is not None:
         cmd += ["-ss", "%.6f" % seek_time]
@@ -4653,7 +4920,7 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
             "-map", "[OUT]", "-an", "-sn", "-dn", "-vsync", "0",
             "-frames:v", str(len(ordered)),
             "-pix_fmt", pix_fmt]
-    cmd += ffmpeg_quality_args(encode_format, quality)
+    cmd += quality_args
     if threads:
         cmd += ["-threads", str(threads)]
     cmd.append(pattern)
@@ -4679,7 +4946,7 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
                 image_format=image_format, quality=quality, interp=interp,
                 threads=threads)
         else:
-            shutil.copyfile(temp, dest)
+            move_file(temp, dest)
 
     items = list(zip(ordered, temp_files))
     if leveled and workers > 1 and len(items) > 1:
@@ -4715,33 +4982,48 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
     size = MAX360_LEVEL_CHUNK_SIZE if levels else EXTRACT_CHUNK_SIZE
     chunks = [ordered_frames[i:i + size]
               for i in range(0, len(ordered_frames), size)]
-    temp_dir = tempfile.mkdtemp(prefix="max360_")
+    # Batches are independent ffmpeg runs, so several can stitch at once.
+    # Each one decodes two hemisphere streams, so memory bounds the count.
+    parallel = max(1, min(workers, len(chunks), MAX360_PARALLEL_BATCHES))
+    # Per-frame leveling inside a batch only gets the workers left over.
+    inner_workers = max(1, workers // parallel)
+    temp_dir = make_temp_dir("max360_", outputs)
+
+    def do_batch(item: Tuple[int, List[int]]) -> None:
+        batch_index, chunk = item
+        seek_time = None
+        if (timeline is not None and timeline.source == "ffprobe"
+                and len(timeline) and chunk[-1] < len(timeline)):
+            seek_time = float(timeline.pts(chunk[0]))
+        if seek_time is not None:
+            try:
+                max360__stitch_batch(
+                    info, chunk, by_frame, temp_dir, batch_index,
+                    width=width, height=height, quality=quality,
+                    image_format=image_format, interp=interp,
+                    threads=threads, keep_filter=keep_filter,
+                    total_batches=len(chunks), seek_time=seek_time,
+                    levels=levels, workers=inner_workers)
+                return
+            except max360_BackendError as exc:
+                LOG.warning("seek-based stitching failed for frames "
+                            "%d-%d (%s); retrying with a full decode",
+                            chunk[0], chunk[-1], exc)
+        max360__stitch_batch(
+            info, chunk, by_frame, temp_dir, batch_index,
+            width=width, height=height, quality=quality,
+            image_format=image_format, interp=interp, threads=threads,
+            keep_filter=keep_filter, total_batches=len(chunks),
+            seek_time=None, levels=levels, workers=inner_workers)
+
     try:
-        for batch_index, chunk in enumerate(chunks):
-            seek_time = None
-            if (timeline is not None and timeline.source == "ffprobe"
-                    and len(timeline) and chunk[-1] < len(timeline)):
-                seek_time = float(timeline.pts(chunk[0]))
-            if seek_time is not None:
-                try:
-                    max360__stitch_batch(
-                        info, chunk, by_frame, temp_dir, batch_index,
-                        width=width, height=height, quality=quality,
-                        image_format=image_format, interp=interp,
-                        threads=threads, keep_filter=keep_filter,
-                        total_batches=len(chunks), seek_time=seek_time,
-                        levels=levels, workers=workers)
-                    continue
-                except max360_BackendError as exc:
-                    LOG.warning("seek-based stitching failed for frames "
-                                "%d-%d (%s); retrying with a full decode",
-                                chunk[0], chunk[-1], exc)
-            max360__stitch_batch(
-                info, chunk, by_frame, temp_dir, batch_index,
-                width=width, height=height, quality=quality,
-                image_format=image_format, interp=interp, threads=threads,
-                keep_filter=keep_filter, total_batches=len(chunks),
-                seek_time=None, levels=levels, workers=workers)
+        items = list(enumerate(chunks))
+        if parallel > 1:
+            with ThreadPoolExecutor(max_workers=parallel) as pool:
+                list(pool.map(do_batch, items))
+        else:
+            for item in items:
+                do_batch(item)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -4974,17 +5256,7 @@ def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
     )
 
 
-def max360__unpositioned_choices(timeline, interval, duration, max_images):
-    """Frames on a time grid for clips whose GPS has no usable fix."""
-    frames = select_time_grid_frames(
-        timeline, interval, duration=duration, max_images=max_images)
-    out = []
-    for index in frames:
-        pts = timeline.pts(index)
-        out.append(FrameChoice(
-            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
-            point={}, position_error=None, clamped=False, estimated=True))
-    return out
+max360__unpositioned_choices = unpositioned_choices
 
 
 def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
@@ -5400,6 +5672,7 @@ def virb_parse_fit(path):
                 break                       # truncated definition
             local_defs[local] = {
                 "num": num, "endian": endian, "fields": fields,
+                "decoders": virb__field_decoders(fields, endian),
                 "size": sum(f[1] for f in fields + dev_fields),
                 "size_ct": sum(f[1] for f in fields + dev_fields if f[0] != 254),
             }
@@ -5416,27 +5689,51 @@ def virb_parse_fit(path):
     return out
 
 
+@lru_cache(maxsize=4096)
+def _virb_field_decoder(fnum, size, base, endian):
+    kind, fmt, bsize = virb_BASE_TYPES.get(base, ("byte", None, 1))
+    n = size // bsize
+    unpacker = None
+    if fmt is not None:
+        if n * bsize != size:
+            # Malformed field size: fail at decode time like struct.unpack.
+            unpacker = struct.Struct(endian + "%dB" % size)
+            kind = "malformed"
+        else:
+            unpacker = struct.Struct(endian + str(n) + fmt)
+    return (fnum, size, kind, unpacker, n, virb_INVALID.get(kind))
+
+
+def virb__field_decoders(fields, endian):
+    """Precompiled ``(fnum, size, kind, Struct, count, invalid)`` per field."""
+    return tuple(_virb_field_decoder(fnum, size, base, endian)
+                 for fnum, size, base in fields)
+
+
 def virb__read_fields(data, pos, definition, endian, compressed, end):
     p = pos
     out = {}
-    for fnum, size, base in definition["fields"]:
+    decoders = definition.get("decoders")
+    if decoders is None:
+        decoders = virb__field_decoders(definition["fields"], endian)
+    for fnum, size, kind, unpacker, n, bad in decoders:
         if p + size > end:
             break                           # truncated payload
         if compressed and fnum == 254:
             continue                        # time_offset lives in the header
-        kind, fmt, bsize = virb_BASE_TYPES.get(base, ("byte", None, 1))
-        n = size // bsize
-        if fmt is None:
+        if unpacker is None:
             chunk = data[p:p + size]
             p += size
             if kind == "string":
                 out[fnum] = chunk.split(b"\x00")[0].decode("utf-8", "replace")
             else:
                 out[fnum] = chunk
+        elif kind == "malformed":
+            raise struct.error("FIT field %d: size %d is not a multiple of "
+                               "its base type" % (fnum, size))
         else:
-            values = struct.unpack(endian + str(n) + fmt, data[p:p + size])
+            values = unpacker.unpack_from(data, p)
             p += size
-            bad = virb_INVALID.get(kind)
             if bad is not None:
                 values = tuple(None if v == bad else v for v in values)
             out[fnum] = values[0] if n == 1 else values
@@ -5657,18 +5954,23 @@ class virb_Telemetry(object):
             # the stored image is rotated, so choose the sign that puts the
             # image-frame up vector above the horizon for most samples.
             sign = 1.0
+            bodies: List[Tuple[List[float], Optional[float], List[float]]] = []
             if key == "ACCL":
+                # Matrix, orientation and the unsigned up vector are computed
+                # once per sample and reused for the sign vote and the angles.
+                matrix = _fit_matrix(calibration)
                 score = 0.0
                 for row, values in converted:
-                    body = _fit_sensor_to_body(values, calibration)
-                    up = _virb_image_up(
-                        body, self.orientation_at(row["fit_s"]))
+                    body = _apply_fit_matrix(matrix, values)
+                    orientation = self.orientation_at(row["fit_s"])
+                    up = _virb_image_up(body, orientation)
+                    bodies.append((body, orientation, up))
                     score += up[2]
                 if score < 0:
                     sign = -1.0
 
             points = []
-            for row, values in converted:
+            for index, (row, values) in enumerate(converted):
                 point = {
                     "fit_s": row["fit_s"],
                     "utc": self.utc_of(row["fit_s"]),
@@ -5676,10 +5978,11 @@ class virb_Telemetry(object):
                     "values": values,
                 }
                 if key == "ACCL":
-                    body = _fit_sensor_to_body(values, calibration)
-                    up = _virb_image_up(
-                        [sign * component for component in body],
-                        self.orientation_at(row["fit_s"]))
+                    body, orientation, up = bodies[index]
+                    if sign != 1.0:
+                        up = _virb_image_up(
+                            [sign * component for component in body],
+                            orientation)
                     # FIT body Y points forward; the shared helper expects
                     # (right, back, up), so the Y component flips.
                     roll, pitch = _roll_pitch_from_body(
@@ -5740,8 +6043,17 @@ class virb_Telemetry(object):
             return int(round(delta.total_seconds() / 900.0) * 900)
         return None
 
+    def _sorted_events(self):
+        """``camera_events`` sorted, cached until the list changes."""
+        events = getattr(self, "camera_events", ())
+        cache = getattr(self, "_events_cache", None)
+        if cache is None or cache[0] is not events or cache[1] != len(events):
+            cache = (events, len(events), sorted(events))
+            self._events_cache = cache
+        return cache[2]
+
     def camera_orientation(self):
-        for _t, _name, orient in sorted(getattr(self, "camera_events", ())):
+        for _t, _name, orient in self._sorted_events():
             if orient is not None:
                 return orient
         return None
@@ -5753,7 +6065,7 @@ class virb_Telemetry(object):
         at or before the sample applies.  Falls back to the first known value.
         """
         current = self.camera_orientation()
-        for when, name, orient in sorted(getattr(self, "camera_events", ())):
+        for when, name, orient in self._sorted_events():
             if orient is None or when > fit_seconds:
                 continue
             if name in virb_VIDEO_START_EVENTS or name == "video_second_stream_start":
@@ -5874,44 +6186,9 @@ def virb_parse_creation_time(text):
 
 def virb_probe_video(path):
     """Return fps, frame count, duration, dimensions, codec and creation time."""
-    out = virb_run(["ffprobe", "-v", "error", "-print_format", "json",
-               "-show_format", "-show_streams", path])
-    try:
-        data = json.loads(out)
-    except ValueError:
-        raise Fatal("ffprobe returned unreadable output for %s" % path)
-
-    video = None
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") == "video":
-            video = stream
-            break
-    if video is None:
-        raise Fatal("no video stream in %s (not a playable video file)" % path)
-
-    rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/0"
-    try:
-        num, den = rate.split("/")
-        fps = float(num) / float(den) if float(den) else 0.0
-    except (ValueError, ZeroDivisionError):
-        fps = 0.0
-
-    duration = None
-    if video.get("duration"):
-        duration = float(video["duration"])
-    elif data.get("format", {}).get("duration"):
-        duration = float(data["format"]["duration"])
-
-    return {
-        "fps": fps,
-        "frames": int(video.get("nb_frames") or 0),
-        "duration": duration,
-        "width": video.get("width"),
-        "height": video.get("height"),
-        "codec": video.get("codec_name"),
-        "creation_time": data.get("format", {}).get("tags", {}).get("creation_time"),
-        "size": os.path.getsize(path),
-    }
+    info = flat_video_info(path)
+    info["size"] = os.path.getsize(path)
+    return info
 
 
 # ===========================================================================
@@ -6087,16 +6364,7 @@ def virb__record_from_choice(choice, track, args, video_start_utc, tz_offset,
     }
 
 
-def virb__unpositioned_choices(timeline, interval, duration, max_images):
-    frames = select_time_grid_frames(
-        timeline, interval, duration=duration, max_images=max_images)
-    out = []
-    for index in frames:
-        pts = timeline.pts(index)
-        out.append(FrameChoice(
-            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
-            point={}, position_error=None, clamped=False, estimated=True))
-    return out
+virb__unpositioned_choices = unpositioned_choices
 
 
 def virb__write_sidecar(path, sequence, video_name, records, source, args):
@@ -6380,23 +6648,17 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
 
     written_paths = []
     failed_frames = []
-    temp_dir = tempfile.mkdtemp(prefix="virb30_")
-    try:
-        extracted = extract_frames_by_index(
-            video, [r["frame_index"] for r in to_extract], temp_dir,
-            image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline)
-        for record in to_extract:
-            temp_path = extracted.get(record["frame_index"])
-            if not temp_path:
-                failed_frames.append(record["frame_index"])
-                continue
-            os.makedirs(os.path.dirname(record["path"]), exist_ok=True)
-            shutil.copyfile(temp_path, record["path"])
-            record["written"] = True
-            written_paths.append(record["path"])
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    if to_extract:
+        temp_dir = make_temp_dir("virb30_", [r["path"] for r in to_extract])
+        try:
+            extracted = extract_frames_by_index(
+                video, [r["frame_index"] for r in to_extract], temp_dir,
+                image_format=args.format, quality=args.quality,
+                workers=args.workers, threads=args.threads, timeline=timeline)
+            written, failed_frames = place_extracted(extracted, to_extract)
+            written_paths = [record["path"] for record in written]
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     if (args.start_distance == 0 and records
             and records[0]["frame_index"] == 0
@@ -6471,20 +6733,7 @@ class hero_VideoInfo:
     serial: Optional[str] = None
 
 
-def hero__parse_rate(rate) -> float:
-    if not rate:
-        return 0.0
-    text = str(rate)
-    if "/" in text:
-        try:
-            num, den = text.split("/", 1)
-            return float(num) / float(den) if float(den) else 0.0
-        except ValueError:
-            return 0.0
-    try:
-        return float(text)
-    except ValueError:
-        return 0.0
+hero__parse_rate = _parse_rate
 
 
 def hero_probe(path: str) -> hero_VideoInfo:
@@ -6564,16 +6813,7 @@ def hero_build_track(info: hero_VideoInfo, args):
     return track, data
 
 
-def hero__unpositioned_choices(timeline, interval, duration, max_images):
-    frames = select_time_grid_frames(
-        timeline, interval, duration=duration, max_images=max_images)
-    out = []
-    for index in frames:
-        pts = timeline.pts(index)
-        out.append(FrameChoice(
-            target_distance=pts, target_time=pts, frame_index=index, pts=pts,
-            point={}, position_error=None, clamped=False, estimated=True))
-    return out
+hero__unpositioned_choices = unpositioned_choices
 
 
 def hero__record(choice, args, info: hero_VideoInfo, tz_offset: int, tz_known: bool,
@@ -6757,23 +6997,16 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 
     written = []
     failed_frames = []
-    temp_dir = tempfile.mkdtemp(prefix="hero_")
-    try:
-        extracted = extract_frames_by_index(
-            path, [record["frame_index"] for record in to_extract], temp_dir,
-            image_format=args.format, quality=args.quality,
-            workers=args.workers, threads=args.threads, timeline=timeline)
-        for record in to_extract:
-            temp = extracted.get(record["frame_index"])
-            if not temp:
-                failed_frames.append(record["frame_index"])
-                continue
-            os.makedirs(os.path.dirname(record["path"]), exist_ok=True)
-            shutil.copyfile(temp, record["path"])
-            record["written"] = True
-            written.append(record)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    if to_extract:
+        temp_dir = make_temp_dir("hero_", [r["path"] for r in to_extract])
+        try:
+            extracted = extract_frames_by_index(
+                path, [record["frame_index"] for record in to_extract],
+                temp_dir, image_format=args.format, quality=args.quality,
+                workers=args.workers, threads=args.threads, timeline=timeline)
+            written, failed_frames = place_extracted(extracted, to_extract)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     if (args.start_distance == 0 and records
             and records[0]["frame_index"] == 0
@@ -6913,8 +7146,7 @@ def detect_groups(videos: Sequence[str]) -> Dict[str, List[str]]:
     groups: Dict[str, List[str]] = {camera: [] for camera in CAMERA_ORDER}
     counts: Dict[Optional[str], int] = {camera: 0 for camera in CAMERA_ORDER}
     counts[None] = 0
-    for video in videos:
-        detection = detect_camera(video, ffprobe=FFPROBE)
+    for video, detection in zip(videos, detect_all(videos)):
         counts[detection.camera] = counts.get(detection.camera, 0) + 1
         name = os.path.basename(video)
         if detection.camera is None:
