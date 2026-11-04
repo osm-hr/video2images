@@ -3660,34 +3660,22 @@ def _split_utc(value: Optional[dt.datetime]):
 
 
 def provenance(meta: FrameMetadata) -> str:
-    """Human-readable provenance (never a keyword tag)."""
-    parts = [
-        "%s via %s" % (meta.camera, meta.script_name),
-        "video=%s" % meta.video,
-        "frame=%d" % meta.frame_index,
-        "pts=%.3fs" % meta.pts,
-    ]
-    if meta.distance is not None:
-        parts.append("distance=%.2fm" % meta.distance)
-    if meta.firmware:
-        parts.append("firmware=%s" % meta.firmware)
-    parts.append("heading_source=%s" % meta.heading_source)
+    """Short technical note for EXIF ``UserComment`` (never a keyword tag).
+
+    Only facts without an EXIF tag of their own: where the heading and the
+    position came from, plus per-camera flags in ``extra``.  Everything else
+    has a proper tag (``GPSHPositioningError``, ``GPSDOP``, ``Software`` /
+    ``XMP-aux:Firmware``) or is an exporter detail kept in the per-image
+    telemetry GeoJSON (video, frame, pts, distance, accuracy source, DOPs).
+    """
+    parts = ["heading_source=%s" % meta.heading_source]
     if meta.position_source:
         parts.append("position_source=%s" % meta.position_source)
-    if meta.accuracy is not None:
-        parts.append("accuracy=%.2fm%s" % (
-            meta.accuracy, " (estimated)" if meta.accuracy_estimated else ""))
-    if meta.hdop is not None:
-        parts.append("hdop=%.2f" % meta.hdop)
-    if meta.vdop is not None:
-        parts.append("vdop=%.2f" % meta.vdop)
-    if meta.pdop is not None:
-        parts.append("pdop=%.2f" % meta.pdop)
     if meta.extra:
         for key, value in sorted(meta.extra.items()):
             if value is not None:
                 parts.append("%s=%s" % (key, value))
-    return " | ".join(parts)
+    return "; ".join(parts)
 
 
 def build_exiftool_args(meta: FrameMetadata) -> List[str]:
@@ -3714,16 +3702,22 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
         tags += ["-OffsetTimeOriginal=" + off, "-OffsetTime=" + off]
 
     # --- camera identity and generating software -------------------------
-    # EXIF ``Software`` names the program that produced *this* image, i.e.
-    # the exporter and its version; the camera firmware stays in provenance.
+    # EXIF ``Software`` is "the software or firmware of the camera", so it
+    # carries the camera firmware, exactly as the cameras' own photos do, and
+    # Adobe's dedicated ``XMP-aux:Firmware`` repeats it.  The exporter is named
+    # in ``XMP:CreatorTool`` (and ``XMP-GPano:StitchingSoftware`` for 360).
+    # With no known firmware, ``Software`` falls back to the exporter.
     if meta.make:
         tags.append("-Make=" + meta.make)
     if meta.model:
         tags.append("-Model=" + meta.model)
-    tags.append("-Software=" + SOFTWARE_TAG)
+    tags.append("-Software=" + (meta.firmware or SOFTWARE_TAG))
+    if meta.firmware:
+        tags.append("-XMP-aux:Firmware=" + meta.firmware)
     if meta.serial:
         tags += ["-SerialNumber=%s" % meta.serial,
-                 "-CameraSerialNumber=%s" % meta.serial]
+                 "-CameraSerialNumber=%s" % meta.serial,
+                 "-XMP-aux:SerialNumber=%s" % meta.serial]
 
     # --- EXIF GPS (UTC date/time, true-north directions) -----------------
     if meta.lat is not None and meta.lon is not None:
@@ -3767,11 +3761,9 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
             tags.append("-XMP:GPSDateTime=" + gps_datetime)
 
     # --- provenance (never a keyword tag) --------------------------------
-    text = provenance(meta)
-    tags += ["-ImageDescription=" + text,
-             "-UserComment=" + text,
-             "-XPComment=" + text,
-             "-XMP:Description=" + text,
+    # Only UserComment: ImageDescription, XPComment and XMP:Description are
+    # shown as the photo's caption by galleries and Panoramax.
+    tags += ["-UserComment=" + provenance(meta),
              "-XMP:CreatorTool=" + SOFTWARE_TAG,
              "-XMP:Title=%s %s" % (meta.video,
                                    local.strftime("%Y-%m-%d %H:%M:%S")
@@ -6459,8 +6451,7 @@ def virb__metadata_for(record, source, args, camera):
         position_source=record.get("position_source"),
         clamped=record.get("clamped"), estimated=record.get("estimated"),
         keywords=parse_keywords(getattr(args, "keywords", None)),
-        extra={"fit": source.get("fit"),
-               "camera_orientation_deg": source.get("orientation_deg")},
+        extra={"camera_orientation_deg": source.get("orientation_deg")},
     )
 
 

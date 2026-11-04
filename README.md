@@ -36,7 +36,7 @@ No separate per-camera modules, no database, no service dependencies. `ffmpeg`, 
 7. **Selects unique frames** at fixed distance intervals, never reusing a frame and never going backwards.
 8. **Extracts stills** with accurate input seek, or stitches MAX 360 hemispheres to equirectangular in bounded batches.
 9. **Optionally levels** 360 photospheres using smoothed IMU roll/pitch from the camera — either by rotating the sphere pixels or by writing the pose into XMP-GPano tags. Classic flat videos are never rotated.
-10. **Writes metadata** (EXIF/XMP, GPS, provenance, exporter version in `Software`, GPano pose) with `exiftool`.
+10. **Writes metadata** (EXIF/XMP, GPS, camera firmware in `Software`, exporter version in `XMP:CreatorTool`, GPano pose) with `exiftool`.
 11. **Exports tracks and telemetry** as GPX plus three GeoJSON files per sequence (track, raw telemetry points, per-image snapshots).
 12. **Optionally writes a run manifest** covering every exported image and video summary.
 
@@ -566,8 +566,9 @@ For MAX, the value chooses **where** the correction lives. The tilt is written t
 - `GPSHPositioningError` is written when an accuracy exists; `GPSDOP` when an HDOP exists.
 - `ColorSpace = 1` (sRGB).
 - All tags are written with exiftool `-n`, so values must be raw (`T`, `K`, `2 3 0 0`, `YYYY:mm:dd HH:MM:SS.sssZ`); exiftool drops print-form values such as `True North` with only a warning.
-- **Exporter version:** EXIF `Software`, `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.3`. The EXIF `Software` tag names the program that generated the still, which is this script; the camera firmware is kept in the provenance string as `firmware=…`.
-- Provenance goes to `ImageDescription`, `UserComment`, `XPComment` and `XMP:Description`; it never goes to keywords.
+- **Camera firmware:** EXIF `Software` (defined as "software or firmware of the camera") and `XMP-aux:Firmware` carry the camera firmware, as the cameras' own photos do (e.g. `H19.03.02.02.00`, `VIRB Ultra 30 FW 4.80`). When no firmware is known, `Software` falls back to the exporter version. The serial number goes to `SerialNumber`, `CameraSerialNumber` and `XMP-aux:SerialNumber`.
+- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.3`.
+- **Provenance note:** only `UserComment`, e.g. `heading_source=gps_course; position_source=interpolated`, plus per-camera flags (`camera_orientation_deg` for VIRB, `unpositioned` for HERO). It holds only facts without an EXIF tag of their own. `ImageDescription`, `XPComment` and `XMP:Description` are not written, because galleries and Panoramax show them as the photo caption. Video, frame, PTS, distance, accuracy source and DOPs are in the per-image telemetry GeoJSON. Provenance never goes to keywords.
 - `Keywords`/`XMP:Subject` are written only when `--keywords` is passed.
 - GPano/XMP-GPano tags are written only for MAX panoramic images.
 - `PoseRollDegrees`/`PosePitchDegrees` are `0` unless `--level-horizon exif` is used, in which case they carry the smoothed camera tilt (see §6.5). The tilt is never present in both the pixels and the pose.
@@ -604,7 +605,7 @@ For MAX, the value chooses **where** the correction lives. The tilt is written t
 | Format | File | When written | Content |
 |---|---|---|---|
 | JPEG / PNG | `*.jpg`, `*.png` | Always (subject to skip/overwrite) | Geotagged still image |
-| EXIF/XMP | Inside image | Unless `--no-exif` or exiftool missing | Camera, GPS, time, provenance, `Software = v2i.py v<version>`, GPano |
+| EXIF/XMP | Inside image | Unless `--no-exif` or exiftool missing | Camera, firmware (`Software`), GPS, time, provenance note (`UserComment`), `CreatorTool = v2i.py v<version>`, GPano |
 | GPX 1.1 | `<sequence>.gpx` | `--track-export both\|gpx` | Track points with UTC time, elevation, speed/course extensions |
 | GeoJSON RFC 7946 | `<sequence>.geojson` | `--track-export both\|geojson` | LineString track plus one Point feature per image |
 | Points telemetry (GeoJSON) | `<sequence>.telemetry.geojson` | `--telemetry-export both\|points` | FeatureCollection: GPS LineString, one Point per GPS sample, one feature per IMU sample positioned on the track |
