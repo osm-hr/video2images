@@ -393,7 +393,7 @@ An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regard
 | `--uere METERS` | float | `5.0` | `> 0` | User-equivalent range error used to estimate accuracy as `HDOP × UERE` when no measured accuracy exists. |
 | `--level-horizon {no,rotate,exif}` | enum | `no` | `no`, `rotate`, `exif` | IMU-based horizon leveling for **360 (MAX) videos only**. `no` preserves the source tilt and pose. `rotate` physically remaps the equirectangular sphere so the pixels are level and writes a zero GPano pose. `exif` keeps the pixels untouched and writes the smoothed roll/pitch into `XMP-GPano:PoseRollDegrees`/`PosePitchDegrees` so viewers level the sphere themselves. Classic flat videos (VIRB, HERO, BlackVue) ignore `rotate`/`exif` and log that they export as recorded. |
 | `--level-window SECONDS` | float | `20.0` | `>= 0` | Real-time window over which IMU gravity samples are combined (median) for each leveled image. Vehicle turns and braking swing GoPro's gravity estimate by several degrees, so keep it long for mounted cameras; `0` uses the nearest single sample (handheld footage). |
-| `--imu-heading` | flag | off | on/off | Derive a tilt-compensated compass heading from `MAGN` + `GRAV` instead of GPS course (MAX/HERO). |
+| `--imu-heading` | flag | off | on/off | Derive a tilt-compensated compass heading from `MAGN` + `GRAV` (MAX/HERO), used only as a fallback where GPS gives no course; the GPS course always wins (see §6.4). |
 
 ### 5.3 Export and logging
 
@@ -415,7 +415,7 @@ An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regard
 | Option | Type | Default | Valid range / values | Functional description |
 |---|---|---|---|---|
 | `--smooth N` | int | `9` | `>= 1` | Moving-average window applied to MAX GPS latitude/longitude samples before track construction. `1` disables smoothing. |
-| `--stationary-speed MPS` | float | `0.3` | `>= 0` | Compatibility option. Accepted so existing command lines keep working; the current track suppresses stationary course noise below 0.3 m/s internally, but changing this flag does not alter the threshold. |
+| `--stationary-speed MPS` | float | `0.3` | `>= 0` | Compatibility option. Accepted so existing command lines keep working; the current track suppresses stationary course noise below 0.5 m/s internally (`COURSE_MIN_SPEED`), but changing this flag does not alter the threshold. |
 | `--jitter METERS` | float | `0.5` | `>= 0` | Compatibility option. Accepted for legacy scripts; the unified track does not use a separate jitter cutoff. |
 
 ### 5.5 GoPro MAX 360 options
@@ -492,10 +492,10 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 
 `resolve_heading()` applies this precedence:
 
-1. `compass_heading` — tilt-compensated IMU/MAGN heading (`heading_source = "compass"`).
-2. `metadata_heading` — camera/container heading (`heading_source = "metadata"`).
-3. `course` or `heading` — recorded course over ground (`heading_source = "gps_course"`).
-4. `gps_course` — computed from neighbouring track positions (`heading_source = "gps_course"`). Samples with no course of their own (vehicle parked, typically at the start of a recording) take the nearest known course, since a mounted camera keeps facing the same way; such samples carry `gps_course_filled = true`.
+1. `metadata_heading` — camera/container heading (`heading_source = "metadata"`).
+2. `course` or `heading` — recorded course over ground (`heading_source = "gps_course"`).
+3. `gps_course` — computed from neighbouring track positions (`heading_source = "gps_course"`). The window around each sample grows until its ends are `COURSE_BASELINE_M` (4 m) apart, capped at `COURSE_MAX_SPAN_S` (10 s of real time), so GPS jitter at walking pace or in a crawl does not turn into a random bearing. Samples slower than `COURSE_MIN_SPEED` (0.5 m/s), or with no course of their own (vehicle parked, typically at the start of a recording), take the nearest known course, since a mounted camera keeps facing the same way; such samples carry `gps_course_filled = true`.
+4. `compass_heading` — tilt-compensated IMU/MAGN heading (`heading_source = "compass"`), only with `--imu-heading` and only where GPS gives no course at all. GoPro's magnetometer is uncalibrated (hard-iron offsets around 100 µT, about twice Earth's field); on test MAX recordings its heading disagreed with the GPS course by 40–250°, so it never overrides a course.
 5. `none`.
 
 `--magnetic-declination` is added only to compass headings. `--heading-offset` is added to every resolved heading and then normalised. The EXIF `GPSImgDirection` uses the final true-north value; `GPSTrack` carries course over ground.
@@ -561,8 +561,11 @@ For MAX, the value chooses **where** the correction lives. The tilt is written t
 - `DateTimeOriginal`, `CreateDate`, `ModifyDate` are camera-local when the offset is known, otherwise UTC.
 - `SubSecTimeOriginal` carries the capture millisecond.
 - `OffsetTimeOriginal`/`OffsetTime` are written only when the offset is known.
-- All GPS date/time tags are UTC.
-- `GPSHPositioningError` is written when an accuracy exists.
+- All GPS date/time tags are UTC. `GPSTimeStamp`, `XMP-exif:GPSDateTime` and `XMP:MetadataDate` carry milliseconds, so time-lapse frames within one second still sort correctly.
+- `GPSImgDirection`/`GPSTrack` (EXIF and XMP-exif) are written with `Ref = T` (true north). `GPSImgDirection` and the GPano `PoseHeadingDegrees`/`InitialViewHeadingDegrees` carry the same value: the compass direction of the image centre (for MAX, the front lens).
+- `GPSHPositioningError` is written when an accuracy exists; `GPSDOP` when an HDOP exists.
+- `ColorSpace = 1` (sRGB).
+- All tags are written with exiftool `-n`, so values must be raw (`T`, `K`, `2 3 0 0`, `YYYY:mm:dd HH:MM:SS.sssZ`); exiftool drops print-form values such as `True North` with only a warning.
 - **Exporter version:** EXIF `Software`, `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.3`. The EXIF `Software` tag names the program that generated the still, which is this script; the camera firmware is kept in the provenance string as `firmware=…`.
 - Provenance goes to `ImageDescription`, `UserComment`, `XPComment` and `XMP:Description`; it never goes to keywords.
 - `Keywords`/`XMP:Subject` are written only when `--keywords` is passed.

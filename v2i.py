@@ -1002,6 +1002,12 @@ def _interp_value(a, b, fraction, key):
     return va if va is not None else vb
 
 
+# Course over ground from GPS positions (see Track._add_gps_courses).
+COURSE_BASELINE_M = 4.0     # positions this far apart give a stable bearing
+COURSE_MAX_SPAN_S = 10.0    # never look further than this (real seconds)
+COURSE_MIN_SPEED = 0.5      # m/s; slower samples inherit a neighbour's course
+
+
 class Track(object):
     """A time-indexed GPS track with interpolated access.
 
@@ -1034,24 +1040,39 @@ class Track(object):
         """Fill a per-sample course-over-ground from neighbouring positions.
 
         At 10-30 Hz a single GPS step is often only centimetres long, which
-        makes a two-point bearing pure noise.  Search outward up to ~1 s until
-        the two points are far enough apart to give a stable course.
+        makes a two-point bearing pure noise: GPS jitter of a metre turns a
+        0.15 m baseline into a random direction.  The window around each
+        sample therefore grows until the two ends are COURSE_BASELINE_M apart
+        (a few GPS error radii), but never beyond COURSE_MAX_SPAN_S of real
+        time, so a slow crawl or a stop does not borrow a course from far
+        away.  At driving speed the baseline is reached within a fraction of
+        a second, so turns stay sharp.
         """
-        n = len(self.samples)
-        for i, sample in enumerate(self.samples):
+        samples = self.samples
+        n = len(samples)
+
+        def span_s(a, b):
+            ua, ub = a.get("utc"), b.get("utc")
+            if ua is not None and ub is not None:
+                return abs((ub - ua).total_seconds())
+            return abs(b.get("t", 0.0) - a.get("t", 0.0))
+
+        for i, sample in enumerate(samples):
             if sample.get("gps_course") is not None:
                 continue
             # A parked vehicle has no meaningful course over ground.
             speed = sample.get("speed")
-            if speed is not None and speed < 0.3:
+            if speed is not None and speed < COURSE_MIN_SPEED:
                 continue
-            for radius in (1, 2, 4, 8, 16, 30):
-                lo = max(0, i - radius)
-                hi = min(n - 1, i + radius)
-                if hi == lo:
-                    continue
-                a, b = self.samples[lo], self.samples[hi]
-                if haversine(a["lat"], a["lon"], b["lat"], b["lon"]) >= 0.15:
+            lo = hi = i
+            while lo > 0 or hi < n - 1:
+                new_lo, new_hi = max(0, lo - 1), min(n - 1, hi + 1)
+                if span_s(samples[new_lo], samples[new_hi]) > COURSE_MAX_SPAN_S:
+                    break
+                lo, hi = new_lo, new_hi
+                a, b = samples[lo], samples[hi]
+                if (haversine(a["lat"], a["lon"], b["lat"], b["lon"])
+                        >= COURSE_BASELINE_M):
                     sample["gps_course"] = initial_bearing_deg(
                         a["lat"], a["lon"], b["lat"], b["lon"])
                     break
@@ -1270,11 +1291,16 @@ def heading_offset_for_folder(args: argparse.Namespace) -> Optional[float]:
 
 def resolve_heading(point: dict, heading_offset: float = 0.0,
                     magnetic_declination: float = 0.0) -> Tuple[Optional[float], str]:
-    """Return ``(true-north heading, heading_source)`` for an interpolated point."""
+    """Return ``(true-north heading, heading_source)`` for an interpolated point.
+
+    Priority: an explicit heading from the source metadata, then the GPS
+    course over ground, and only then the IMU compass.  The GoPro magnetometer
+    is uncalibrated (hard-iron offsets of ~100 uT, twice Earth's field, from
+    the camera body and the vehicle), and on real MAX recordings its heading
+    disagreed with the GPS course by 40-250 degrees, so it must never
+    override a course; it only fills in when GPS gives no course at all.
+    """
     declination = magnetic_declination or 0.0
-    compass = point.get("compass_heading")
-    if compass is not None:
-        return (compass + declination + heading_offset) % 360.0, "compass"
     metadata = point.get("metadata_heading")
     if metadata is not None:
         return (metadata + heading_offset) % 360.0, "metadata"
@@ -1286,6 +1312,9 @@ def resolve_heading(point: dict, heading_offset: float = 0.0,
     gps_course = point.get("gps_course")
     if gps_course is not None:
         return (gps_course + heading_offset) % 360.0, "gps_course"
+    compass = point.get("compass_heading")
+    if compass is not None:
+        return (compass + declination + heading_offset) % 360.0, "compass"
     return None, "none"
 
 
@@ -1715,8 +1744,10 @@ MAX360_LEVEL_CHUNK_SIZE = 8
 
 # At most this many MAX stitch batches run at the same time (bounded by
 # --workers).  Every batch decodes two 4K hemisphere streams through a large
-# filter graph, so memory rather than CPU count is the limit.
-MAX360_PARALLEL_BATCHES = 2
+# filter graph, and one batch already keeps all cores of a 4-core machine
+# busy (measured: 2 at once gave no speedup), so batches run one by one.
+# Raise this only on machines with many cores and plenty of memory.
+MAX360_PARALLEL_BATCHES = 1
 
 
 def make_temp_dir(prefix: str, outputs: Sequence[str] = ()) -> str:
@@ -3619,8 +3650,13 @@ def _split_utc(value: Optional[dt.datetime]):
     if value.tzinfo is None:
         value = value.replace(tzinfo=dt.timezone.utc)
     value = value.astimezone(dt.timezone.utc)
-    return (value.strftime("%Y:%m:%d"), value.strftime("%H:%M:%S"),
-            _fmt_utc(value))
+    # Milliseconds in GPSTimeStamp: time-lapse frames can share a whole second,
+    # and readers that order a sequence by GPS time alone would tie them.
+    time_stamp = value.strftime("%H:%M:%S") + ".%03d" % (value.microsecond // 1000)
+    date_stamp = value.strftime("%Y:%m:%d")
+    # Exif-style "YYYY:mm:dd HH:MM:SS.sssZ": under exiftool's -n the ISO form
+    # (with "-" and "T") is rejected for XMP date tags and silently dropped.
+    return date_stamp, time_stamp, "%s %sZ" % (date_stamp, time_stamp)
 
 
 def provenance(meta: FrameMetadata) -> str:
@@ -3656,7 +3692,10 @@ def provenance(meta: FrameMetadata) -> str:
 
 def build_exiftool_args(meta: FrameMetadata) -> List[str]:
     """Return exiftool arguments (without the file name)."""
-    tags: List[str] = ["-n", "-charset", "filename=utf8", "-Orientation=1"]
+    # ColorSpace: exiftool otherwise creates the EXIF IFD with 65535
+    # ("Uncalibrated"), but ffmpeg's JPEG/PNG output is plain sRGB.
+    tags: List[str] = ["-n", "-charset", "filename=utf8", "-Orientation=1",
+                       "-ColorSpace=1"]
 
     local = meta.captured_local
     if local is None and meta.captured_utc is not None:
@@ -3688,7 +3727,7 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
 
     # --- EXIF GPS (UTC date/time, true-north directions) -----------------
     if meta.lat is not None and meta.lon is not None:
-        tags += ["-GPSVersionID=2.3.0.0",
+        tags += ["-GPSVersionID=2 3 0 0",
                  "-GPSLatitude=%r" % abs(meta.lat),
                  "-GPSLatitudeRef=%s" % ("N" if meta.lat >= 0 else "S"),
                  "-GPSLongitude=%r" % abs(meta.lon),
@@ -3700,13 +3739,15 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
             tags += ["-GPSSpeed=%r" % (meta.speed * 3.6), "-GPSSpeedRef=K"]
         if meta.img_direction is not None:
             tags += ["-GPSImgDirection=%r" % meta.img_direction,
-                     "-GPSImgDirectionRef=True North"]
+                     "-GPSImgDirectionRef=T"]  # raw value: -n is on
         if meta.course is not None:
             tags += ["-GPSTrack=%r" % meta.course,
-                     "-GPSTrackRef=True North"]
+                     "-GPSTrackRef=T"]
         if meta.accuracy is not None:
             tags += ["-GPSHPositioningError=%r" % meta.accuracy,
                      "-XMP:GPSHPositioningError=%r" % meta.accuracy]
+        if meta.hdop is not None:
+            tags += ["-GPSDOP=%r" % meta.hdop, "-XMP:GPSDOP=%r" % meta.hdop]
         date_stamp, time_stamp, gps_datetime = _split_utc(meta.captured_utc)
         if date_stamp:
             tags += ["-GPSDateStamp=" + date_stamp,
@@ -3718,7 +3759,10 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
             tags += ["-XMP:GPSAltitude=%r" % abs(meta.alt),
                      "-XMP:GPSAltitudeRef#=%d" % (0 if meta.alt >= 0 else 1)]
         if meta.img_direction is not None:
-            tags.append("-XMP:GPSImgDirection=%r" % meta.img_direction)
+            tags += ["-XMP:GPSImgDirection=%r" % meta.img_direction,
+                     "-XMP:GPSImgDirectionRef=T"]
+        if meta.course is not None:
+            tags += ["-XMP:GPSTrack=%r" % meta.course, "-XMP:GPSTrackRef=T"]
         if date_stamp:
             tags.append("-XMP:GPSDateTime=" + gps_datetime)
 
@@ -3736,7 +3780,7 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
         tags += ["-XMP:CreateDate=" + local.strftime("%Y:%m:%d %H:%M:%S"),
                  "-XMP:ModifyDate=" + local.strftime("%Y:%m:%d %H:%M:%S")]
     if meta.captured_utc is not None:
-        tags.append("-XMP:MetadataDate=" + _fmt_utc(meta.captured_utc))
+        tags.append("-XMP:MetadataDate=" + _split_utc(meta.captured_utc)[2])
 
     # --- opt-in keywords --------------------------------------------------
     if meta.keywords:
@@ -7099,8 +7143,11 @@ def build_parser() -> argparse.ArgumentParser:
     geometry.add_argument("--keep-filter", action="store_true",
                           help="keep the generated MAX ffmpeg filter graph")
     parser.add_argument("--imu-heading", action="store_true",
-                        help="derive compass heading from MAGN + GRAV streams "
-                             "instead of GPS course (HERO/MAX)")
+                        help="derive a compass heading from the MAGN + GRAV "
+                             "streams (HERO/MAX) as a fallback for recordings "
+                             "where GPS gives no course; the GPS course "
+                             "always wins because GoPro's magnetometer is "
+                             "uncalibrated and unreliable")
 
     virb = parser.add_argument_group("Garmin VIRB telemetry")
     virb.add_argument("--fit", action="append", default=[], metavar="FILE",
