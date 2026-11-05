@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import datetime as dt
 import glob
 import json
@@ -61,11 +62,9 @@ __version__ = "0.0.3"
 # ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.3``.
 SOFTWARE_TAG = "%s v%s" % (SCRIPT_NAME, __version__)
 
-# ``--level-horizon`` values: how 360 (MAX) imagery is leveled, if at all.
-LEVEL_NONE = "no"                # default: pixels and pose untouched
-LEVEL_MODE_ROTATE = "rotate"     # remap the pixels on the sphere
-LEVEL_MODE_EXIF = "exif"         # leave pixels alone, write XMP-GPano pose
-LEVEL_MODES = (LEVEL_NONE, LEVEL_MODE_ROTATE, LEVEL_MODE_EXIF)
+# Values ``--level-horizon`` accepted before it became an on/off switch; they
+# are rejected with an explanation instead of a bare argparse error.
+LEVEL_HORIZON_OLD_VALUES = ("no", "rotate", "exif")
 
 FFPROBE = os.environ.get("V2I_FFPROBE", "ffprobe")
 FFMPEG = os.environ.get("V2I_FFMPEG", "ffmpeg")
@@ -562,14 +561,28 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
     parser.add_argument("--extensions", default=default_extensions,
                         metavar="LIST",
                         help="comma-separated video file extensions to scan")
-    parser.add_argument("--heading-offset", dest="heading_offset", type=float,
-                        default=None, metavar="DEGREES",
-                        help="degrees added to the heading to derive the image "
-                             "direction; recalculated to 000-360 and appended "
-                             "to the camera folder as -NNN")
-    parser.add_argument("--offset", dest="heading_offset", type=float,
-                        default=None,
+    parser.add_argument("--heading-offset", dest="heading_offset",
+                        default=None, metavar="DEGREES|auto",
+                        help="clockwise angle (0-360) from the direction of "
+                             "travel to the camera's front lens, e.g. 90 when "
+                             "the lens faces right; 'auto' reads it from each "
+                             "video's folder name (a separate 3-digit part, "
+                             "e.g. 2026-11-05-max360-090-30fps).  360 videos "
+                             "are rotated so the direction of travel is the "
+                             "image centre (see --no-recenter-forward); flat "
+                             "videos keep the pixels, add the offset to the "
+                             "heading and get -NNN on their output folder")
+    parser.add_argument("--offset", dest="heading_offset", default=None,
+                        metavar="DEGREES|auto",
                         help="alias for --heading-offset")
+    parser.add_argument("--recenter-forward", dest="recenter_forward",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="with a heading offset, rotate 360 (MAX) images "
+                             "so the direction of travel is the image centre "
+                             "(default); --no-recenter-forward keeps the "
+                             "front lens at the centre, adds the offset to "
+                             "the heading and appends -NNN to the output "
+                             "folder.  Ignored for flat videos")
     parser.add_argument("--magnetic-declination", type=float, default=0.0,
                         metavar="DEGREES",
                         help="east-positive magnetic declination added to "
@@ -578,6 +591,14 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                         help="user-equivalent range error used as "
                              "accuracy_m = HDOP x UERE when no measured "
                              "accuracy exists (default 5.0)")
+    parser.add_argument("--max-dop", type=float, default=GPS_MAX_DOP,
+                        metavar="DOP",
+                        help="drop GoPro GPS readings whose dilution of "
+                             "precision is above DOP (default %g; 0 keeps "
+                             "every reading).  While the receiver is still "
+                             "acquiring, GoPro reports a 2D fix with DOP "
+                             "99.99 and positions that jump hundreds of "
+                             "metres" % GPS_MAX_DOP)
     parser.add_argument("--timezone", dest="timezone", default=None,
                         metavar="OFFSET",
                         help="override the camera UTC offset, e.g. +02:00 "
@@ -593,24 +614,21 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
     parser.add_argument("--keywords", default=None, metavar="LIST",
                         help="opt-in keywords to write to Keywords/XMP:Subject, "
                              "semicolon- or comma-separated")
-    parser.add_argument("--level-horizon", choices=LEVEL_MODES,
-                        default=LEVEL_NONE,
-                        help="level 360 (MAX) photospheres from the camera's "
-                             "own IMU roll/pitch, averaged over nearby "
-                             "positions to avoid jitter: 'no' leaves the "
-                             "source tilt (default); 'rotate' physically "
-                             "remaps the equirectangular sphere so the pixels "
-                             "are level; 'exif' keeps the pixels untouched and "
-                             "writes the roll/pitch into the XMP-GPano Pose "
-                             "tags instead; ignored for classic flat videos")
-    parser.add_argument("--level-window", type=float,
+    parser.add_argument("--level-horizon", "--horizon", dest="level_horizon",
+                        action="store_true",
+                        help="level 360 (MAX) photospheres: rotate the sphere "
+                             "so the horizon is level, using the camera's own "
+                             "gravity sensor smoothed over --level-window.  "
+                             "Off by default; ignored for flat videos")
+    parser.add_argument("--level-window", "--horizon-window",
+                        dest="level_window", type=float,
                         default=LEVEL_WINDOW_DEFAULT, metavar="SECONDS",
-                        help="real-time window over which IMU gravity samples "
-                             "are combined (median) for each leveled image "
-                             "(default %g); a vehicle's turns and braking "
-                             "swing GoPro's gravity estimate by several "
-                             "degrees, so keep this long for mounted cameras "
-                             "and use 0 (nearest sample) for handheld footage"
+                        help="real-time window over which gravity samples are "
+                             "averaged (Gaussian weights) for each leveled "
+                             "image (default %g).  A vehicle's turns and "
+                             "braking swing GoPro's gravity estimate by "
+                             "several degrees, so keep this long for mounted "
+                             "cameras; 0 uses the nearest sample (handheld)"
                              % LEVEL_WINDOW_DEFAULT)
     parser.add_argument("--track-export", choices=("both", "gpx", "geojson", "none"),
                         default="both",
@@ -746,20 +764,24 @@ def validate_common_args(parser: argparse.ArgumentParser,
         parser.error("--workers must be at least 1 (got %d)" % args.workers)
     if args.threads < 0:
         parser.error("--threads must not be negative (got %d)" % args.threads)
-    offset = args.heading_offset
-    if offset is None:
-        args.heading_offset_given = False
-        args.heading_offset = 0.0
-    else:
-        if not math.isfinite(offset):
-            parser.error("--heading-offset must be a finite number of degrees")
-        args.heading_offset_given = True
-        args.heading_offset = normalize_heading_offset(offset)
+    try:
+        args.heading_offset_auto, args.heading_offset_value = \
+            parse_heading_offset_arg(args.heading_offset)
+    except ValueError as exc:
+        parser.error(str(exc))
+    # Per-video values (folder offset, re-centring) are filled in later by
+    # video_args(); these defaults describe "no offset".
+    args.heading_offset_given = False
+    args.heading_offset = 0.0
+    args.recenter_deg = 0.0
     if not (-180.0 <= args.magnetic_declination <= 180.0):
         parser.error("--magnetic-declination must be between -180 and +180 "
                      "degrees (got %g)" % args.magnetic_declination)
     if args.uere <= 0:
         parser.error("--uere must be greater than zero (got %g)" % args.uere)
+    if args.max_dop < 0:
+        parser.error("--max-dop must be 0 (off) or positive (got %g)"
+                     % args.max_dop)
     if args.level_window < 0:
         parser.error("--level-window must not be negative (got %g)"
                      % args.level_window)
@@ -1165,12 +1187,17 @@ class Track(object):
             point["distance"] = 0.0
             return point
         lo, fraction, source = self._locate_time(t)
-        if source == "clamped-start":
-            point = dict(self.samples[0])
+        if source in ("clamped-start", "clamped-end"):
+            anchor = self.samples[0 if source == "clamped-start" else -1]
+            point = dict(anchor)
             point["t"] = t
-        elif source == "clamped-end":
-            point = dict(self.samples[-1])
-            point["t"] = t
+            # The position is held at the first/last fix, but the capture
+            # time is the frame's own: shift the fix's clock by the frame's
+            # distance from it (in real seconds, so TimeWarp is respected).
+            utc = point.get("utc")
+            if isinstance(utc, dt.datetime):
+                point["utc"] = utc + dt.timedelta(
+                    seconds=(t - anchor["t"]) * self.real_seconds_per_t())
         else:
             point = self._interp(self.samples[lo], self.samples[lo + 1],
                                  fraction)
@@ -1179,6 +1206,24 @@ class Track(object):
         point["clamped"] = source.startswith("clamped")
         point["estimated"] = True
         return point
+
+    def real_seconds_per_t(self) -> float:
+        """Real (UTC) seconds per unit of track time ``t``.
+
+        1.0 for normal video; the time-lapse/TimeWarp speed-up when ``t`` is
+        playback time.  Falls back to 1.0 without usable UTC stamps.
+        """
+        if len(self.samples) < 2:
+            return 1.0
+        first, last = self.samples[0], self.samples[-1]
+        span_t = last.get("t", 0.0) - first.get("t", 0.0)
+        ua, ub = first.get("utc"), last.get("utc")
+        if (span_t > 0 and isinstance(ua, dt.datetime)
+                and isinstance(ub, dt.datetime)):
+            rate = (ub - ua).total_seconds() / span_t
+            if rate > 0:
+                return rate
+        return 1.0
 
     def at_distance(self, distance):
         """Interpolate at a cumulative track distance."""
@@ -1289,8 +1334,117 @@ def heading_offset_for_folder(args: argparse.Namespace) -> Optional[float]:
     return None
 
 
+HEADING_OFFSET_AUTO = "auto"
+
+
+def parse_heading_offset_arg(value: Optional[str]
+                             ) -> Tuple[bool, Optional[float]]:
+    """Parse ``--heading-offset``: ``(is_auto, degrees or None)``.
+
+    Only ``auto`` or a number from 0 to 360 is accepted; anything else
+    (negative, above 360, not a number) raises ValueError.
+    """
+    if value is None:
+        return False, None
+    text = str(value).strip()
+    if text.lower() == HEADING_OFFSET_AUTO:
+        return True, None
+    try:
+        degrees = float(text)
+    except ValueError:
+        raise ValueError("--heading-offset must be a number from 0 to 360 "
+                         "or 'auto' (got %r)" % value) from None
+    if not math.isfinite(degrees) or not 0.0 <= degrees <= 360.0:
+        raise ValueError("--heading-offset must be from 0 to 360 degrees "
+                         "(got %s)" % text)
+    return False, degrees
+
+
+def folder_heading_offset(name: str) -> Optional[float]:
+    """Heading offset encoded in a folder name, or ``None`` when there is none.
+
+    The name is split on ``-`` and ``_``; the offset is a part that consists
+    of exactly three digits (``000``-``360``) and is not the first part, so it
+    has a separator before it and a separator or the end of the name after
+    it.  ``2026-11-05-max360-090-30fps`` -> 90.  Camera names and formats
+    such as ``max360``, ``30fps``, ``120fps``, ``1080p``, ``4k`` or
+    ``timelapse05`` are never separate 3-digit parts, and dates use 4- and
+    2-digit parts.  Raises ValueError for a 3-digit part above 360 or for two
+    different offsets in one name.
+    """
+    parts = re.split(r"[-_]", name)[1:]
+    values = []
+    for part in parts:
+        if re.fullmatch(r"[0-9]{3}", part):
+            degrees = float(part)
+            if degrees > 360.0:
+                raise ValueError("folder %r: %s is not a heading offset "
+                                 "(000-360)" % (name, part))
+            if degrees not in values:
+                values.append(degrees)
+    if len(values) > 1:
+        raise ValueError("folder %r has more than one heading offset (%s)"
+                         % (name, ", ".join("%03d" % v for v in values)))
+    return values[0] if values else None
+
+
+def video_heading_offset(args: argparse.Namespace, video: str
+                         ) -> Optional[float]:
+    """The heading offset that applies to *video* (``None`` = no offset)."""
+    if getattr(args, "heading_offset_auto", False):
+        folder = os.path.basename(os.path.dirname(os.path.abspath(video)))
+        return folder_heading_offset(folder)
+    return getattr(args, "heading_offset_value", None)
+
+
+def video_args(args: argparse.Namespace, video: str,
+               camera: str) -> argparse.Namespace:
+    """Per-video copy of *args* with the heading offset resolved.
+
+    For 360 (MAX) videos with re-centring on (the default), the offset is
+    applied to the pixels instead of the heading: ``recenter_deg`` is the
+    offset, ``heading_offset`` is 0 and the output folder gets no -NNN label.
+    Otherwise (flat videos, or --no-recenter-forward) the offset is added to
+    the heading and labels the output folder as before.
+    """
+    vargs = copy.copy(args)
+    offset = video_heading_offset(args, video)
+    recenter = camera == CAMERA_MAX and getattr(args, "recenter_forward", True)
+    vargs.recenter_deg = (offset % 360.0) if (recenter and offset) else 0.0
+    vargs.heading_offset = 0.0 if (recenter or offset is None) else offset
+    vargs.heading_offset_given = offset is not None and not recenter
+    vargs.heading_offset_note = None
+    if offset is not None:
+        vargs.heading_offset_note = "heading offset %03d%s%s" % (
+            int(round(offset)),
+            " (from folder name)" if args.heading_offset_auto else "",
+            ": sphere rotated so the direction of travel is the image centre"
+            if vargs.recenter_deg else
+            ": added to the heading" if offset else "")
+    return vargs
+
+
+def log_heading_offset(args: argparse.Namespace) -> None:
+    note = getattr(args, "heading_offset_note", None)
+    if note:
+        LOG.info("  %s", note)
+
+
+def recenter_yaw(recenter_deg: float) -> float:
+    """v360 ``yaw`` that brings the direction of travel to the image centre.
+
+    v360 shows the input azimuth ``yaw`` at the output centre (verified with
+    marker images: ``yaw=90`` centres what was 90 degrees to the right).  The
+    front lens points *recenter_deg* clockwise of travel, so travel sits at
+    ``-recenter_deg`` in the stitched image.
+    """
+    yaw = (-float(recenter_deg) + 180.0) % 360.0 - 180.0
+    return 0.0 if abs(yaw) < 1e-9 else yaw
+
+
 def resolve_heading(point: dict, heading_offset: float = 0.0,
-                    magnetic_declination: float = 0.0) -> Tuple[Optional[float], str]:
+                    magnetic_declination: float = 0.0,
+                    recenter_deg: float = 0.0) -> Tuple[Optional[float], str]:
     """Return ``(true-north heading, heading_source)`` for an interpolated point.
 
     Priority: an explicit heading from the source metadata, then the GPS
@@ -1312,9 +1466,12 @@ def resolve_heading(point: dict, heading_offset: float = 0.0,
     gps_course = point.get("gps_course")
     if gps_course is not None:
         return (gps_course + heading_offset) % 360.0, "gps_course"
+    # The compass measures where the front lens points, i.e. the image centre
+    # as stitched; a heading offset (travel -> lens) does not apply to it, but
+    # re-centring turns the image centre back by the offset.
     compass = point.get("compass_heading")
     if compass is not None:
-        return (compass + declination + heading_offset) % 360.0, "compass"
+        return (compass + declination - recenter_deg) % 360.0, "compass"
     return None, "none"
 
 
@@ -1334,6 +1491,67 @@ def derive_accuracy(point: dict, uere: float = 5.0):
     if hdop is not None:
         return float(hdop) * float(uere), True, "hdop*uere"
     return None, False, None
+
+
+# GPS readings rejected before a track is built (see reject_bad_gps).
+GPS_MAX_DOP = 10.0          # default --max-dop; GoPro writes 99.99 = no fix
+GPS_MAX_SPEED = 70.0        # m/s (252 km/h); faster jumps are receiver noise
+GPS_JUMP_RESET_S = 5.0      # after this long rejecting, trust the new reading
+
+
+def reject_bad_gps(samples: Sequence[dict], max_dop: float = GPS_MAX_DOP,
+                   max_speed: float = GPS_MAX_SPEED
+                   ) -> Tuple[List[dict], int, int]:
+    """Drop unusable GPS readings; return ``(kept, n_dop, n_jump)``.
+
+    *samples* must be in time order and carry ``utc``, ``lat`` and ``lon``.
+    Two checks, both needed on real GoPro footage:
+
+    * DOP: while acquiring, the receiver already reports a 2D fix but with
+      DOP 99.99 and positions that wander by hundreds of metres per second.
+      ``max_dop <= 0`` disables this check.
+    * Speed: a reading that implies more than *max_speed* from the previous
+      kept reading is a jump (typically where the DOP first improves).  If
+      readings keep being rejected for GPS_JUMP_RESET_S, the earlier kept
+      reading was the bad one, so the current reading is accepted instead of
+      throwing the rest of the track away.
+    """
+    kept: List[dict] = []
+    n_dop = n_jump = 0
+    rejecting_since = None
+    for sample in samples:
+        dop = sample.get("hdop")
+        if dop is None:
+            dop = sample.get("dop")
+        if max_dop > 0 and dop is not None and dop > max_dop:
+            n_dop += 1
+            continue
+        if kept and max_speed > 0:
+            prev = kept[-1]
+            span = (sample["utc"] - prev["utc"]).total_seconds()
+            moved = haversine(prev["lat"], prev["lon"],
+                              sample["lat"], sample["lon"])
+            if moved > max_speed * max(span, 1e-3):
+                if rejecting_since is None:
+                    rejecting_since = sample["utc"]
+                if ((sample["utc"] - rejecting_since).total_seconds()
+                        < GPS_JUMP_RESET_S):
+                    n_jump += 1
+                    continue
+        rejecting_since = None
+        kept.append(sample)
+    return kept, n_dop, n_jump
+
+
+def log_rejected_gps(n_dop: int, n_jump: int, max_dop: float) -> None:
+    if n_dop or n_jump:
+        parts = []
+        if n_dop:
+            parts.append("%d with DOP above %g" % (n_dop, max_dop))
+        if n_jump:
+            parts.append("%d implausible jump(s) faster than %.0f km/h"
+                         % (n_jump, GPS_MAX_SPEED * 3.6))
+        LOG.info("  rejected GPS reading(s): %s", ", ".join(parts))
 
 
 def apply_accuracy(sample: dict, uere: float = 5.0) -> dict:
@@ -1572,6 +1790,11 @@ class FrameChoice:
     estimated: bool
 
 
+# Longest real-time gap between recording start and the first usable GPS fix
+# for which frame 0 is still exported (at the first fix's position).
+FIRST_FIX_MAX_DELAY_S = 2.0
+
+
 def select_unique_frames(track: Track, timeline: FrameTimeline, interval: float,
                          *, start_distance: float = 0.0,
                          max_position_error: Optional[float] = None,
@@ -1588,14 +1811,30 @@ def select_unique_frames(track: Track, timeline: FrameTimeline, interval: float,
     rather than duplicate frames.  Targets with no acceptable frame are
     skipped and returned in the second list.
 
-    With ``start_distance == 0`` the first frame (index 0) is always exported,
-    even if telemetry starts slightly later (the position is clamped).
+    With ``start_distance == 0`` the first frame (index 0) is exported even if
+    telemetry starts slightly later (position clamped to the first fix,
+    capture time still the frame's own), but only when that delay is at most
+    FIRST_FIX_MAX_DELAY_S of real time; otherwise the sequence starts at the
+    first fix.
     """
     log = logger or LOG
     if max_position_error is None:
         max_position_error = interval / 2.0
     shots = plan_shots(track, interval, start_distance=start_distance,
                        max_shots=max_images)
+    # Frame 0 is forced only when GPS was already fixed at (or within
+    # FIRST_FIX_MAX_DELAY_S of) the recording start.  When the camera started
+    # recording before its GPS locked, frame 0 was taken somewhere the track
+    # never saw, so pinning it to the first fix would misplace it.
+    if require_first_frame and start_distance == 0.0 and len(timeline) > 0:
+        delay = ((track.times[0] - timeline.pts(0))
+                 * track.real_seconds_per_t()) if track.times else 0.0
+        if delay > FIRST_FIX_MAX_DELAY_S:
+            log.warning("  GPS fix starts %.0f s after the recording start; "
+                        "the footage before it has no position and is not "
+                        "exported (wait for GPS lock before recording)",
+                        delay)
+            require_first_frame = False
     choices: List[FrameChoice] = []
     skipped: List[dict] = []
     last = -1
@@ -1803,7 +2042,8 @@ def place_extracted(extracted: Mapping[int, str], records: Sequence[dict]
 
 
 def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
-                        height: int, interp: str = "cubic") -> str:
+                        height: int, interp: str = "cubic",
+                        yaw: float = 0.0) -> str:
     """Return the v360 filter that levels an equirectangular MAX frame.
 
     ``roll_deg``/``pitch_deg`` use the camera convention: positive roll is
@@ -1812,48 +2052,17 @@ def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
     tilted GoPro MAX footage: ``roll=+R`` turns the picture clockwise, so a
     clockwise camera roll is undone with ``roll=-roll_deg``; ``pitch=+P``
     makes the view look *up* by P (content moves down), which is exactly what
-    levels a camera tilted down, so pitch is passed through unchanged.  Only
-    roll and pitch are corrected; yaw is deliberately left alone.
+    levels a camera tilted down, so pitch is passed through unchanged.
+
+    *yaw* re-centres the sphere (see :func:`recenter_yaw`).  Rotation order
+    ``pry`` applies the leveling in the camera's own frame first and the yaw
+    last: with marker images it matched "level, then a separate yaw pass" to
+    57 dB PSNR, while the default ``ypr`` (yaw first) tilts about the wrong
+    axes.  With ``yaw = 0`` it is the same rotation as before.
     """
-    return ("v360=e:e:roll=%.6f:pitch=%.6f:w=%d:h=%d:interp=%s"
-            % (-float(roll_deg), float(pitch_deg), int(width), int(height),
-               interp))
-
-
-def gpano_pose(roll_deg: float, pitch_deg: float) -> Tuple[float, float]:
-    """Convert camera roll/pitch to XMP-GPano ``PoseRollDegrees``/``PosePitchDegrees``.
-
-    The camera convention used throughout this file is positive roll =
-    clockwise (right side down) and positive pitch = camera tilted down, both
-    measured as independent ``atan2`` angles of the gravity vector:
-    ``roll = atan2(right, down)`` and ``pitch = atan2(forward, down)``.
-
-    The Photo Sphere spec fixes the Euler order ``R_Z(-heading) * R_X(pitch)
-    * R_Y(roll)`` with the sphere centre facing north and Z up.  Under that
-    order the world-up vector seen from the camera is ``(-sin r cos p,
-    sin p, cos r cos p)`` in (right, forward, up), so ``PoseRollDegrees`` is
-    the same ``atan2(right, down)`` as ours (positive = camera top leans
-    right = horizon turns counter-clockwise in the image, as the spec says),
-    while ``PosePitchDegrees`` is ``asin`` of the forward component, i.e. the
-    elevation of the image centre above the horizon.  Converting the
-    ``atan2`` pitch exactly matters once tilts reach tens of degrees; for the
-    few degrees of a vehicle mount both give the same number.  Values are
-    clamped to the ranges the spec allows (roll in (-180, 180], pitch in
-    [-90, 90]).
-    """
-    r = math.radians(float(roll_deg))
-    q = math.radians(float(pitch_deg))
-    if abs(math.cos(r)) < 1e-9 or abs(math.cos(q)) < 1e-9:
-        pose_pitch = -90.0 if q > 0 else 90.0
-    else:
-        tr, tq = math.tan(r), math.tan(q)
-        forward = tq / math.sqrt(1.0 + tr * tr + tq * tq)
-        pose_pitch = -math.degrees(math.asin(max(-1.0, min(1.0, forward))))
-    roll = (float(roll_deg) + 180.0) % 360.0 - 180.0
-    if roll == -180.0:
-        roll = 180.0
-    pitch = max(-90.0, min(90.0, pose_pitch))
-    return round(roll, 3), round(pitch, 3)
+    return ("v360=e:e:yaw=%.6f:pitch=%.6f:roll=%.6f:rorder=pry:w=%d:h=%d:"
+            "interp=%s" % (float(yaw), float(pitch_deg), -float(roll_deg),
+                           int(width), int(height), interp))
 
 
 def _extract_one(video: str, frame_index: int, seek_time: float, pattern: str,
@@ -3082,19 +3291,34 @@ def _make_gps_sample(row: Sequence[float], scale: Sequence[float],
     }
 
 
+# GPS time stamps further than this from the median camera-clock offset are
+# stale (GoPro's first payload) and left out of the reported clock spread.
+GPS_CLOCK_OUTLIER_S = 1.0
+
+
 def _build_gps_samples(blocks: List[_Block]
-                       ) -> Tuple[List[dict], float, int]:
+                       ) -> Tuple[List[dict], float, int, int]:
+    """Return ``(samples, clock_spread_s, median_offset_us, stale_stamps)``.
+
+    Each block's GPSU time minus its STMP gives the camera-clock offset; the
+    median is used.  The spread is reported over offsets within
+    GPS_CLOCK_OUTLIER_S of that median: GoPro's first payload often carries a
+    GPS time a few seconds stale, which would otherwise dominate the number
+    while having no effect on any position.
+    """
     gps_blocks = [b for b in blocks if _gps_rows(b)[0]]
     if not gps_blocks:
-        return [], 0.0, 0
+        return [], 0.0, 0, 0
 
     offsets = []
     for block in gps_blocks:
         if block.stmp_us is not None and block.utc is not None:
             offsets.append(_epoch_us(block.utc) - block.stmp_us)
     median_offset = int(statistics.median(offsets)) if offsets else 0
-    spread = ((max(offsets) - min(offsets)) / 1e6
-              if len(offsets) > 1 else 0.0)
+    close = [o for o in offsets
+             if abs(o - median_offset) <= GPS_CLOCK_OUTLIER_S * 1e6]
+    stale = len(offsets) - len(close)
+    spread = (max(close) - min(close)) / 1e6 if len(close) > 1 else 0.0
 
     samples: List[dict] = []
     for bi, block in enumerate(gps_blocks):
@@ -3119,11 +3343,13 @@ def _build_gps_samples(blocks: List[_Block]
                 samples.append(sample)
     samples.sort(key=lambda s: (s["utc"] or dt.datetime.min.replace(
         tzinfo=dt.timezone.utc), s["stmp_us"] or 0))
-    return samples, spread, median_offset
+    return samples, spread, median_offset, stale
 
 
 def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]],
-                       median_offset: int = 0) -> Dict[str, List[dict]]:
+                       median_offset: int = 0,
+                       wanted: Optional[Dict[str, int]] = None
+                       ) -> Dict[str, List[dict]]:
     """Decode IMU-ish streams into ``{KEY: [{stmp_us, utc, values}]}``.
 
     GoPro's ``STNM`` is a human-readable description ("Magnetometer"), while
@@ -3131,8 +3357,9 @@ def _build_imu_streams(blocks_by_name: Dict[str, List[_Block]],
     key keeps this independent of firmware naming.
     """
     imu: Dict[str, List[dict]] = {}
-    wanted = {"MAGN": 3, "ACCL": 3, "GYRO": 3, "GRAV": 3,
-              "CORI": 4, "IORI": 4, "ORIN": 3}
+    if wanted is None:
+        wanted = {"MAGN": 3, "ACCL": 3, "GYRO": 3, "GRAV": 3,
+                  "CORI": 4, "IORI": 4, "ORIN": 3}
     for _name, blocks in blocks_by_name.items():
         for key, size in wanted.items():
             present = [block for block in blocks if block.keys.get(key)]
@@ -3269,7 +3496,19 @@ def _virb_image_up(body: Sequence[float], orientation_deg: Optional[float]
 # for one image.  GoPro's GRAV is low-passed *apparent* gravity, so in a
 # vehicle it swings by several degrees through every turn and braking phase;
 # a 20 s median averages those out while a rigid mount's true tilt survives.
-LEVEL_WINDOW_DEFAULT = 20.0
+LEVEL_WINDOW_DEFAULT = 25.0
+# Largest change of the leveling roll/pitch between consecutive images.  With
+# a 25 s Gaussian window this kept every image-to-image step at or below the
+# cap on the test drives (the uncapped median used before jumped up to 3.3
+# degrees around stops), while following real slope changes.
+LEVEL_MAX_STEP_DEG = 0.5
+# Optionally, gravity samples taken while the vehicle accelerates, brakes or
+# turns are down-weighted by 1 / (1 + (a / LEVEL_ACCEL_REF)^2), a from GPS
+# (m/s^2).  Off: on four test drives it changed the angles by ~0.4 degrees
+# but made image-to-image steps slightly larger (fewer effective samples),
+# with no evidence of a more accurate horizon.
+LEVEL_ACCEL_WEIGHTING = False
+LEVEL_ACCEL_REF = 0.5
 
 
 def _angle_unit_vector(row: dict, key: str) -> Optional[Tuple[float, float, float]]:
@@ -3298,41 +3537,108 @@ def _angle_unit_vector(row: dict, key: str) -> Optional[Tuple[float, float, floa
     return x / norm, down / norm, forward / norm
 
 
-def _median_vector_angles(vectors: Sequence[Tuple[float, float, float]]
-                          ) -> Optional[Tuple[float, float]]:
-    """Roll/pitch of the component-wise median of unit gravity vectors.
+def _weighted_vector_angles(vectors: Sequence[Tuple[float, float, float]],
+                            weights: Sequence[float]
+                            ) -> Optional[Tuple[float, float]]:
+    """Roll/pitch of the weighted mean of unit gravity vectors.
 
-    The median is robust against the transient swings that vehicle dynamics
-    put into the gravity estimate, and working on vector components rather
-    than on angles avoids any wrap-around trouble near +-180 degrees.
+    Averaging vector components (not angles) avoids any wrap-around trouble.
+    Unlike the median used before, a weighted mean changes smoothly as the
+    window slides, so consecutive images do not step between values.
     """
-    if not vectors:
+    total = sum(weights)
+    if not vectors or total <= 0:
         return None
-    x = statistics.median(v[0] for v in vectors)
-    down = statistics.median(v[1] for v in vectors)
-    forward = statistics.median(v[2] for v in vectors)
+    x = sum(w * v[0] for v, w in zip(vectors, weights)) / total
+    down = sum(w * v[1] for v, w in zip(vectors, weights)) / total
+    forward = sum(w * v[2] for v, w in zip(vectors, weights)) / total
     roll, pitch = _roll_pitch_from_body(x, forward, down)
     if roll is None or pitch is None:
         return None
-    return round(roll, 3), round(pitch, 3)
+    return roll, pitch
+
+
+def _vehicle_acceleration(track) -> Tuple[List[dt.datetime], List[float]]:
+    """Horizontal acceleration (m/s^2) of the vehicle at each GPS sample.
+
+    Longitudinal from the change of speed, lateral from speed times the turn
+    rate, both over about 1.5 s.  Empty without a usable track.
+    """
+    samples = [s for s in (getattr(track, "samples", None) or [])
+               if isinstance(s.get("utc"), dt.datetime)]
+    times = [s["utc"] for s in samples]
+    accel: List[float] = []
+    for i in range(len(samples)):
+        lo = bisect.bisect_left(times, times[i] - dt.timedelta(seconds=0.75))
+        hi = min(len(samples) - 1, bisect.bisect_right(
+            times, times[i] + dt.timedelta(seconds=0.75)) - 1)
+        a, b = samples[lo], samples[hi]
+        span = (b["utc"] - a["utc"]).total_seconds()
+        va, vb = a.get("speed"), b.get("speed")
+        if span < 0.2 or va is None or vb is None:
+            accel.append(0.0)
+            continue
+        along = (vb - va) / span
+        lateral = 0.0
+        ca, cb = a.get("gps_course"), b.get("gps_course")
+        if ca is not None and cb is not None and min(va, vb) > 1.0:
+            turn = math.radians((cb - ca + 540.0) % 360.0 - 180.0) / span
+            lateral = 0.5 * (va + vb) * turn
+        accel.append(math.hypot(along, lateral))
+    return times, accel
+
+
+def _limit_steps(values: Sequence[Tuple[float, float]], max_step: float
+                 ) -> List[Tuple[float, float]]:
+    """Cap the change between consecutive (roll, pitch) pairs.
+
+    A forward and a backward rate-limited pass are averaged, so the result
+    has no systematic lag in either direction; the average of two sequences
+    whose steps are all <= max_step also has steps <= max_step.
+    """
+    if len(values) < 2 or max_step <= 0:
+        return list(values)
+
+    def one_way(seq):
+        out = [seq[0]]
+        for value in seq[1:]:
+            prev = out[-1]
+            out.append(tuple(prev[k] + max(-max_step,
+                                           min(max_step, value[k] - prev[k]))
+                             for k in range(2)))
+        return out
+
+    forward = one_way(list(values))
+    backward = one_way(list(values)[::-1])[::-1]
+    return [((f[0] + b[0]) / 2.0, (f[1] + b[1]) / 2.0)
+            for f, b in zip(forward, backward)]
 
 
 def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
                   *, window_s: float = LEVEL_WINDOW_DEFAULT,
-                  max_delta_s: float = 1.0
+                  max_delta_s: float = 1.0, track=None,
+                  max_step: float = LEVEL_MAX_STEP_DEG
                   ) -> Tuple[Dict[int, Tuple[float, float]],
                              Dict[int, Tuple[float, float]]]:
     """Map ``frame_index`` to raw and leveling ``(roll, pitch)`` per image.
 
     Returns ``(raw, level)``.  ``raw`` is the single IMU sample nearest to the
     capture time (within ``max_delta_s``), kept for the telemetry exports.
-    ``level`` is what the horizon correction actually uses: the roll/pitch of
-    the median gravity vector over all samples within ``window_s`` *real*
-    seconds centred on the capture time.  Working in real (UTC) time rather
-    than in exported-image neighbours makes this independent of the frame
-    spacing, so TimeWarp/timelapse footage -- where consecutive images are
-    seconds of real time apart -- is handled the same way as normal video.
-    With ``window_s == 0`` the raw sample is used as is.
+    ``level`` is what the horizon correction actually uses:
+
+    * a Gaussian-weighted mean of the gravity vectors within ``window_s``
+      *real* seconds centred on the capture time (sigma = window / 4);
+    * samples taken while the vehicle accelerates, brakes or turns (from the
+      GPS *track*) count less, since GoPro's gravity estimate then tilts;
+    * near the start and end of the recording the window is not cut in half:
+      the value of the first/last full window is held instead;
+    * finally the change between consecutive images is capped at *max_step*
+      degrees (forward/backward averaged, so without lag).
+
+    Working in real (UTC) time rather than in exported-image neighbours makes
+    this independent of the frame spacing, so TimeWarp/timelapse footage is
+    handled like normal video.  With ``window_s == 0`` the nearest sample is
+    used as is (no smoothing, no cap).
 
     ``GRAV`` is preferred because it is absolute; the ``ACCL`` fallback covers
     streams that only provide calibrated roll/pitch.  Images without any
@@ -3354,6 +3660,23 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
             indexes[key] = ([item[0] for item in timed],
                             [item[1] for item in timed])
     half = max(0.0, float(window_s)) / 2.0
+    sigma = half / 2.0
+    acc_times, acc_values = (_vehicle_acceleration(track) if half > 0
+                             else ([], []))
+
+    def accel_weight(when: dt.datetime) -> float:
+        if not acc_times:
+            return 1.0
+        pos = min(len(acc_times) - 1, bisect.bisect_left(acc_times, when))
+        if pos > 0 and (abs((acc_times[pos - 1] - when).total_seconds())
+                        < abs((acc_times[pos] - when).total_seconds())):
+            pos -= 1
+        if abs((acc_times[pos] - when).total_seconds()) > 2.0:
+            return 1.0
+        ratio = acc_values[pos] / LEVEL_ACCEL_REF
+        return 1.0 / (1.0 + ratio * ratio)
+
+    weight_cache: Dict[Tuple[str, int], float] = {}
     for record in records:
         target = _as_utc(record.get("datetime_utc"))
         if target is None:
@@ -3378,14 +3701,41 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
             if half <= 0.0:
                 level[frame] = (round(float(roll), 3), round(float(pitch), 3))
                 break
-            lo = bisect.bisect_left(times, target - dt.timedelta(seconds=half))
-            hi = bisect.bisect_right(times, target + dt.timedelta(seconds=half))
-            vectors = [v for v in (_angle_unit_vector(rows[i], key)
-                                   for i in range(lo, hi)) if v is not None]
-            angles = _median_vector_angles(vectors)
+            # Hold the first/last full window near the recording's ends.
+            centre = target
+            if (times[-1] - times[0]).total_seconds() > 2 * half:
+                earliest = times[0] + dt.timedelta(seconds=half)
+                latest = times[-1] - dt.timedelta(seconds=half)
+                centre = min(max(target, earliest), latest)
+            lo = bisect.bisect_left(times, centre - dt.timedelta(seconds=half))
+            hi = bisect.bisect_right(times, centre + dt.timedelta(seconds=half))
+            vectors, weights = [], []
+            for i in range(lo, hi):
+                vector = _angle_unit_vector(rows[i], key)
+                if vector is None:
+                    continue
+                offset_s = (times[i] - centre).total_seconds()
+                cached = weight_cache.get((key, i))
+                if cached is None:
+                    cached = weight_cache[(key, i)] = accel_weight(times[i])
+                vectors.append(vector)
+                weights.append(math.exp(-0.5 * (offset_s / sigma) ** 2)
+                               * cached)
+            angles = _weighted_vector_angles(vectors, weights)
             if angles is not None:
                 level[frame] = angles
             break
+    if half > 0 and level:
+        ordered = sorted((record for record in records
+                          if int(record["frame_index"]) in level),
+                         key=lambda r: (_as_utc(r.get("datetime_utc"))
+                                        or dt.datetime.min.replace(
+                                            tzinfo=dt.timezone.utc),
+                                        int(r["frame_index"])))
+        frames = [int(r["frame_index"]) for r in ordered]
+        limited = _limit_steps([level[f] for f in frames], max_step)
+        for frame, (roll, pitch) in zip(frames, limited):
+            level[frame] = (round(roll, 3), round(pitch, 3))
     return raw, level
 
 
@@ -3498,6 +3848,11 @@ class GpmfData:
     imu: Dict[str, List[dict]]
     has_gps: bool
     clock_spread_s: float = 0.0
+    clock_stale_stamps: int = 0                      # GPSU outliers ignored
+    # Per-frame exposure: ``SHUT`` (seconds) and ``ISOE`` rows, same shape
+    # as the IMU rows.  Kept apart from ``imu`` so telemetry exports stay as
+    # they were.
+    exposure: Dict[str, List[dict]] = field(default_factory=dict)
     origin_utc: Optional[dt.datetime] = None
     time_scale: float = 1.0
     camera_utc_offset: Optional[int] = None
@@ -3520,6 +3875,47 @@ def _anchor_imu_utc(imu: Dict[str, List[dict]],
             if row.get("utc") is None and row.get("stmp_us") is not None:
                 row["utc"] = origin + dt.timedelta(
                     microseconds=int(row["stmp_us"]))
+
+
+def attach_exposure(records: Sequence[dict],
+                    exposure: Optional[Dict[str, List[dict]]],
+                    max_delta_s: float = 1.0) -> int:
+    """Copy GoPro's per-frame shutter time and ISO onto the image records.
+
+    ``SHUT``/``ISOE`` hold one value per recorded frame; the row nearest to
+    each image's capture time (within *max_delta_s* real seconds) is used.
+    Sets ``exposure_time_s`` and ``iso``; returns how many images got one.
+    """
+    if not exposure:
+        return 0
+    found = 0
+    for key, field_name, convert in (("SHUT", "exposure_time_s", float),
+                                     ("ISOE", "iso", int)):
+        timed = sorted(((_as_utc(row.get("utc")), row)
+                        for row in exposure.get(key) or []
+                        if row.get("utc") is not None and row.get("values")),
+                       key=lambda item: item[0])
+        if not timed:
+            continue
+        times = [item[0] for item in timed]
+        for record in records:
+            target = _as_utc(record.get("datetime_utc"))
+            if target is None:
+                continue
+            pos = bisect.bisect_left(times, target)
+            best = None
+            for j in (pos - 1, pos):
+                if 0 <= j < len(times):
+                    delta = abs((times[j] - target).total_seconds())
+                    if best is None or delta < best[0]:
+                        best = (delta, timed[j][1])
+            if best is not None and best[0] <= max_delta_s:
+                value = best[1]["values"][0]
+                if value and value > 0:
+                    record[field_name] = convert(value)
+                    if key == "SHUT":
+                        found += 1
+    return found
 
 
 def parse_gpmf(buf: bytes, *, imu_heading: bool = False) -> GpmfData:
@@ -3551,13 +3947,16 @@ def parse_gpmf(buf: bytes, *, imu_heading: bool = False) -> GpmfData:
                             "supported")
 
     all_blocks = [block for items in blocks.values() for block in items]
-    gps_samples, spread, median_offset = _build_gps_samples(all_blocks)
+    gps_samples, spread, median_offset, stale = _build_gps_samples(all_blocks)
     imu = _build_imu_streams(blocks, median_offset)
+    exposure = _build_imu_streams(blocks, median_offset,
+                                  wanted={"SHUT": 1, "ISOE": 1})
     if imu_heading:
         _attach_compass(gps_samples, imu)
     return GpmfData(device_name=device_name, streams=streams,
                     gps_samples=gps_samples, imu=imu,
-                    has_gps=bool(gps_samples), clock_spread_s=spread)
+                    has_gps=bool(gps_samples), clock_spread_s=spread,
+                    clock_stale_stamps=stale, exposure=exposure)
 
 
 def extract_gpmf(path: str, stream_index: int, *, ffmpeg: str = FFMPEG
@@ -3624,6 +4023,9 @@ class FrameMetadata:
     pose_heading: Optional[float] = None
     pose_pitch: float = 0.0                          # XMP-GPano PosePitchDegrees
     pose_roll: float = 0.0                           # XMP-GPano PoseRollDegrees
+
+    exposure_time: Optional[float] = None            # seconds (GPMF SHUT)
+    iso: Optional[int] = None                        # GPMF ISOE
 
     keywords: Optional[Sequence[str]] = None
     extra: dict = field(default_factory=dict)
@@ -3719,6 +4121,12 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
                  "-CameraSerialNumber=%s" % meta.serial,
                  "-XMP-aux:SerialNumber=%s" % meta.serial]
 
+    # --- per-frame exposure recorded by the camera (GoPro SHUT/ISOE) ------
+    if meta.exposure_time:
+        tags.append("-ExposureTime=%r" % meta.exposure_time)
+    if meta.iso:
+        tags.append("-ISO=%d" % meta.iso)
+
     # --- EXIF GPS (UTC date/time, true-north directions) -----------------
     if meta.lat is not None and meta.lon is not None:
         tags += ["-GPSVersionID=2 3 0 0",
@@ -3764,10 +4172,7 @@ def build_exiftool_args(meta: FrameMetadata) -> List[str]:
     # Only UserComment: ImageDescription, XPComment and XMP:Description are
     # shown as the photo's caption by galleries and Panoramax.
     tags += ["-UserComment=" + provenance(meta),
-             "-XMP:CreatorTool=" + SOFTWARE_TAG,
-             "-XMP:Title=%s %s" % (meta.video,
-                                   local.strftime("%Y-%m-%d %H:%M:%S")
-                                   if local else "")]
+             "-XMP:CreatorTool=" + SOFTWARE_TAG]
     if local is not None:
         tags += ["-XMP:CreateDate=" + local.strftime("%Y:%m:%d %H:%M:%S"),
                  "-XMP:ModifyDate=" + local.strftime("%Y:%m:%d %H:%M:%S")]
@@ -4306,7 +4711,8 @@ def blackvue__record_from_choice(choice, args, video_start_utc, video_start_loca
         naming = dt.datetime(1970, 1, 1)
 
     heading, heading_source = resolve_heading(
-        point, args.heading_offset, args.magnetic_declination)
+        point, args.heading_offset, args.magnetic_declination,
+        getattr(args, "recenter_deg", 0.0))
     accuracy, accuracy_estimated, accuracy_source = derive_accuracy(
         point, args.uere)
     course = point.get("course")
@@ -4396,6 +4802,7 @@ def blackvue_process_video(video, sequence, output_dir, args, have_exiftool):
     """Export one video sequence. Returns a summary dict; never raises Fatal."""
     name = os.path.basename(video)
     LOG.info("--- %s -> %s", name, sequence)
+    log_heading_offset(args)
 
     info = blackvue_probe_video(video)
     LOG.info("  video: %sx%s %s %.3f fps, %s frames, %.2f s",
@@ -4727,7 +5134,8 @@ def max360_build_eac_filter(a: int, b: Optional[int], width: int, height: int,
                      interp: str = "cubic",
                      already_equirect: bool = False,
                      hemi_width: int = max360_HEMI_W,
-                     hemi_height: int = max360_HEMI_H) -> str:
+                     hemi_height: int = max360_HEMI_H,
+                     yaw: float = 0.0) -> str:
     """Build the ffmpeg filter graph for one EAC hemisphere pair.
 
     A native 4096x1344 strip is side 1376 + centre 1344 + side 1376 with no
@@ -4735,15 +5143,21 @@ def max360_build_eac_filter(a: int, b: Optional[int], width: int, height: int,
     so they must be cross-blended instead of simply cropped (max2sphere does
     the same).  The six faces are assembled into a 3x2 EAC net and v360
     reprojects it to equirectangular.  The 2272x736 (side 768, centre 736,
-    blend 16) layout is handled by the same code.
+    blend 16) layout is handled by the same code.  A non-zero *yaw*
+    re-centres the sphere in the same v360 call (see :func:`recenter_yaw`).
     """
+    yaw_opt = ":yaw=%.6f" % yaw if abs(yaw) >= 1e-6 else ""
     lines: List[str] = []
     if already_equirect:
         if select:
             lines.append("[0:%d]select='%s'[src]" % (a, select))
         else:
             lines.append("[0:%d]null[src]" % a)
-        lines.append("[src]scale=%d:%d[OUT]" % (width, height))
+        if yaw_opt:
+            lines.append("[src]v360=e:e%s:interp=%s:w=%d:h=%d[OUT]"
+                         % (yaw_opt, interp, width, height))
+        else:
+            lines.append("[src]scale=%d:%d[OUT]" % (width, height))
         return ";\n".join(lines)
 
     if b is None:
@@ -4814,8 +5228,8 @@ def max360_build_eac_filter(a: int, b: Optional[int], width: int, height: int,
     lines.append("[LEFT][FRONT][RIGHT]hstack=inputs=3[ROWA]")
     lines.append("[DOWN][BACK][UP]hstack=inputs=3[ROWB]")
     lines.append("[ROWA][ROWB]vstack=inputs=2[eac]")
-    lines.append("[eac]v360=eac:equirect:interp=%s:w=%d:h=%d[OUT]"
-                 % (interp, width, height))
+    lines.append("[eac]v360=eac:equirect%s:interp=%s:w=%d:h=%d[OUT]"
+                 % (yaw_opt, interp, width, height))
     return ";\n".join(lines)
 
 
@@ -4877,10 +5291,11 @@ def max360__kept_filter_path(base: str, index: int, total: int) -> str:
 
 def max360__level_image(src: str, dest: str, roll_deg: float, pitch_deg: float,
                         *, width: int, height: int, image_format: str,
-                        quality: int, interp: str, threads: int) -> None:
-    """Level one stitched equirectangular image and write the final file."""
+                        quality: int, interp: str, threads: int,
+                        yaw: float = 0.0) -> None:
+    """Level (and re-centre) one stitched equirectangular image."""
     rotate = (abs(float(roll_deg)) >= 0.05
-              or abs(float(pitch_deg)) >= 0.05)
+              or abs(float(pitch_deg)) >= 0.05 or abs(float(yaw)) >= 0.05)
     same_format = (os.path.splitext(src)[1].lower()
                    == os.path.splitext(dest)[1].lower())
     if not rotate and same_format:
@@ -4889,7 +5304,7 @@ def max360__level_image(src: str, dest: str, roll_deg: float, pitch_deg: float,
     cmd = [FFMPEG, "-v", "error", "-y", "-i", src]
     if rotate:
         cmd += ["-vf", max360_level_filter(
-            roll_deg, pitch_deg, width, height, interp)]
+            roll_deg, pitch_deg, width, height, interp, yaw=yaw)]
     cmd += ["-frames:v", "1",
             "-pix_fmt", "rgb24" if image_format == "png" else "yuvj420p"]
     cmd += ffmpeg_quality_args(image_format, quality)
@@ -4906,7 +5321,7 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
                   keep_filter: Optional[str], total_batches: int,
                   seek_time: Optional[float],
                   levels: Optional[Mapping[int, Tuple[float, float]]] = None,
-                  workers: int = 1) -> None:
+                  workers: int = 1, yaw: float = 0.0) -> None:
     """Run one bounded EAC/v360 batch and copy its images to their targets.
 
     When *levels* contains a roll/pitch pair for any selected frame, the batch
@@ -4920,10 +5335,13 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
     selected = ordered if seek_time is None else\
         [frame - ordered[0] for frame in ordered]
     select = select_expression(selected)
+    # Without leveling the re-centring yaw is part of the stitching v360;
+    # leveled frames get it in their per-frame rotation instead.
     script = max360_build_eac_filter(
         info.hemi_a, info.hemi_b, width, height, select=select,
         interp=interp, already_equirect=info.already_equirect,
-        hemi_width=info.width, hemi_height=info.height)
+        hemi_width=info.width, hemi_height=info.height,
+        yaw=0.0 if leveled else yaw)
     attempt = "seek" if seek_time is not None else "full"
     script_path = os.path.join(
         temp_dir, "stitch_%03d_%s.filter" % (batch_index, attempt))
@@ -4980,7 +5398,7 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
             max360__level_image(
                 temp, dest, roll, pitch, width=width, height=height,
                 image_format=image_format, quality=quality, interp=interp,
-                threads=threads)
+                threads=threads, yaw=yaw)
         else:
             move_file(temp, dest)
 
@@ -5000,7 +5418,7 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
                   threads: int, keep_filter: Optional[str],
                   timeline: Optional[FrameTimeline] = None,
                   levels: Optional[Mapping[int, Tuple[float, float]]] = None,
-                  workers: int = 1) -> None:
+                  workers: int = 1, yaw: float = 0.0) -> None:
     """Stitch selected frames in bounded batches (seek-assisted when possible).
 
     A single ``select`` expression cannot hold hundreds of frame numbers, so
@@ -5039,7 +5457,7 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
                     image_format=image_format, interp=interp,
                     threads=threads, keep_filter=keep_filter,
                     total_batches=len(chunks), seek_time=seek_time,
-                    levels=levels, workers=inner_workers)
+                    levels=levels, workers=inner_workers, yaw=yaw)
                 return
             except max360_BackendError as exc:
                 LOG.warning("seek-based stitching failed for frames "
@@ -5050,7 +5468,7 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
             width=width, height=height, quality=quality,
             image_format=image_format, interp=interp, threads=threads,
             keep_filter=keep_filter, total_batches=len(chunks),
-            seek_time=None, levels=levels, workers=inner_workers)
+            seek_time=None, levels=levels, workers=inner_workers, yaw=yaw)
 
     try:
         items = list(enumerate(chunks))
@@ -5069,12 +5487,17 @@ def max360_stitch_max2sphere(info: max360_VideoInfo, frames: Sequence[int],
                       quality: int, image_format: str, interp: str,
                       threads: int,
                       levels: Optional[Mapping[int, Tuple[float, float]]] = None,
-                      workers: int = 1) -> None:
-    """Stitch with the optional max2sphere binary, then extract frames."""
+                      workers: int = 1, yaw: float = 0.0) -> None:
+    """Stitch with the optional max2sphere binary, then extract frames.
+
+    max2sphere cannot rotate, so leveled or re-centred frames take one extra
+    v360 pass each (via a lossless PNG).
+    """
     temp_dir = tempfile.mkdtemp(prefix="max360_m2s_")
     video_out = os.path.join(temp_dir, "equirect.mp4")
-    leveled = levels is not None and any(
-        levels.get(int(frame)) is not None for frame in frames)
+    leveled = (levels is not None and any(
+        levels.get(int(frame)) is not None for frame in frames)) \
+        or abs(yaw) >= 0.05
     try:
         max360__run(max360_max2sphere_command(info.path, video_out, width, height, info.fps))
         timeline = probe_frame_timeline(
@@ -5103,7 +5526,7 @@ def max360_stitch_max2sphere(info: max360_VideoInfo, frames: Sequence[int],
                 max360__level_image(
                     temp, dest, roll, pitch, width=width, height=height,
                     image_format=image_format, quality=quality, interp=interp,
-                    threads=threads)
+                    threads=threads, yaw=yaw)
             else:
                 shutil.copyfile(temp, dest)
 
@@ -5137,6 +5560,43 @@ def max360__smooth(values: Sequence[float], window: int) -> List[float]:
     return out
 
 
+# GoPro capture modes whose fixed rate makes the linear GPS-to-video time
+# mapping exact.  Anything else (TimeWarp "Auto" speed, odd rates) is mapped
+# linearly too, but deserves a warning.
+TIMELAPSE_INTERVALS_S = (0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+TIMEWARP_FACTORS = (2.0, 5.0, 10.0, 15.0, 30.0)
+SLOWMO_FACTORS = (2.0, 4.0, 8.0)
+RATE_MATCH_TOLERANCE = 0.03
+
+
+def log_time_scale(speedup: float, fps: float, real_span: float,
+                   video_span: float) -> None:
+    """Describe a video whose playback rate differs from real time."""
+    def near(value: float, nominal: float) -> bool:
+        return abs(value / nominal - 1.0) <= RATE_MATCH_TOLERANCE
+
+    detail = "%.0f s recorded in %.1f s of video" % (real_span, video_span)
+    if speedup > 1.0:
+        interval = speedup / fps if fps > 0 else 0.0
+        if interval and any(near(interval, n) for n in TIMELAPSE_INTERVALS_S):
+            LOG.info("  time-lapse: 1 frame every %.2f s of real time "
+                     "(%.1fx speed-up, %s)", interval, speedup, detail)
+            return
+        factor = next((f for f in TIMEWARP_FACTORS if near(speedup, f)), None)
+        if factor is not None:
+            LOG.info("  TimeWarp %gx (%s)", factor, detail)
+            return
+    else:
+        factor = next((f for f in SLOWMO_FACTORS
+                       if near(1.0 / speedup, f)), None)
+        if factor is not None:
+            LOG.info("  slow motion %gx (%s)", factor, detail)
+            return
+    LOG.warning("  unusual playback rate %.2fx real time (%s); frame times "
+                "are mapped linearly and may drift if the rate varied "
+                "(e.g. TimeWarp Auto speed)", speedup, detail)
+
+
 def max360_build_track(path: str, info: max360_VideoInfo,
                        args) -> Tuple[Optional[Track], Optional[GpmfData]]:
     """Return ``(track, gpmf)`` and ``(None, gpmf)`` when GPS is unusable.
@@ -5154,12 +5614,14 @@ def max360_build_track(path: str, info: max360_VideoInfo,
     if not data.has_gps:
         data.origin_utc = info.creation_time
         _anchor_imu_utc(data.imu, data.origin_utc)
+        _anchor_imu_utc(data.exposure, data.origin_utc)
         return None, data
 
     timed = [s for s in data.gps_samples if s.get("utc") is not None]
     if not timed:
         data.origin_utc = info.creation_time
         _anchor_imu_utc(data.imu, data.origin_utc)
+        _anchor_imu_utc(data.exposure, data.origin_utc)
         return None, data
     first_sample = min(timed, key=lambda sample: sample["utc"])
     first_gps = first_sample["utc"]
@@ -5207,9 +5669,7 @@ def max360_build_track(path: str, info: max360_VideoInfo,
             scale = info.duration / gps_span
             origin = first_gps
             origin_is_gps = True
-            LOG.warning("  TimeWarp/rate change detected: GPS span %.2f s -> "
-                        "video span %.2f s (scale %.4f)", gps_span,
-                        info.duration, scale)
+            log_time_scale(ratio, info.fps, gps_span, info.duration)
 
     samples = []
     for sample in data.gps_samples:
@@ -5224,6 +5684,10 @@ def max360_build_track(path: str, info: max360_VideoInfo,
         item["course"] = None
         apply_accuracy(item, args.uere)
         samples.append(item)
+    samples.sort(key=lambda s: s["t"])
+    max_dop = getattr(args, "max_dop", GPS_MAX_DOP)
+    samples, n_dop, n_jump = reject_bad_gps(samples, max_dop)
+    log_rejected_gps(n_dop, n_jump, max_dop)
     if not samples:
         # No usable fix (for example an indoor recording).  Keep the clock and
         # IMU so the caller can still export an unpositioned time-lapse.
@@ -5239,9 +5703,12 @@ def max360_build_track(path: str, info: max360_VideoInfo,
             sample["lat"], sample["lon"] = lat, lon
 
     track = Track(samples, args.distance_mode)
+    stale = data.clock_stale_stamps
     LOG.info("  telemetry: %d GPS sample(s), %.1f m of travel, "
-             "clock spread %.0f ms", len(samples), track.length,
-             data.clock_spread_s * 1000)
+             "clock spread %.0f ms%s", len(samples), track.length,
+             data.clock_spread_s * 1000,
+             " (%d stale GPS time stamp%s ignored)"
+             % (stale, "" if stale == 1 else "s") if stale else "")
     data.origin_utc = origin
     data.time_scale = scale
     return track, data
@@ -5251,19 +5718,12 @@ def max360_build_track(path: str, info: max360_VideoInfo,
 # Records
 # ---------------------------------------------------------------------------
 def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
-    # The GPano pose and the pixels must never both carry the tilt.  With
-    # ``--level-horizon rotate`` the sphere is physically remapped (and left
-    # untouched with ``no``), so the pose stays level.  With ``exif`` the
-    # pixels are untouched and the smoothed roll/pitch go into the pose tags
-    # so viewers can level the sphere themselves.  The raw angles remain
-    # available in the per-image telemetry either way.
-    pose_roll = 0.0
-    pose_pitch = 0.0
-    if record.get("level_mode") == LEVEL_MODE_EXIF:
-        roll = record.get("level_roll_deg")
-        pitch = record.get("level_pitch_deg")
-        if roll is not None and pitch is not None:
-            pose_roll, pose_pitch = gpano_pose(roll, pitch)
+    # The GPano pose is always level: --level-horizon rotates the pixels
+    # themselves, and without it the source tilt is kept as recorded.  The
+    # raw angles remain available in the per-image telemetry.
+    extra = {}
+    if record.get("recentered_deg"):
+        extra["recentered_deg"] = "%03d" % int(round(record["recentered_deg"]))
     return FrameMetadata(
         camera=CAMERA_LABELS[CAMERA_MAX], video=record["video"],
         sequence=record["sequence"], frame_index=record["frame_index"],
@@ -5287,8 +5747,9 @@ def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
         clamped=record.get("clamped"), estimated=record.get("estimated"),
         image_width=args.width, image_height=args.height, panorama=True,
         pose_heading=record.get("heading_deg"),
-        pose_pitch=round(pose_pitch, 3), pose_roll=round(pose_roll, 3),
-        keywords=parse_keywords(args.keywords),
+        pose_pitch=0.0, pose_roll=0.0,
+        exposure_time=record.get("exposure_time_s"), iso=record.get("iso"),
+        keywords=parse_keywords(args.keywords), extra=extra,
     )
 
 
@@ -5316,7 +5777,8 @@ def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
         naming = dt.datetime(1970, 1, 1)
 
     heading, heading_source = resolve_heading(
-        point, args.heading_offset, args.magnetic_declination)
+        point, args.heading_offset, args.magnetic_declination,
+        getattr(args, "recenter_deg", 0.0))
     accuracy, accuracy_estimated, accuracy_source = derive_accuracy(
         point, args.uere)
     course = point.get("course")
@@ -5328,6 +5790,7 @@ def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
     unpositioned = point.get("lat") is None
     return {
         "sequence": sequence, "video": video_name, "camera": CAMERA_MAX,
+        "recentered_deg": getattr(args, "recenter_deg", 0.0) or None,
         "image": image_filename(naming, args.format),
         "frame_index": int(choice.frame_index), "pts_seconds": round(pts, 3),
         "datetime_local": local.isoformat() if local else None,
@@ -5360,6 +5823,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     result = {"video": name, "sequence": sequence, "images": 0,
               "planned": 0, "failed": False, "entries": [], "dir": None}
     LOG.info("--- %s -> %s", name, sequence)
+    log_heading_offset(args)
     info = max360_probe(path)
     LOG.info("  video: %dx%d %.4f fps, %d frame(s), %.2f s%s",
              info.width, info.height, info.fps, info.frame_count,
@@ -5424,11 +5888,13 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                    start_utc=fallback_start,
                    time_scale=gpmf.time_scale if gpmf else 1.0)
                for c in choices]
-    level_mode = getattr(args, "level_horizon", LEVEL_NONE)
-    if level_mode != LEVEL_NONE:
+    attach_exposure(records, gpmf.exposure if gpmf else None)
+    level_on = bool(getattr(args, "level_horizon", False))
+    if level_on:
         window_s = float(getattr(args, "level_window", LEVEL_WINDOW_DEFAULT))
-        angles, leveled = _image_angles(records, gpmf.imu if gpmf else None,
-                                        window_s=window_s)
+        angles, leveled = _image_angles(
+            records, gpmf.imu if gpmf else None, window_s=window_s,
+            track=track if LEVEL_ACCEL_WEIGHTING else None)
         for record in records:
             angle = angles.get(record["frame_index"])
             if angle is not None:
@@ -5436,15 +5902,12 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
             level = leveled.get(record["frame_index"])
             if level is not None:
                 record["level_roll_deg"], record["level_pitch_deg"] = level
-                record["level_mode"] = level_mode
                 record["level_window_s"] = window_s
-        LOG.info("  horizon: IMU pose for %d/%d image(s) (%s); %s",
-                 len(leveled), len(records),
-                 "median over a %g s real-time window" % window_s
+        LOG.info("  horizon: leveling %d/%d image(s) (%s, at most %.1f deg "
+                 "change between images)", len(leveled), len(records),
+                 "Gaussian average over a %g s real-time window" % window_s
                  if window_s > 0 else "nearest sample, no smoothing",
-                 "sphere pixels will be rotated"
-                 if level_mode == LEVEL_MODE_ROTATE
-                 else "written to XMP-GPano pose tags, pixels untouched")
+                 LEVEL_MAX_STEP_DEG)
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         args.output, CAMERA_MAX, sequence, first_time,
@@ -5481,8 +5944,9 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     backend = max360__resolve_backend(args.stitch_backend)
     LOG.info("  stitching backend: %s", backend)
+    yaw = recenter_yaw(getattr(args, "recenter_deg", 0.0))
     levels = None
-    if level_mode == LEVEL_MODE_ROTATE:
+    if level_on:
         levels = {}
         for record in to_extract:
             roll = record.get("level_roll_deg")
@@ -5499,14 +5963,14 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                               height=args.height, quality=args.quality,
                               image_format=args.format, interp=args.interp,
                               threads=args.threads, levels=levels,
-                              workers=args.workers)
+                              workers=args.workers, yaw=yaw)
         else:
             max360_stitch_ffmpeg(info, frames, outputs, width=args.width,
                           height=args.height, quality=args.quality,
                           image_format=args.format, interp=args.interp,
                           threads=args.threads, keep_filter=keep_filter,
                           timeline=timeline, levels=levels,
-                          workers=args.workers)
+                          workers=args.workers, yaw=yaw)
         for record in to_extract:
             record["written"] = os.path.exists(record["path"])
     if (args.start_distance == 0 and records
@@ -6355,7 +6819,8 @@ def virb__record_from_choice(choice, track, args, video_start_utc, tz_offset,
         naming = dt.datetime(1970, 1, 1)
 
     heading, heading_source = resolve_heading(
-        point, args.heading_offset, args.magnetic_declination)
+        point, args.heading_offset, args.magnetic_declination,
+        getattr(args, "recenter_deg", 0.0))
     accuracy, accuracy_estimated, accuracy_source = derive_accuracy(
         point, args.uere)
     course = point.get("course")
@@ -6506,6 +6971,7 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
     """Export one video sequence. Returns a summary dict; never raises Fatal."""
     name = os.path.basename(video)
     LOG.info("--- %s -> %s", name, sequence)
+    log_heading_offset(args)
 
     info = virb_probe_video(video)
     LOG.info("  video: %sx%s %s %.3f fps, %s frames, %.2f s",
@@ -6652,7 +7118,7 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
             choice, track, args, video_start_utc, tz_offset, tz_known,
             CAMERA_VIRB, sequence, name))
 
-    if args.level_horizon != LEVEL_NONE:
+    if args.level_horizon:
         LOG.info("  --level-horizon applies to 360 videos only; flat %s "
                  "frames are exported as recorded", CAMERA_LABELS[CAMERA_VIRB])
 
@@ -6817,6 +7283,7 @@ def hero_build_track(info: hero_VideoInfo, args):
     if not data.has_gps:
         data.origin_utc = info.creation_time
         _anchor_imu_utc(data.imu, data.origin_utc)
+        _anchor_imu_utc(data.exposure, data.origin_utc)
         return None, data
 
     origin = info.creation_time
@@ -6837,6 +7304,10 @@ def hero_build_track(info: hero_VideoInfo, args):
         item["t"] = (utc - origin).total_seconds()
         apply_accuracy(item, args.uere)
         samples.append(item)
+    samples.sort(key=lambda s: s["t"])
+    max_dop = getattr(args, "max_dop", GPS_MAX_DOP)
+    samples, n_dop, n_jump = reject_bad_gps(samples, max_dop)
+    log_rejected_gps(n_dop, n_jump, max_dop)
     if not samples:
         return None, data
     samples.sort(key=lambda sample: sample["t"])
@@ -6872,7 +7343,8 @@ def hero__record(choice, args, info: hero_VideoInfo, tz_offset: int, tz_known: b
         naming = dt.datetime(1970, 1, 1)
 
     heading, heading_source = resolve_heading(
-        point, args.heading_offset, args.magnetic_declination)
+        point, args.heading_offset, args.magnetic_declination,
+        getattr(args, "recenter_deg", 0.0))
     accuracy, accuracy_estimated, accuracy_source = derive_accuracy(
         point, args.uere)
     course = point.get("course")
@@ -6932,6 +7404,7 @@ def hero__metadata_for(record, info: hero_VideoInfo, args):
         position_source=record.get("position_source"),
         clamped=record.get("clamped"), estimated=record.get("estimated"),
         image_width=info.width, image_height=info.height, panorama=False,
+        exposure_time=record.get("exposure_time_s"), iso=record.get("iso"),
         keywords=parse_keywords(args.keywords),
         extra={"unpositioned": record.get("unpositioned")},
     )
@@ -6942,6 +7415,7 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
     result = {"video": name, "sequence": sequence, "images": 0,
               "planned": 0, "failed": False, "entries": [], "dir": None}
     LOG.info("--- %s -> %s", name, sequence)
+    log_heading_offset(args)
     info = hero_probe(path)
     LOG.info("  video: %dx%d %.4f fps, %d frame(s), %.2f s", info.width,
              info.height, info.fps, info.frame_count, info.duration)
@@ -6991,8 +7465,9 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 
     records = [hero__record(choice, args, info, tz_offset, tz_known, sequence)
                for choice in choices]
+    attach_exposure(records, gpmf.exposure if gpmf else None)
 
-    if args.level_horizon != LEVEL_NONE:
+    if args.level_horizon:
         LOG.info("  --level-horizon applies to 360 videos only; flat %s "
                  "frames are exported as recorded", CAMERA_LABELS[CAMERA_HERO])
 
@@ -7210,6 +7685,7 @@ def process_group(camera: str, videos: Sequence[str], root: str,
                   output_dir: str, args: argparse.Namespace,
                   have_exiftool: bool) -> Tuple[List[dict], List[dict], int]:
     """Run one camera pipeline over its accepted videos."""
+    base_args = args
     sequence_ids = build_sequence_ids(videos, root)
     fits: List[str] = []
     telemetry_cache: dict = {}
@@ -7226,6 +7702,7 @@ def process_group(camera: str, videos: Sequence[str], root: str,
     for video in videos:
         sequence = sequence_ids[video]
         try:
+            args = video_args(base_args, video, camera)
             if camera == CAMERA_BLACKVUE:
                 summary = blackvue_process_video(video, sequence, output_dir,
                                                  args, have_exiftool)
@@ -7275,8 +7752,56 @@ def write_manifest(path: str, entries: Sequence[dict],
         fh.write("\n")
 
 
+def reject_old_level_horizon(parser: argparse.ArgumentParser,
+                             argv: Sequence[str]) -> None:
+    """Explain the old ``--level-horizon rotate|exif|no`` syntax."""
+    for i, arg in enumerate(argv):
+        name, _, value = arg.partition("=")
+        if name not in ("--level-horizon", "--horizon"):
+            continue
+        if not value and i + 1 < len(argv):
+            value = argv[i + 1] if argv[i + 1] in LEVEL_HORIZON_OLD_VALUES \
+                else ""
+        if value:
+            parser.error("%s no longer takes a value (got %r): give "
+                         "--level-horizon to level the horizon (the former "
+                         "'rotate'), leave it out to keep the source tilt; "
+                         "'exif' was removed" % (name, value))
+
+
+def check_videos(videos: Sequence[str], args: argparse.Namespace) -> bool:
+    """Validate folder heading offsets and warn about duplicate file names."""
+    ok = True
+    if getattr(args, "heading_offset_auto", False):
+        for folder in sorted({os.path.dirname(os.path.abspath(v))
+                              for v in videos}):
+            try:
+                offset = folder_heading_offset(os.path.basename(folder))
+            except ValueError as exc:
+                LOG.error("--heading-offset auto: %s", exc)
+                ok = False
+                continue
+            LOG.info("heading offset %s: %s",
+                     "%03d" % int(offset) if offset is not None else "none",
+                     folder)
+    by_name: Dict[str, List[str]] = {}
+    for video in videos:
+        by_name.setdefault(os.path.basename(video).lower(), []).append(video)
+    for name, paths in sorted(by_name.items()):
+        folders = sorted({os.path.dirname(os.path.abspath(p)) for p in paths})
+        if len(folders) > 1:
+            LOG.warning("video file name %s occurs in %d folders (%s); their "
+                        "images may share an output folder, where an existing "
+                        "image is skipped rather than overwritten",
+                        os.path.basename(paths[0]), len(folders),
+                        ", ".join(folders))
+    return ok
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
+    reject_old_level_horizon(parser,
+                             sys.argv[1:] if argv is None else list(argv))
     args = parser.parse_args(argv)
     if args.input is None:
         args.input = args.input_alias
@@ -7303,6 +7828,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not videos:
         LOG.error("no video files matching %s found under %s",
                   ",".join(extensions), input_arg)
+        return 2
+
+    if not check_videos(videos, args):
         return 2
 
     groups = detect_groups(videos)
