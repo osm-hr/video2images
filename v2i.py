@@ -6,7 +6,7 @@ Everything needed to identify videos, read telemetry, select frames, extract
 stills and write metadata lives in this single file.  Supported cameras:
 
     * Garmin VIRB Ultra 30   (MP4 + sibling FIT telemetry)
-    * GoPro MAX 360 / MAX2   (``.360`` EAC hemispheres -> equirectangular)
+    * GoPro Max, GoPro Max2  (``.360`` EAC hemispheres -> equirectangular)
     * BlackVue DR900         (MP4 with embedded NMEA)
     * GoPro HERO             (flat MP4 with GPMF telemetry)
 
@@ -73,13 +73,15 @@ FFMPEG = os.environ.get("V2I_FFMPEG", "ffmpeg")
 # Camera identities
 # ---------------------------------------------------------------------------
 CAMERA_VIRB = "garmin-virb-ultra-30"
-CAMERA_MAX = "gopro-max-360"
+CAMERA_MAX = "gopro-max"
+CAMERA_MAX2 = "gopro-max2"
 CAMERA_BLACKVUE = "blackvue-dr900"
 CAMERA_HERO = "gopro-hero"
 
 CAMERA_LABELS = {
     CAMERA_VIRB: "Garmin VIRB Ultra 30",
-    CAMERA_MAX: "GoPro MAX 360",
+    CAMERA_MAX: "GoPro Max",
+    CAMERA_MAX2: "GoPro Max2",
     CAMERA_BLACKVUE: "BlackVue DR900",
     CAMERA_HERO: "GoPro HERO",
 }
@@ -87,10 +89,15 @@ CAMERA_LABELS = {
 # Stable output-directory suffix (``YYYY-MM-DD-<suffix>``).
 CAMERA_SUFFIX = {
     CAMERA_VIRB: "virb30",
-    CAMERA_MAX: "max360",
+    CAMERA_MAX: "max",
+    CAMERA_MAX2: "max2",
     CAMERA_BLACKVUE: "blackvue",
     CAMERA_HERO: "hero",
 }
+
+# GoPro 360 cameras: separate cameras (labels, counts, output folders) that
+# share the EAC stitching pipeline (``max360_*`` functions).
+CAMERA_360 = (CAMERA_MAX, CAMERA_MAX2)
 
 # Default scanned extensions.  The single entry point scans this set and uses
 # :func:`detect_camera` to route each file to its camera pipeline.
@@ -278,7 +285,7 @@ class GoProSettings:
     place the camera's own photos take their EXIF from).  ``tz_offset_s`` is
     the camera's configured UTC offset (``TZON``, minutes, daylight saving
     included) and ``local_created`` the camera-local wall clock (``CDAT``);
-    the GoPro MAX does not write either, the MAX2 and HERO11 do.
+    the GoPro Max does not write either, the MAX2 and HERO11 do.
     """
     model: Optional[str] = None             # MINF, e.g. "GoPro Max", "MAX2"
     firmware: Optional[str] = None          # FMWR
@@ -360,11 +367,20 @@ def read_gopro_settings(path: str) -> GoProSettings:
     return settings
 
 
+# EXIF ``Model`` for the GoPro 360 cameras.  The MAX writes "GoPro Max" into
+# its own photos; the MAX2 reports only "MAX2", so it gets the same title case
+# ("GoPro Max2") for consistency.  Other models (HERO) keep the camera's text.
+GOPRO_360_MODEL_NAMES = {"MAX": "GoPro Max", "MAX2": "GoPro Max2"}
+
+
 def gopro_model_name(minf: Optional[str], fallback: str) -> str:
-    """EXIF ``Model`` as the camera writes it ("GoPro Max", "GoPro MAX2")."""
+    """EXIF ``Model``: "GoPro Max" / "GoPro Max2", else the camera's text."""
     text = (minf or "").strip()
     if not text:
         return fallback
+    key = re.sub(r"^GOPRO\s*", "", text.upper()).replace(" ", "")
+    if key in GOPRO_360_MODEL_NAMES:
+        return GOPRO_360_MODEL_NAMES[key]
     return text if text.lower().startswith("gopro") else "GoPro " + text
 
 
@@ -392,8 +408,61 @@ def read_gpmf_device_name(path: str, stream_index: Optional[int],
         return None
 
 
+# GoPro Max2 hemisphere strip size, used when no device name is available.
+MAX2_STRIP_SIZE = (5888, 1920)
+
+
+def gopro_360_camera(path: str, device_name: Optional[str] = None,
+                     streams: Optional[Sequence[dict]] = None
+                     ) -> Tuple[str, str]:
+    """Tell a GoPro Max from a MAX2: ``(camera, evidence)``.
+
+    The GPMF device name (``MAX2`` / ``GoPro Max``) decides, then the model
+    in the file's Global Settings block (``MINF``), then the hemisphere size
+    (MAX2 strips are 5888x1920).  The default is the MAX.
+    """
+    for source, value in (("GPMF device name", device_name),
+                          ("camera model", read_gopro_settings(path).model)):
+        text = (value or "").upper().replace(" ", "")
+        if "MAX2" in text:
+            return CAMERA_MAX2, "%s %r" % (source, value)
+        if "MAX" in text:
+            return CAMERA_MAX, "%s %r" % (source, value)
+    for stream in streams or []:
+        size = (int(stream.get("width") or 0), int(stream.get("height") or 0))
+        if size == MAX2_STRIP_SIZE:
+            return CAMERA_MAX2, "%dx%d MAX2 hemisphere layout" % size
+    return CAMERA_MAX, "dual EAC layout of the GoPro Max"
+
+
 def detect_camera(path: str, *, ffprobe: str = FFPROBE) -> Detection:
     """Identify the camera that recorded *path* from its metadata.
+
+    GoPro 360 files are first recognised as a 360 GoPro, then told apart
+    (MAX or MAX2) by :func:`gopro_360_camera`.
+    """
+    detection = _detect_camera_family(path, ffprobe=ffprobe)
+    if detection.camera != CAMERA_MAX:
+        return detection
+    streams: List[dict] = []
+    if not detection.device_name:
+        try:
+            streams = probe_metadata(path, ffprobe).video_streams_info()
+        except UnreadableVideo:
+            streams = []
+    camera, why = gopro_360_camera(path, detection.device_name, streams)
+    evidence = dict(detection.evidence)
+    if camera == CAMERA_MAX2:
+        evidence[CAMERA_MAX2] = list(evidence.get(CAMERA_MAX, [])) + [why]
+        evidence[CAMERA_MAX] = []
+    else:
+        evidence[CAMERA_MAX] = list(evidence.get(CAMERA_MAX, []))
+    return Detection(camera, CAMERA_LABELS[camera], evidence, None,
+                     detection.device_name)
+
+
+def _detect_camera_family(path: str, *, ffprobe: str = FFPROBE) -> Detection:
+    """Identify the camera family; GoPro 360 files all report ``CAMERA_MAX``.
 
     Returns a :class:`Detection`.  ``camera`` is ``None`` when the file is
     unreadable, when no known camera can be identified, or when evidence is
@@ -407,7 +476,8 @@ def detect_camera(path: str, *, ffprobe: str = FFPROBE) -> Detection:
         return Detection(None, None, {}, "invalid or unreadable video (%s)" % exc)
 
     evidence: Dict[str, List[str]] = {
-        CAMERA_VIRB: [], CAMERA_MAX: [], CAMERA_BLACKVUE: [], CAMERA_HERO: [],
+        CAMERA_VIRB: [], CAMERA_MAX: [], CAMERA_MAX2: [], CAMERA_BLACKVUE: [],
+        CAMERA_HERO: [],
     }
     handlers = meta.handler_text
     if "garmin" in handlers:
@@ -436,7 +506,7 @@ def detect_camera(path: str, *, ffprobe: str = FFPROBE) -> Detection:
     if _RE_VIRB_NAME.match(name):
         evidence[CAMERA_VIRB].append("VIRB file name (%s)" % name)
     if _RE_MAX_NAME.match(name):
-        evidence[CAMERA_MAX].append("GoPro MAX file name (%s)" % name)
+        evidence[CAMERA_MAX].append("GoPro Max file name (%s)" % name)
     if _RE_HERO_NAME.match(name):
         evidence[CAMERA_HERO].append("GoPro HERO file name (%s)" % name)
     if _RE_BLACKVUE_NAME.match(name):
@@ -484,7 +554,7 @@ def detect_camera(path: str, *, ffprobe: str = FFPROBE) -> Detection:
         if "HERO" in upper and not any("MAX" in w for w in max_specific):
             return Detection(CAMERA_HERO, CAMERA_LABELS[CAMERA_HERO], evidence,
                              None, gpmf_device)
-        labels = "GoPro MAX 360 / GoPro HERO"
+        labels = "GoPro Max / GoPro HERO"
         return Detection(None, None, evidence,
                          "ambiguous GoPro model metadata (%s)" % labels,
                          gpmf_device)
@@ -527,8 +597,7 @@ def skip_reason(detection: Detection, expected: str) -> Optional[str]:
 def summarize_detections(counts: Dict[Optional[str], int]) -> str:
     """One-line count per known camera type plus unrecognised files."""
     parts = ["%s=%d" % (CAMERA_LABELS[camera], counts.get(camera, 0))
-             for camera in (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_VIRB,
-                            CAMERA_HERO)]
+             for camera in CAMERA_ORDER]
     unsupported = counts.get(None, 0)
     if unsupported:
         parts.append("unsupported=%d" % unsupported)
@@ -665,7 +734,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                              "travel to the camera's front lens, e.g. 90 when "
                              "the lens faces right; 'auto' reads it from each "
                              "video's folder name (a separate 3-digit part, "
-                             "e.g. 2026-11-05-max360-090-30fps).  360 videos "
+                             "e.g. 2026-11-05-max-090-30fps).  360 videos "
                              "are rotated so the direction of travel is the "
                              "image centre (see --no-recenter-forward); flat "
                              "videos keep the pixels, add the offset to the "
@@ -1109,7 +1178,7 @@ def resolve_timezone(args: argparse.Namespace, detected: Optional[int], *,
         return 0, True
     if detected is not None:
         return detected, True
-    if camera in (CAMERA_MAX, CAMERA_HERO):
+    if camera in CAMERA_360 + (CAMERA_HERO,):
         logger.warning("no camera-local timezone in this video; using UTC for "
                        "file names and EXIF (pass --timezone to override)")
     return 0, False
@@ -1541,7 +1610,7 @@ def folder_heading_offset(name: str) -> Optional[float]:
     The name is split on ``-`` and ``_``; the offset is a part that consists
     of exactly three digits (``000``-``360``) and is not the first part, so it
     has a separator before it and a separator or the end of the name after
-    it.  ``2026-11-05-max360-090-30fps`` -> 90.  Camera names and formats
+    it.  ``2026-11-05-max-090-30fps`` -> 90.  Camera names and formats
     such as ``max360``, ``30fps``, ``120fps``, ``1080p``, ``4k`` or
     ``timelapse05`` are never separate 3-digit parts, and dates use 4- and
     2-digit parts.  Raises ValueError for a 3-digit part above 360 or for two
@@ -1584,7 +1653,7 @@ def video_args(args: argparse.Namespace, video: str,
     """
     vargs = copy.copy(args)
     offset = video_heading_offset(args, video)
-    recenter = camera == CAMERA_MAX and getattr(args, "recenter_forward", True)
+    recenter = camera in CAMERA_360 and getattr(args, "recenter_forward", True)
     vargs.recenter_deg = (offset % 360.0) if (recenter and offset) else 0.0
     vargs.heading_offset = 0.0 if (recenter or offset is None) else offset
     vargs.heading_offset_given = offset is not None and not recenter
@@ -2279,7 +2348,7 @@ def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
     ``roll_deg``/``pitch_deg`` use the camera convention: positive roll is
     clockwise (right side down) and positive pitch means the camera was
     tilted down.  v360's signs were established empirically on deliberately
-    tilted GoPro MAX footage: ``roll=+R`` turns the picture clockwise, so a
+    tilted GoPro Max footage: ``roll=+R`` turns the picture clockwise, so a
     clockwise camera roll is undone with ``roll=-roll_deg``; ``pitch=+P``
     makes the view look *up* by P (content moves down), which is exactly what
     levels a camera tilted down, so pitch is passed through unchanged.
@@ -3174,7 +3243,7 @@ def write_images_telemetry(path: str, *, camera: str, video: str,
 
 
 # =========================================================================
-# GoPro GPMF telemetry reader (MAX 360 and HERO)
+# GoPro GPMF telemetry reader (MAX, MAX2 and HERO)
 # =========================================================================
 
 TYPE_STRING = ord("c")
@@ -5393,7 +5462,7 @@ def blackvue_process_video(video, sequence, output_dir, args, have_exiftool):
 
 
 # =========================================================================
-# GoPro MAX 360 pipeline
+# GoPro Max / MAX2 (360) pipeline
 # =========================================================================
 
 max360_HEMI_W, max360_HEMI_H = 4096, 1344
@@ -5428,6 +5497,7 @@ class max360_VideoInfo:
     model: str = "GoPro Max"
     serial: Optional[str] = None
     tz_offset_s: Optional[int] = None   # camera TZON (MAX2), None on the MAX
+    camera: str = CAMERA_MAX            # CAMERA_MAX or CAMERA_MAX2
     out_width: int = max360_DEFAULT_WIDTH        # equirectangular output size
     out_height: int = max360_DEFAULT_HEIGHT
 
@@ -5472,7 +5542,7 @@ def max360__frame_count(stream: dict, duration: float, fps: float) -> int:
 
 
 def max360_probe(path: str) -> max360_VideoInfo:
-    """Inspect a GoPro MAX file and describe its hemisphere/telemetry layout."""
+    """Inspect a GoPro Max file and describe its hemisphere/telemetry layout."""
     meta = probe_metadata(path, FFPROBE)
     videos = meta.video_streams_info()
     if not videos:
@@ -5546,19 +5616,20 @@ def max360_probe(path: str) -> max360_VideoInfo:
         serial=(meta.format_tags.get("serial_number")
                 or meta.format_tags.get("serial") or settings.serial),
         tz_offset_s=settings.tz_offset_s,
+        camera=gopro_360_camera(path, None, videos)[0],
     )
 
 
 # ---------------------------------------------------------------------------
 # EAC stitching filter
 # ---------------------------------------------------------------------------
-# Known GoPro MAX hemisphere layouts: (strip width, strip height) ->
+# Known GoPro Max hemisphere layouts: (strip width, strip height) ->
 # (side width, centre width, blend width).  A strip is side + centre + side
 # with no gaps; each side region contains its own 2*blend overlap seam.
 max360_EAC_LAYOUTS = {
     (4096, 1344): (1376, 1344, 32),
     (2272, 736): (768, 736, 16),
-    # GoPro MAX2: 1984 + 1920 + 1984.  Measured on GS010037: content repeats
+    # GoPro Max2: 1984 + 1920 + 1984.  Measured on GS010037: content repeats
     # 64 px apart across each seam (like the MAX), so the overlap crops are
     # 64 px, not the 128 px the generic gap formula below would assume, and
     # 928 unique + 64 blended + 928 unique fill a 1920 face without scaling.
@@ -6118,7 +6189,7 @@ def max360_build_track(path: str, info: max360_VideoInfo,
     last_gps = max(s["utc"] for s in timed)
     gps_span = (last_gps - first_gps).total_seconds()
 
-    # GoPro MAX writes creation_time as camera-local wall clock in some
+    # GoPro Max writes creation_time as camera-local wall clock in some
     # firmware, even though the field looks like UTC.  The GPMF GPS clock is
     # authoritative, so use the first fix unless creation_time agrees with it
     # to within five minutes.  The difference is also the camera's UTC offset
@@ -6215,7 +6286,7 @@ def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
     if record.get("recentered_deg"):
         extra["recentered_deg"] = "%03d" % int(round(record["recentered_deg"]))
     return FrameMetadata(
-        camera=CAMERA_LABELS[CAMERA_MAX], video=record["video"],
+        camera=CAMERA_LABELS[info.camera], video=record["video"],
         sequence=record["sequence"], frame_index=record["frame_index"],
         pts=record["pts_seconds"], distance=record.get("distance_m"),
         script_name=SCRIPT_NAME, make=info.make, model=info.model,
@@ -6280,7 +6351,7 @@ def max360__record(choice, track, args, info, tz_offset, tz_known, sequence,
         speed = point.get("speed2d")
     unpositioned = point.get("lat") is None
     return {
-        "sequence": sequence, "video": video_name, "camera": CAMERA_MAX,
+        "sequence": sequence, "video": video_name, "camera": info.camera,
         "recentered_deg": getattr(args, "recenter_deg", 0.0) or None,
         "image": image_filename(naming, args.format),
         "frame_index": int(choice.frame_index), "pts_seconds": round(pts, 3),
@@ -6351,7 +6422,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     detected_offset = gpmf.camera_utc_offset if gpmf else None
     tz_offset, tz_known = resolve_gopro_timezone(
         args, info.tz_offset_s, detected_offset,
-        "container clock vs GPS", track, camera=CAMERA_MAX, logger=LOG)
+        "container clock vs GPS", track, camera=info.camera, logger=LOG)
 
     if track is None:
         if args.fallback_interval <= 0:
@@ -6414,7 +6485,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                  else "")
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
-        args.output, CAMERA_MAX, sequence, first_time,
+        args.output, info.camera, sequence, first_time,
         heading_offset=heading_offset_for_folder(args))
     used_paths = set()
     for record in records:
@@ -6497,7 +6568,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
 
     export_track_files(
         sequence_dir, sequence, track.samples if track else [], records,
-        track_export=args.track_export, camera=CAMERA_MAX, video=name,
+        track_export=args.track_export, camera=info.camera, video=name,
         imu=gpmf.imu if gpmf else None,
         video_start_utc=(gpmf.origin_utc if gpmf else fallback_start),
         telemetry_export=args.telemetry_export,
@@ -7747,7 +7818,7 @@ def hero_probe(path: str) -> hero_VideoInfo:
     meta = probe_metadata(path, FFPROBE)
     videos = meta.video_streams_info()
     if len(videos) != 1:
-        raise Fatal("expected one flat video stream, found %d (GoPro MAX EAC "
+        raise Fatal("expected one flat video stream, found %d (GoPro Max EAC "
                     "files are handled by the MAX pipeline)" % len(videos))
     stream = videos[0]
     width = int(stream.get("width") or 0)
@@ -8064,7 +8135,7 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 # ===========================================================================
 # Command-line interface
 # ===========================================================================
-CAMERA_ORDER = (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_VIRB,
+CAMERA_ORDER = (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_MAX2, CAMERA_VIRB,
                 CAMERA_HERO)
 
 
@@ -8073,7 +8144,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=SCRIPT_NAME,
         description="Export geotagged still images from supported action-camera "
                     "videos every N metres of travel. The camera is detected "
-                    "per file (Garmin VIRB Ultra 30, GoPro MAX 360, BlackVue "
+                    "per file (Garmin VIRB Ultra 30, GoPro Max, GoPro Max2, BlackVue "
                     "DR900 or GoPro HERO), so one input tree may mix cameras.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Examples:\n"
@@ -8100,11 +8171,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="deprecated alias; unpositioned export is enabled by "
                            "--fallback-interval SECONDS")
 
-    geometry = parser.add_argument_group("GoPro MAX 360 output geometry")
+    geometry = parser.add_argument_group("GoPro Max / Max2 (360) output geometry")
     geometry.add_argument("--width", type=int, default=None,
                           help="360 output image width (default: the "
-                               "camera's native size, 5376 for the MAX, "
-                               "7680 for the MAX2; 2:1 with --height)")
+                               "camera's native size, 5376 for the Max, "
+                               "7680 for the Max2; 2:1 with --height)")
     geometry.add_argument("--height", type=int, default=None,
                           help="360 output image height (default: width / 2)")
     geometry.add_argument("--interp", default="cubic",
@@ -8219,7 +8290,7 @@ def process_group(camera: str, videos: Sequence[str], root: str,
             if camera == CAMERA_BLACKVUE:
                 summary = blackvue_process_video(video, sequence, output_dir,
                                                  args, have_exiftool)
-            elif camera == CAMERA_MAX:
+            elif camera in CAMERA_360:
                 summary = max360_process_video(video, sequence, args)
             elif camera == CAMERA_VIRB:
                 summary = virb_process_video(video, sequence, output_dir, fits,

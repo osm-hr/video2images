@@ -35,7 +35,7 @@ No separate per-camera modules, no database, no service dependencies. `ffmpeg`, 
 5. **Extracts telemetry** from embedded GPMF (`gpmd`), embedded NMEA (`free` atoms) or a sibling Garmin FIT file.
 6. **Builds a time-indexed track**, interpolates positions and measures cumulative travel distance.
 7. **Selects unique frames** at fixed distance intervals, never reusing a frame and never going backwards.
-8. **Extracts stills** with accurate input seek, or stitches MAX 360 hemispheres to equirectangular in bounded batches.
+8. **Extracts stills** with accurate input seek, or stitches MAX/MAX2 hemispheres to equirectangular in bounded batches.
 9. **Optionally levels** 360 photospheres using smoothed IMU roll/pitch from the camera — either by rotating the sphere pixels or by writing the pose into XMP-GPano tags. Classic flat videos are never rotated.
 10. **Writes metadata** (EXIF/XMP, GPS, camera firmware in `Software`, exporter version in `XMP:CreatorTool`, GPano pose) with `exiftool`.
 11. **Exports tracks and telemetry** as GPX plus three GeoJSON files per sequence (track, raw telemetry points, per-image snapshots).
@@ -162,7 +162,8 @@ run manifest JSON
 | Class | Camera | Container / media | Video | Telemetry carrier | IMU | 360 | Leveling |
 |---|---|---|---|---|---|---|---|
 | `garmin-virb-ultra-30` | Garmin VIRB Ultra 30 | MP4/MOV, H.264 | Flat 4K/1080 | Sibling `.FIT` in `GMetrix/` or matched by name/time | `ACCL`, `GYRO`, `MAGN` in FIT | No | None (`--level-horizon` ignored) |
-| `gopro-max-360` | GoPro MAX 360, GoPro MAX2 | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (MAX 4096×1344 or 2272×736, MAX2 5888×1920) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation **or** XMP-GPano pose |
+| `gopro-max` | GoPro Max | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation **or** XMP-GPano pose |
+| `gopro-max2` | GoPro Max2 | `.360`, H.265 | Dual EAC hemispheres (5888×1920) | Embedded GPMF `gpmd` (`GPS9`) | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI`, `MNOR` | Yes | Sphere rotation |
 | `blackvue-dr900` | BlackVue DR900 series | MP4, H.264 | Flat dashcam | NMEA sentences in top-level `free` atoms | None | No | None |
 | `gopro-hero` | GoPro HERO (flat) | MP4/MOV, H.264/H.265 | Single flat stream | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | No | None (`--level-horizon` ignored) |
 
@@ -180,7 +181,9 @@ run manifest JSON
 - **Validated frame rates:** 24 and 30 fps classic recording. Variable-frame-rate sources are handled because selection uses real PTS.
 - **Filename convention:** `VIRB[0-9]+.(mp4|mov)`.
 
-### 3.3 GoPro MAX 360 and MAX2
+### 3.3 GoPro Max and GoPro Max2
+
+The MAX and the MAX2 are **separate cameras**: their own detection label, run-summary count, processing pass, output-folder suffix (`max`, `max2`) and camera id in the exports (`gopro-max`, `gopro-max2`). Both use the same 360 pipeline (EAC stitching, re-centring, leveling, heading offset); everything below applies to both unless the MAX2 is named.
 
 - **Format requirements:** `.360`, MP4 or MOV with two matching EAC hemisphere streams and an embedded GPMF (`gpmd`) track. A single wide equirectangular stream is also accepted.
 - **Known layouts:**
@@ -188,7 +191,7 @@ run manifest JSON
   - `2272×736` (MAX): side 768 + centre 736 + side 768, 16 px blend.
   - `5888×1920` (MAX2): side 1984 + centre 1920 + side 1984, 32 px blend (64 px overlap crops). Measured on a MAX2 recording: content repeats 64 px apart across each lens seam, as on the MAX. The generic fallback for unknown sizes would assume 128 px here and doubles every seam, so this size has its own table entry. 928 unique + 64 blended + 928 unique pixels fill a 1920 px face exactly, so unlike the MAX no 624→640 stretch is needed.
 - **Stitching:** The filter cross-blends the overlapping side seams, assembles a 3×2 EAC net, and reprojects with `v360=eac:equirect`. The default output is the camera's native size, four cube faces around: **5376×2688** for the MAX and **7680×3840** (8K) for the MAX2. `--width`/`--height` override it (one of them alone keeps 2:1). Equirectangular input keeps 5376×2688.
-- **GoPro MAX2:** detected as a MAX (device name `MAX2`); EXIF `Model` is `GoPro MAX2` (the MAX keeps `GoPro Max`, the value its own photos carry). Differences from the MAX:
+- **GoPro Max2:** detected as a MAX (device name `MAX2`); EXIF `Model` (and XMP `GPano:CaptureSoftware`) is `GoPro Max2`: the MAX writes `GoPro Max` into its own photos, and the MAX2 (which reports only `MAX2`) gets the same title case for consistency. The camera labels in logs and exports are `GoPro Max` / `GoPro Max2` too. Differences from the MAX:
   - GPS is `GPS9`, a GPMF "complex" (`?`) structure described by the stream's `TYPE` (`lllllllSS`: lat, lon, alt, 2D speed, 3D speed, days since 2000, seconds, DOP, fix), one structure per sample. There is no `GPSU`/`GPSF`/`GPSP`; each sample has its own fix time, fix type and DOP, and the first sample of a block anchors the camera clock (`STMP`) to UTC for the IMU and exposure streams.
   - `creation_time` is real UTC, and the camera's timezone is stored separately (`TZON`, see §4.6).
   - In time-lapse there is one GPMF payload and one GPS sample per video frame (0.5 s apart in the 0.5 s mode).
@@ -230,7 +233,7 @@ Detection never guesses. Accepted evidence includes:
 | Camera | Evidence |
 |---|---|
 | VIRB | Garmin container handler; `VIRB*` filename; Garmin container markers |
-| MAX 360 | GoPro handler plus `DVNM` containing `MAX`; `.360`; dual-video/EAC layout; `GS*` filename |
+| MAX / MAX2 | GoPro handler plus `DVNM` containing `MAX`; `.360`; dual-video/EAC layout; `GS*` filename. The two are then told apart by `DVNM` (`MAX2` vs `GoPro Max`), else the camera model `MINF` in the file's Global Settings block, else the hemisphere size (5888×1920 = MAX2); the default is the MAX. |
 | BlackVue | PittaSoft/BlackVue handler; `YYYYMMDD_HHMMSS_XX` filename; PittaSoft/BlackVue markers |
 | HERO | GoPro handler plus `DVNM` containing `HERO`; single flat video stream with GPMF; `GX*`/`GH*`/`GOPR*` filename |
 
@@ -241,7 +244,8 @@ Ambiguous GoPro files (for example a generic GoPro handler with conflicting MAX/
 | Camera | Modes validated | Notes |
 |---|---|---|
 | Garmin VIRB Ultra 30 | 24 fps, 30 fps | Classic recording; VFR handled by real PTS |
-| GoPro MAX 360 | 24 fps, 30 fps, TimeWarp/timelapse at 30 fps playback | GPS span is scaled to video span |
+| GoPro Max | 24 fps, 30 fps, TimeWarp/timelapse at 30 fps playback | GPS span is scaled to video span |
+| GoPro Max2 | 0.5 s time-lapse at 30 fps playback | One GPS sample per frame |
 | BlackVue DR900 | 2 fps, 30 fps | Timelapse and normal drive modes |
 | GoPro HERO | 24 fps, 30 fps | Classic recording |
 
@@ -263,7 +267,7 @@ These are tested operating modes, not hard-coded rejections. Any container whose
 
 ### 4.1 Telemetry availability matrix
 
-| Telemetry group | GoPro MAX | GoPro HERO | Garmin VIRB | BlackVue |
+| Telemetry group | GoPro Max | GoPro HERO | Garmin VIRB | BlackVue |
 |---|---|---|---|---|
 | GPS position | GPMF `GPS5`/`GPS9` | GPMF `GPS5`/`GPS9` | FIT message 160 | NMEA GGA/RMC |
 | Altitude | GPMF | GPMF | FIT enhanced altitude | NMEA GGA |
@@ -437,7 +441,7 @@ The log names the source, e.g. `camera-local time offset: +02:00 (camera TZON se
 | `--stationary-speed MPS` | float | `0.3` | `>= 0` | Compatibility option. Accepted so existing command lines keep working; the current track suppresses stationary course noise below 0.5 m/s internally (`COURSE_MIN_SPEED`), but changing this flag does not alter the threshold. |
 | `--jitter METERS` | float | `0.5` | `>= 0` | Compatibility option. Accepted for legacy scripts; the unified track does not use a separate jitter cutoff. |
 
-### 5.5 GoPro MAX 360 options
+### 5.5 GoPro Max / Max2 (360) options
 
 | Option | Type | Default | Valid range / values | Functional description |
 |---|---|---|---|---|
@@ -527,8 +531,8 @@ Gaps are allowed. Low frame rates and VFR sources produce fewer images rather th
 
 | Camera | What the offset does | Output folder |
 |---|---|---|
-| 360 (MAX), default | The sphere is rotated (`v360` `yaw`, in the stitching pass, no extra cost) so the **direction of travel is the image centre**. The heading is then simply the course; the offset is not added to it. `UserComment` records `recentered_deg=NNN`. | `2026-11-05-max360` (no offset) |
-| 360 with `--no-recenter-forward` | Pixels keep the front lens at the centre; the offset is added to the heading. | `2026-11-05-max360-NNN` |
+| 360 (MAX, MAX2), default | The sphere is rotated (`v360` `yaw`, in the stitching pass, no extra cost) so the **direction of travel is the image centre**. The heading is then simply the course; the offset is not added to it. `UserComment` records `recentered_deg=NNN`. | `2026-11-05-max` (no offset) |
+| 360 with `--no-recenter-forward` | Pixels keep the front lens at the centre; the offset is added to the heading. | `2026-11-05-max-NNN` |
 | Flat (BlackVue, VIRB, HERO) | Pixels unchanged; the offset is added to the heading. Re-centring does not apply. | `2026-10-18-virb30-NNN` |
 
 The compass fallback measures where the front lens points, so the offset is not added to it; with re-centring it is turned back by the offset.
@@ -537,14 +541,14 @@ The compass fallback measures where the front lens points, so the offset is not 
 
 | Folder name | Offset |
 |---|---|
-| `2026-11-05-max360-090` | 090 |
-| `2026-11-05-max360` | none (0) |
-| `2026-11-05-max360-270-30fps` | 270 |
-| `2026-11-05_max360_090_120fps` | 090 |
-| `2026-10-31-max360-090-standard-30fps-varazdin-horizont` | 090 |
+| `2026-11-05-max-090` | 090 |
+| `2026-11-05-max` | none (0) |
+| `2026-11-05-max-270-30fps` | 270 |
+| `2026-11-05_max_090_120fps` | 090 |
+| `2026-10-31-max-090-standard-30fps-varazdin-horizont` | 090 |
 | `2026-10-18-virb-270-4k-24fps` | 270 |
 
-Camera names and formats such as `max360`, `30fps`, `120fps`, `1080p`, `4k` or `timelapse05` are never separate 3-digit parts, and dates use 4- and 2-digit parts, so they are ignored. A folder whose name *starts* with three digits (`090-trip`) has no offset. A 3-digit part above 360 (`-400-`) or two different offsets in one name (`-090-…-270`) stop the run with an error before anything is exported. Each video's folder offset is logged at the start. When the same video file name occurs in several folders, a warning is logged: their 360 images can land in the same output folder, where an existing image is skipped rather than overwritten.
+Camera names and formats such as `max`, `max2`, `max360`, `30fps`, `120fps`, `1080p`, `4k` or `timelapse05` are never separate 3-digit parts, and dates use 4- and 2-digit parts, so they are ignored. A folder whose name *starts* with three digits (`090-trip`) has no offset. A 3-digit part above 360 (`-400-`) or two different offsets in one name (`-090-…-270`) stop the run with an error before anything is exported. Each video's folder offset is logged at the start. When the same video file name occurs in several folders, a warning is logged: their 360 images can land in the same output folder, where an existing image is skipped rather than overwritten.
 
 ### 6.5 Horizon leveling (360 only)
 
@@ -552,7 +556,7 @@ Camera names and formats such as `max360`, `30fps`, `120fps`, `1080p`, `4k` or `
 
 | Camera | Behaviour |
 |---|---|
-| MAX 360 | Leveled when the switch is on. |
+| MAX, MAX2 | Leveled when the switch is on. |
 | HERO | Switch ignored (logged); IMU roll/pitch still appear in telemetry. |
 | VIRB | Switch ignored (logged); calibrated `ACCL` (FIT message 167 + orientation matrix) still appears in telemetry. |
 | BlackVue | No IMU; switch ignored. |
@@ -601,7 +605,7 @@ Measured on images taken during steady driving (|acceleration| < 0.3 m/s²), aga
 It helps most on steep roads and in the 90th percentile, but it is not better everywhere (GS013336's worst image got worse), and the GoPro's GPS altitude noise is its limit. That is why it is opt-in; try it on hilly routes and check a few images on crests. Doppler vertical speed (3D minus 2D GPS speed) was tested as a cleaner gradient source and is not usable (correlation 0.2–0.28, about 0 in time-lapse).
 - Leveling happens during export. Existing images are skipped unless `--overwrite` is used.
 
-### 6.6 MAX 360 stitching pipeline
+### 6.6 MAX / MAX2 stitching pipeline
 
 1. Probe the file; select the largest matching EAC hemisphere pair, or a single wide equirectangular stream.
 2. Build a filter graph:
@@ -658,7 +662,7 @@ It helps most on steep roads and in the 90th percentile, but it is not better ev
 ```
 
 - The date folder is based on the **first exported frame**, not on the source filename.
-- Camera suffixes: `virb30`, `max360`, `blackvue`, `hero`.
+- Camera suffixes: `virb30`, `max`, `max2`, `blackvue`, `hero`.
 - The sequence name is the source stem. Duplicate stems in nested folders are prefixed with the relative directory (`subdir__VIRB0001`); no numeric `_NNNNNN` counter is used.
 - An explicitly supplied heading offset is appended to the camera folder: `YYYY-MM-DD-virb30-090`.
 - Images that cross midnight stay in the same sequence folder; their filenames carry the date.
@@ -716,7 +720,7 @@ It helps most on steep roads and in the 90th percentile, but it is not better ev
       },
       "properties": {
         "name": "GS013338",
-        "camera": "gopro-max-360",
+        "camera": "gopro-max",
         "video": "GS013338.360",
         "point_count": 2
       }
@@ -731,7 +735,7 @@ It helps most on steep roads and in the 90th percentile, but it is not better ev
         "image": "2026-10-31_12-13-24-821.jpg",
         "video": "GS013338.360",
         "sequence": "GS013338",
-        "camera": "gopro-max-360",
+        "camera": "gopro-max",
         "frame_index": 0,
         "pts_seconds": 0.0,
         "timestamp_local": "2026-10-31T12:13:24.821",
@@ -770,8 +774,8 @@ A one-point track is emitted as a `Point` feature. An empty track emits no geome
   "type": "FeatureCollection",
   "generator": "v2i.py",
   "generator_version": "0.0.4",
-  "camera": "gopro-max-360",
-  "camera_label": "GoPro MAX 360",
+  "camera": "gopro-max",
+  "camera_label": "GoPro Max",
   "video": "GS013338.360",
   "sequence": "GS013338",
   "video_start_utc": "2026-10-31T10:13:24.821Z",
@@ -835,8 +839,8 @@ VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
   "type": "FeatureCollection",
   "generator": "v2i.py",
   "generator_version": "0.0.4",
-  "camera": "gopro-max-360",
-  "camera_label": "GoPro MAX 360",
+  "camera": "gopro-max",
+  "camera_label": "GoPro Max",
   "video": "GS013338.360",
   "sequence": "GS013338",
   "video_start_utc": "2026-10-31T10:13:24.821Z",
@@ -851,7 +855,7 @@ VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
       "properties": {
         "sequence": "GS013338",
         "video": "GS013338.360",
-        "camera": "gopro-max-360",
+        "camera": "gopro-max",
         "image": "2026-10-31_12-13-24-821.jpg",
         "frame_index": 0,
         "pts_seconds": 0.0,
@@ -925,7 +929,7 @@ VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
   "generator": "v2i.py",
   "camera": "mixed",
   "camera_label": "Mixed cameras",
-  "cameras": ["blackvue-dr900", "gopro-max-360"],
+  "cameras": ["blackvue-dr900", "gopro-max"],
   "distance_interval_m": 7.0,
   "image_count": 2,
   "images": [
@@ -989,8 +993,8 @@ python3 v2i.py -i video/ -o images/ -d 7
 # Garmin VIRB (FIT discovered in GMetrix/)
 python3 v2i.py -i video/2026-10-05-virb-1080-24fps -o images/ -d 5 --start-distance 0
 
-# GoPro MAX 360 TimeWarp / timelapse
-python3 v2i.py -i video/2026-10-26-max360-000-timelapse05-30fps -o images/ -d 2 --start-distance 0
+# GoPro Max TimeWarp / timelapse
+python3 v2i.py -i video/2026-10-26-max-000-timelapse05-30fps -o images/ -d 2 --start-distance 0
 
 # BlackVue DR900
 python3 v2i.py -i video/2019-07-12-blackvue-standard -o images/ -d 5 --start-distance 0
@@ -1003,14 +1007,14 @@ python3 v2i.py -i video/2025-08-16-hero-standard-nogps -o images/ --fallback-int
 python3 v2i.py -i video/ -o images/ -d 7
 
 # Leveled MAX: rotate the sphere pixels, parallel v360 passes
-python3 v2i.py -i video/2026-10-31-max360-000-horizont -o images/ -d 2 --horizon --workers 4
+python3 v2i.py -i video/2026-10-31-max-000-horizont -o images/ -d 2 --horizon --workers 4
 
-# Mount offsets from the folder names (…-max360-090-…): 360 images are
+# Mount offsets from the folder names (…-max-090-…): 360 images are
 # re-centred to the direction of travel, flat videos get -NNN folders
 python3 v2i.py -i video/ --recursive -o images/ -d 5 --heading-offset auto
 
 # Handheld footage whose tilt genuinely changes every frame: no smoothing
-python3 v2i.py -i video/2026-10-31-max360-000-horizont-nogps -o images/ --fallback-interval 0.2 --level-horizon --level-window 0
+python3 v2i.py -i video/2026-10-31-max-000-horizont-nogps -o images/ --fallback-interval 0.2 --level-horizon --level-window 0
 
 # Dry run and manifest
 python3 v2i.py -i video/ -o images/ -d 7 --dry-run
@@ -1095,7 +1099,7 @@ Coverage includes:
 - MAX EAC batch command construction and fallback records.
 - Seek-based extraction compared against a decode/select pass.
 - Horizon leveling: `--level-horizon`/`--horizon` switch (old values rejected), 360-only gating (flat cameras ignore it), Gaussian real-time window (`--level-window`) with a 0.5° per-image cap, MAX sphere rotation with zero pose values, VIRB orientation/sign handling in telemetry.
-- Heading offset: `0`–`360`/`auto` validation, folder-name parsing, 360 re-centring (`yaw` sign checked with marker images and real footage; `rorder=pry` for combined leveling), `-NNN` folders only for flat videos or `--no-recenter-forward`. Sign conventions were validated visually on `video/2026-10-31-max360-000-horizont-nogps` (camera deliberately rolled to ±40° and pitched down ~10–19°).
+- Heading offset: `0`–`360`/`auto` validation, folder-name parsing, 360 re-centring (`yaw` sign checked with marker images and real footage; `rorder=pry` for combined leveling), `-NNN` folders only for flat videos or `--no-recenter-forward`. Sign conventions were validated visually on `video/2026-10-31-max-000-horizont-nogps` (camera deliberately rolled to ±40° and pitched down ~10–19°).
 - Detailed GPS/IMU telemetry GeoJSON exporters: FeatureCollection structure, track LineString, IMU samples positioned on the track, null-geometry handling, per-image nearest-sample matching and `--telemetry-export`.
 - EXIF `Software`/`XMP:CreatorTool`/`XMP-GPano:StitchingSoftware` carry `v2i.py v<__version__>`.
 
@@ -1196,19 +1200,19 @@ Speed conversion: knots × `0.514444` = m/s.
 
 | Sample | Notes |
 |---|---|
-| `video/2026-10-26-max360-000-timelapse05-30fps/GS013336.360` | GoPro Max, DVNM `GoPro Max`, dual EAC 4096×1344, 1208 frames / 40.34 s; GPS span 604.57 s scaled to video span; equirect 5376×2688 with full GPano tags |
+| `video/2026-10-26-max-000-timelapse05-30fps/GS013336.360` | GoPro Max, DVNM `GoPro Max`, dual EAC 4096×1344, 1208 frames / 40.34 s; GPS span 604.57 s scaled to video span; equirect 5376×2688 with full GPano tags |
 | `video/2025-08-16-hero-standard-nogps/GX011785.MP4` | HERO11 Black, GPMF IMU but no GPS5/GPSU/GPSF/GPSP → skipped by default; fallback exports UTC millisecond names |
 | `video/2026-10-05-virb-1080-24fps/VIRB0996.MP4` + `GMetrix/2026-10-05-07-53-07.fit` | 9108 GPS samples, IMU present; camera events align the segment; offset `+02:00` |
 | `video/2026-10-18-virb-090-4k-30fps/VIRB0782.MP4` | VIRB Ultra 30; real capture milliseconds in filenames (e.g. `2026-10-18_16-18-37-111.jpg`) |
 | `video/2026-10-18-virb-270-4k-24fps/VIRB0008.MP4` | VIRB Ultra 30 at 24 fps; offset `+02:00` |
-| `video/2026-10-31-max360-000-horizont-nogps/GS013338.360` | No valid GPS fix; `--fallback-interval` exports unpositioned frames with full IMU telemetry and an empty GPS track |
+| `video/2026-10-31-max-000-horizont-nogps/GS013338.360` | No valid GPS fix; `--fallback-interval` exports unpositioned frames with full IMU telemetry and an empty GPS track |
 | BlackVue samples | NMEA in `free` atoms; GGA/RMC/VTG/GSA parsed; clock reconciled to GPS; course from RMC/VTG |
 
 ### 10.7 Version history
 
 | Version | Highlight |
 |---|---|
-| `0.0.4` | GoPro MAX2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, `GoPro MAX2` model); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX 360: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
+| `0.0.4` | GoPro Max2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, EXIF model `GoPro Max2`, title case like the MAX's own `GoPro Max`); GoPro Max and GoPro Max2 are separate cameras (ids `gopro-max`/`gopro-max2`, output folders `-max`/`-max2`; the old `gopro-max-360` id and `-max360` folder suffix are gone); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
 | `0.0.3` | Unified single-file pipelines, per-camera telemetry, timezone detection, universal unpositioned fallback. Horizon leveling restricted to 360 (MAX) videos via `--level-horizon {no,rotate,exif}`; telemetry exports switched from `*.json` to RFC 7946 `*.geojson`; exporter version written to EXIF `Software` |
 | Earlier | Per-camera scripts and modules, merged into `v2i.py` |
 
