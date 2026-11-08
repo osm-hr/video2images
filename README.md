@@ -4,7 +4,7 @@
 
 No separate per-camera modules, no database, no service dependencies. `ffmpeg`, `ffprobe` and `exiftool` are external tools; `max2sphere` is optional.
 
-**Version:** `0.0.3` · **Python:** 3.9+ · **Validated with:** ffmpeg/ffprobe 5.1.9, exiftool 12.x
+**Version:** `0.0.4` · **Python:** 3.9+ · **Validated with:** ffmpeg/ffprobe 5.1.9, exiftool 12.x
 
 ---
 
@@ -20,6 +20,7 @@ No separate per-camera modules, no database, no service dependencies. `ffmpeg`, 
 8. [Operational guide](#8-operational-guide)
 9. [Tests and verification](#9-tests-and-verification)
 10. [Appendix](#10-appendix)
+11. [Further research](#11-further-research)
 
 ---
 
@@ -111,7 +112,7 @@ FrameChoice[]  ── frame index, PTS, interpolated point, distance, error
       ▼
 JPEG/PNG files
       │
-      │ exiftool batch  (Software = "v2i.py v0.0.3")
+      │ exiftool batch  (Software = "v2i.py v0.0.4")
       ▼
 EXIF + XMP + GPano tags
       │
@@ -148,7 +149,7 @@ run manifest JSON
 
 - **Sequential videos, parallel frames.** Videos are processed one at a time. Within a video, `--workers N` runs up to `N` independent ffmpeg extraction jobs.
 - **MAX batch decode.** MAX stitches frames in bounded batches (`EXTRACT_CHUNK_SIZE = 60`; `MAX360_LEVEL_CHUNK_SIZE = 8` when leveling in `rotate` mode). Each batch decodes the source once; a failed seek batch retries from the start of the file.
-- **Leveled MAX two-pass (`--level-horizon`).** The EAC → equirectangular result is written as a lossless PNG, then each frame is rotated on the sphere with its own `v360` filter (roll, pitch and the re-centring yaw) and encoded to the requested format. This keeps the sphere remap as the only lossy step. Without leveling, the re-centring yaw is part of the stitching `v360` and costs nothing extra.
+- **Leveled MAX single pass (`--level-horizon`).** Consecutive frames whose leveling angles agree within `LEVEL_GROUP_TOLERANCE_DEG` (0.2°) form a run; each run is stitched with its roll, pitch and re-centring yaw inside the stitching `v360`, so leveling costs no extra pass. If a run fails, its frames fall back to the former two-pass path (lossless PNG, then one `v360=e:e` rotation per frame). Without leveling, the re-centring yaw is part of the stitching `v360` as well.
 - **Telemetry caching.** VIRB FIT files are parsed once and reused across videos in the same run (`telemetry_cache`).
 - **Failure isolation.** A `Fatal` error fails one video, not the run. `--fail-fast` stops at the first failure.
 
@@ -161,7 +162,7 @@ run manifest JSON
 | Class | Camera | Container / media | Video | Telemetry carrier | IMU | 360 | Leveling |
 |---|---|---|---|---|---|---|---|
 | `garmin-virb-ultra-30` | Garmin VIRB Ultra 30 | MP4/MOV, H.264 | Flat 4K/1080 | Sibling `.FIT` in `GMetrix/` or matched by name/time | `ACCL`, `GYRO`, `MAGN` in FIT | No | None (`--level-horizon` ignored) |
-| `gopro-max-360` | GoPro MAX 360 | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation **or** XMP-GPano pose |
+| `gopro-max-360` | GoPro MAX 360, GoPro MAX2 | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (MAX 4096×1344 or 2272×736, MAX2 5888×1920) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation **or** XMP-GPano pose |
 | `blackvue-dr900` | BlackVue DR900 series | MP4, H.264 | Flat dashcam | NMEA sentences in top-level `free` atoms | None | No | None |
 | `gopro-hero` | GoPro HERO (flat) | MP4/MOV, H.264/H.265 | Single flat stream | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | No | None (`--level-horizon` ignored) |
 
@@ -179,13 +180,20 @@ run manifest JSON
 - **Validated frame rates:** 24 and 30 fps classic recording. Variable-frame-rate sources are handled because selection uses real PTS.
 - **Filename convention:** `VIRB[0-9]+.(mp4|mov)`.
 
-### 3.3 GoPro MAX 360
+### 3.3 GoPro MAX 360 and MAX2
 
 - **Format requirements:** `.360`, MP4 or MOV with two matching EAC hemisphere streams and an embedded GPMF (`gpmd`) track. A single wide equirectangular stream is also accepted.
 - **Known layouts:**
-  - `4096×1344`: side 1376 + centre 1344 + side 1376, 32 px blend.
-  - `2272×736`: side 768 + centre 736 + side 768, 16 px blend.
-- **Stitching:** The filter cross-blends the overlapping side seams, assembles a 3×2 EAC net, and reprojects with `v360=eac:equirect`. Default output is 5376×2688.
+  - `4096×1344` (MAX): side 1376 + centre 1344 + side 1376, 32 px blend (64 px overlap crops).
+  - `2272×736` (MAX): side 768 + centre 736 + side 768, 16 px blend.
+  - `5888×1920` (MAX2): side 1984 + centre 1920 + side 1984, 32 px blend (64 px overlap crops). Measured on a MAX2 recording: content repeats 64 px apart across each lens seam, as on the MAX. The generic fallback for unknown sizes would assume 128 px here and doubles every seam, so this size has its own table entry. 928 unique + 64 blended + 928 unique pixels fill a 1920 px face exactly, so unlike the MAX no 624→640 stretch is needed.
+- **Stitching:** The filter cross-blends the overlapping side seams, assembles a 3×2 EAC net, and reprojects with `v360=eac:equirect`. The default output is the camera's native size, four cube faces around: **5376×2688** for the MAX and **7680×3840** (8K) for the MAX2. `--width`/`--height` override it (one of them alone keeps 2:1). Equirectangular input keeps 5376×2688.
+- **GoPro MAX2:** detected as a MAX (device name `MAX2`); EXIF `Model` is `GoPro MAX2` (the MAX keeps `GoPro Max`, the value its own photos carry). Differences from the MAX:
+  - GPS is `GPS9`, a GPMF "complex" (`?`) structure described by the stream's `TYPE` (`lllllllSS`: lat, lon, alt, 2D speed, 3D speed, days since 2000, seconds, DOP, fix), one structure per sample. There is no `GPSU`/`GPSF`/`GPSP`; each sample has its own fix time, fix type and DOP, and the first sample of a block anchors the camera clock (`STMP`) to UTC for the IMU and exposure streams.
+  - `creation_time` is real UTC, and the camera's timezone is stored separately (`TZON`, see §4.6).
+  - In time-lapse there is one GPMF payload and one GPS sample per video frame (0.5 s apart in the 0.5 s mode).
+  - Extra streams (ignored): magnetic-north orientation `MNOR` with confidence `OCNF`, `DisparityMatrix`, face data, logs, compression scores.
+  - The native 8K output costs time: a 6-image test spread over a 140 s time-lapse took 7.7 min, mostly decoding two 5888×1920 HEVC streams up to the last frame; one image near the start took 18 s.
 - **TimeWarp / rate changes:** GPS span and video span are compared. A ratio outside 0.8–1.2 maps real GPS time onto playback time (`scale = video_span / gps_span`), so frame selection and timestamps stay aligned and no frame is emitted twice. The log names the mode: a standard time-lapse interval (0.5–60 s) or TimeWarp factor (2–30×) is reported as INFO (e.g. `time-lapse: 1 frame every 0.50 s of real time (15.0x speed-up, …)`); any other rate is a WARNING, because a variable rate such as TimeWarp Auto speed is still mapped linearly and frame times may drift.
 - **Bad GPS readings (MAX and HERO):** while the receiver is acquiring, GoPro already reports a 2D fix but with DOP 99.99 and positions that jump hundreds of metres per second. Readings with DOP above `--max-dop` (default 10) are dropped, then any reading implying more than 70 m/s from the previous kept one (if rejections last 5 s, the new position is trusted instead). The log reports how many were rejected. Frames before the first kept reading are handled like any frame before the first GPS fix.
 - **Clock spread:** the logged spread of GPS time vs camera clock ignores time stamps more than 1 s from the median (GoPro's first payload is often a few seconds stale) and says how many were ignored; the median offset is used either way.
@@ -193,7 +201,7 @@ run manifest JSON
 - **Leveling:** The only camera that honours `--level-horizon` (off by default). Roll/pitch come from `GRAV`; the sphere pixels are rotated and the GPano pose stays zero. See §6.5.
 - **Re-centring:** With a heading offset, the sphere is rotated so the direction of travel is the image centre (default; `--no-recenter-forward` keeps the lens view). See §6.4.
 - **No valid GPS fix:** `--fallback-interval SECONDS` exports an unpositioned time grid while retaining the GPMF IMU, camera clock and TimeWarp scale.
-- **Filename convention:** `GS[0-9A-Z]+.(360|mp4|mov)`; device name usually contains `MAX`.
+- **Filename convention:** `GS[0-9A-Z]+.(360|mp4|mov)`; device name usually contains `MAX` (`GoPro Max`, `MAX2`).
 
 ### 3.4 BlackVue DR900 series
 
@@ -209,7 +217,7 @@ run manifest JSON
 
 - **Format requirements:** MP4/MOV with exactly one flat video stream and an embedded GPMF (`gpmd`) track.
 - **Telemetry:** `GPS5`/`GPS9` positions, `GPSU`/`STMP` timestamps, `GPSF`/`GPSP` accuracy/DOP, plus IMU streams.
-- **Clock anchoring:** GPS UTC is authoritative. Without GPS, `STMP` is anchored to the container `creation_time`; if no local offset is known, filenames and EXIF use UTC.
+- **Clock anchoring:** GPS UTC is authoritative. Without GPS, `STMP` is anchored to the container `creation_time`. The local offset comes from the camera's `TZON` setting (HERO11 and later, §4.6); without it, filenames and EXIF use UTC with a warning.
 - **Validated frame rates:** 24 and 30 fps classic recording.
 - **No GPS:** `--fallback-interval SECONDS` exports an unpositioned time grid with IMU snapshots when the clock is available.
 - **Leveling:** None. `--level-horizon` is accepted but ignored for this flat camera; IMU roll/pitch still appear in the telemetry exports.
@@ -347,12 +355,17 @@ The host timezone is never consulted.
 
 | Camera | Clock rule |
 |---|---|
-| MAX | Container `creation_time` is compared with the first GPS UTC. `STMP` is added so later chapters compare against recording start. The difference is rounded to the nearest 15 minutes and rejected beyond ±14 hours. |
-| HERO | GPS UTC is authoritative. Without GPS, the container clock anchors `STMP`; an unknown offset falls back to UTC with a warning. |
+| MAX2 (and any GoPro with `TZON`) | The camera's own timezone setting `TZON` (minutes, daylight saving included) from the "Global Settings" GPMF block in `moov/udta/GPMF` is the default source. `creation_time` is real UTC; `CDAT` there is the matching local wall clock. |
+| MAX | No `TZON`. Container `creation_time` (camera-local wall clock) is compared with the first GPS UTC. `STMP` is added so later chapters compare against recording start. The difference is rounded to the nearest 15 minutes and rejected beyond ±14 hours. |
+| HERO | GPS UTC is authoritative. The offset is `TZON` (HERO11 and later); older models without it fall back to UTC with a warning. |
 | VIRB | FIT UTC is authoritative. Container `creation_time` is camera-local wall clock and is used for segment matching and as a last-resort anchor. |
 | BlackVue | GPS UTC is authoritative. Filename local time is snapped to a quarter-hour offset and checked against GPS. |
 
-An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regardless of detection.
+An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regardless of detection (opt-in; local time is the default). When nothing gives an offset, names and EXIF stay in UTC and a warning says so.
+
+The log names the source, e.g. `camera-local time offset: +02:00 (camera TZON setting)` or `(container clock vs GPS)`.
+
+**GPS sanity check.** A camera-derived offset (TZON or MAX clock) is compared with the solar offset of the first GPS fix (longitude / 15 h). More than `TZ_SOLAR_TOLERANCE_H` (3.5 h) apart means the camera is still set for another region, and a warning suggests `--timezone`. Real zones stay within about 3 h of solar time (western China, Spain in summer), so this catches a wrong continent, not a one-hour daylight-saving slip. An exact lookup of the timezone from the position (e.g. the `tzfpy` package plus `zoneinfo`) would also catch that, but needs an extra dependency and is not used.
 
 ---
 
@@ -397,6 +410,7 @@ An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regard
 | `--uere METERS` | float | `5.0` | `> 0` | User-equivalent range error used to estimate accuracy as `HDOP × UERE` when no measured accuracy exists. |
 | `--max-dop DOP` | float | `10` | `>= 0` | Drop GoPro (MAX/HERO) GPS readings with DOP above this value; `0` keeps every reading. Raise it (e.g. `15`) to keep low-quality but consistent fixes. |
 | `--level-horizon`, `--horizon` | flag | off | on/off | Level **360 (MAX)** photospheres: rotate the sphere so the horizon is level (GPano pose stays `0`). Flat videos ignore it and log that they export as recorded. The former values `rotate`/`exif`/`no` are rejected with an explanation. See §6.5. |
+| `--horizon-gradient`, `--level-gradient` | flag | off | on/off | Opt-in, needs `--level-horizon`: follow the road gradient from GPS altitude so hills do not leave the horizon tilted. Uses the heading offset as the mount angle. See §6.5. |
 | `--level-window SECONDS`, `--horizon-window` | float | `25.0` | `>= 0` | Real-time window of the Gaussian-weighted gravity average for each leveled image; changes between consecutive images are capped at 0.5°. Keep it long for mounted cameras; `0` uses the nearest single sample (handheld footage). |
 | `--imu-heading` | flag | off | on/off | Derive a tilt-compensated compass heading from `MAGN` + `GRAV` (MAX/HERO), used only as a fallback where GPS gives no course; the GPS course always wins (see §6.4). |
 
@@ -427,8 +441,8 @@ An explicit `--timezone` always wins. `--time-base utc` forces UTC naming regard
 
 | Option | Type | Default | Valid range / values | Functional description |
 |---|---|---|---|---|
-| `--width WIDTH` | int | `5376` | `>= 2`, even | Equirectangular output width. Must be even for yuv output. |
-| `--height HEIGHT` | int | `2688` | `>= 2`, even | Equirectangular output height. Use 2:1 with `--width`. |
+| `--width WIDTH` | int | native (`5376` MAX, `7680` MAX2) | `>= 2`, even | Equirectangular output width. Must be even for yuv output. Alone, the height is width / 2. |
+| `--height HEIGHT` | int | native (`2688` MAX, `3840` MAX2) | `>= 2`, even | Equirectangular output height. Use 2:1 with `--width`. Alone, the width is 2 × height. |
 | `--interp MODE` | enum | `cubic` | `cubic`, `linear`, `nearest`, `lanczos` | `v360` reprojection interpolation used for stitching and sphere leveling. |
 | `--stitch-backend {auto,ffmpeg,max2sphere}` | enum | `auto` | `auto`, `ffmpeg`, `max2sphere` | `auto` prefers ffmpeg and falls back to `max2sphere`. `max2sphere` must be installed to select it explicitly. |
 | `--keep-filter` | flag | off | on/off | Copy each generated ffmpeg filter graph next to the sequence. Multiple batches get `.00`, `.01`, … suffixes. |
@@ -559,11 +573,32 @@ Camera names and formats such as `max360`, `30fps`, `120fps`, `1080p`, `4k` or `
 - Near the start and end of a recording, the value of the first/last full window is held instead of using a one-sided window.
 - The change between consecutive images is capped at `LEVEL_MAX_STEP_DEG` (`0.5°`). A forward and a backward rate-limited pass are averaged, so the correction does not lag in either direction.
 - On four test drives (two 0.5 s time-lapses, two normal videos, 5 m spacing), the largest image-to-image change went from 1.9–3.3° (20 s median) to 0.5°, with 95% of the changes at or below about 0.3°. The largest jumps used to occur around stops, where images are seconds apart.
-- Down-weighting samples taken while the vehicle accelerates, brakes or turns (from GPS) is implemented but off (`LEVEL_ACCEL_WEIGHTING`). On the same drives it changed the angles by about 0.4° and made image-to-image changes slightly larger, without evidence of a more accurate horizon.
+- Down-weighting samples taken while the vehicle accelerates, brakes or turns (from GPS) is implemented but off (`LEVEL_ACCEL_WEIGHTING`) and **marked for possible removal**. On the same drives it changed the angles by about 0.4° and made image-to-image changes slightly larger, without evidence of a more accurate horizon. A later analysis showed why: on hilly roads most of the tilt variation is the real road gradient (below), which down-weighting cannot tell apart from acceleration. Only the flat GS010153 drive was dominated by acceleration (R² 0.77).
 - The window is in real time, not image count, so TimeWarp and normal video behave identically. Use `--level-window 0` (nearest sample, no smoothing, no cap) for handheld footage where the tilt genuinely changes from frame to frame.
 - Raw `roll_deg`/`pitch_deg` (nearest single sample) remain in telemetry; `level_roll_deg`/`level_pitch_deg` record the applied value and `level_window_s` the window used.
 - Rotations below `0.05°` are skipped to avoid needless resampling.
-- Leveling stays a second `v360` pass per frame. Doing it inside the stitching pass, with per-frame `v360` commands (`sendcmd`), was tried and dropped: `v360` rebuilds its remap tables on every command, which made it about 40% slower (215 s against 154 s for 12 frames), and the result did not match the verified two-pass geometry.
+- **Single pass.** The rotation is applied inside the stitching `v360=eac:equirect` (same options and `rorder=pry` as the old second pass; one frame matched the two-pass result at 36 dB PSNR, the normal difference between one and two resamplings). Because one `v360` call can only hold one rotation, consecutive frames whose roll and pitch agree within `LEVEL_GROUP_TOLERANCE_DEG` (0.2°, about 3 px at the edge of a 5376 px panorama) form a run that shares the run's mid value. On four drives that gave runs of 4–5 images. Twelve leveled, re-centred frames of GS010153 took 89 s instead of 215 s (2.4× faster), and the output was visually identical, slightly sharper. A run that fails falls back to the old path (lossless PNG, then one `v360=e:e` rotation per frame, batches of 8). The log shows `N leveled frame(s) in M single-pass run(s)`.
+- Per-frame `v360` commands (`sendcmd`) were tried first and dropped: `v360` rebuilds its remap tables on every command (about 40% slower), and the result did not match.
+
+**Road gradient (`--horizon-gradient`, opt-in)**
+
+On hilly roads the vehicle, and the camera with it, really pitches: GPS altitude explained 46–61% of the tilt variation on three drives with gradients up to ±15%, with a size matching the geometry (1% gradient ≈ 0.57° of tilt), on the camera axis the mount angle predicts. The 25 s window and the 0.5° cap partly average this real tilt away, so on hills the horizon stays a little tilted. With `--horizon-gradient`:
+
+- The road gradient is computed from GPS altitude (averaged over ±2 s, differenced over ±30 m of travel, clamped to ±30%; spans under 39 m count as flat).
+- The tilt it causes is projected onto the camera with the mount angle (the heading offset; 0 when none is given): `pitch = −atan(g)·cos(mount)`, `roll = +atan(g)·sin(mount)`. The signs match regressions on the 000, 090 and 270 drives.
+- That tilt is removed from every gravity sample before the 25 s average and the image's own gradient tilt is added back afterwards, so hills are followed without the window's lag.
+- The 0.5° cap applies to the smoothed part; the total may change by up to `LEVEL_GRADIENT_MAX_STEP_DEG` (1.0°) per image so crests are not delayed.
+
+Measured on images taken during steady driving (|acceleration| < 0.3 m/s²), against a 3 s gravity average as reference (the camera's own reading, not ground truth):
+
+| Drive (mount) | Default: median / p90 / max | `--horizon-gradient` | Largest image-to-image change |
+|---|---|---|---|
+| GS013342 (270, time-lapse) | 0.68 / 1.41 / 2.54° | 0.65 / 1.15 / 2.54° | 0.5° → 1.0° |
+| GS013336 (000, time-lapse) | 0.58 / 1.27 / 2.39° | 0.49 / 1.02 / **3.67°** | 0.5° → 1.0° |
+| GS013324 (270, video, steepest) | 0.83 / 1.83 / **7.19°** | 0.85 / 1.84 / **3.94°** | 0.5° → 1.0° |
+| GS010153 (090, flat) | 1.16 / 1.85 / 2.08° | 1.27 / 1.63 / 2.06° | 0.5° → 1.0° |
+
+It helps most on steep roads and in the 90th percentile, but it is not better everywhere (GS013336's worst image got worse), and the GoPro's GPS altitude noise is its limit. That is why it is opt-in; try it on hilly routes and check a few images on crests. Doppler vertical speed (3D minus 2D GPS speed) was tested as a cleaner gradient source and is not usable (correlation 0.2–0.28, about 0 in time-lapse).
 - Leveling happens during export. Existing images are skipped unless `--overwrite` is used.
 
 ### 6.6 MAX 360 stitching pipeline
@@ -571,14 +606,14 @@ Camera names and formats such as `max360`, `30fps`, `120fps`, `1080p`, `4k` or `
 1. Probe the file; select the largest matching EAC hemisphere pair, or a single wide equirectangular stream.
 2. Build a filter graph:
    - Split each hemisphere into side/centre/side regions.
-   - Cross-blend the 32 px (or 16 px) overlap seams.
+   - Cross-blend the overlap seams (64 px crops on the MAX 4096×1344 and the MAX2, 32 px on 2272×736).
    - Assemble the six faces into a 3×2 EAC net.
    - Reproject with `v360=eac:equirect:interp=…:w=…:h=…`, including the re-centring `yaw` when there is one (§6.4).
 3. Process selected frames in batches:
    - Seek to the first PTS of each batch when the timeline allows it.
    - Retry the batch from the start of the file if the seek produces a bad result.
 4. Without `--level-horizon`, encode directly to the target format.
-5. With `--level-horizon`, write lossless PNG intermediates and run one `v360=e:e` sphere rotation per frame (roll, pitch and the re-centring yaw together), then encode.
+5. With `--level-horizon`, group consecutive frames whose angles agree within 0.2° and stitch each group with its roll, pitch and re-centring yaw in the same `v360` (single pass). A group that fails falls back to lossless PNG intermediates and one `v360=e:e` rotation per frame.
 6. `--workers` parallelises the per-frame sphere rotations.
 7. `max2sphere` shares the same two-pass leveled path after it produces the equirectangular video.
 
@@ -595,8 +630,8 @@ Camera names and formats such as `max360`, `30fps`, `120fps`, `1080p`, `4k` or `
 - `ColorSpace = 1` (sRGB).
 - GoPro (MAX/HERO): `ExposureTime` and `ISO` come from the camera's per-frame `SHUT`/`ISOE` telemetry (nearest frame within 1 s of the capture time). They are real per-frame values, e.g. useful to spot motion blur; other lens/exposure tags are not written.
 - All tags are written with exiftool `-n`, so values must be raw (`T`, `K`, `2 3 0 0`, `YYYY:mm:dd HH:MM:SS.sssZ`); exiftool drops print-form values such as `True North` with only a warning.
-- **Camera firmware:** EXIF `Software` (defined as "software or firmware of the camera") and `XMP-aux:Firmware` carry the camera firmware, as the cameras' own photos do (e.g. `H19.03.02.02.00`, `VIRB Ultra 30 FW 4.80`). When no firmware is known, `Software` falls back to the exporter version. The serial number goes to `SerialNumber`, `CameraSerialNumber` and `XMP-aux:SerialNumber`.
-- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.3`.
+- **Camera firmware:** EXIF `Software` (defined as "software or firmware of the camera") and `XMP-aux:Firmware` carry the camera firmware, as the cameras' own photos do (e.g. `H19.03.02.02.00`, `VIRB Ultra 30 FW 4.80`). When no firmware is known, `Software` falls back to the exporter version. The serial number goes to `SerialNumber`, `CameraSerialNumber` and `XMP-aux:SerialNumber`. For GoPro (MAX, MAX2, HERO) it is `CASN` from the file's "Global Settings" block, as on the camera's own photos (e.g. `C3351325080196`); ffprobe does not show it. Note that Panoramax publishes EXIF, so the serial is public.
+- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.4`.
 - **Provenance note:** only `UserComment`, e.g. `heading_source=gps_course; position_source=interpolated`, plus per-camera flags (`camera_orientation_deg` for VIRB, `unpositioned` for HERO). It holds only facts without an EXIF tag of their own. `ImageDescription`, `XPComment` and `XMP:Description` and `XMP:Title` are not written, because galleries and Panoramax show them as the photo caption or title. Video, frame, PTS, distance, accuracy source and DOPs are in the per-image telemetry GeoJSON. Provenance never goes to keywords.
 - `Keywords`/`XMP:Subject` are written only when `--keywords` is passed.
 - GPano/XMP-GPano tags are written only for MAX panoramic images.
@@ -734,7 +769,7 @@ A one-point track is emitted as a `Point` feature. An empty track emits no geome
 {
   "type": "FeatureCollection",
   "generator": "v2i.py",
-  "generator_version": "0.0.3",
+  "generator_version": "0.0.4",
   "camera": "gopro-max-360",
   "camera_label": "GoPro MAX 360",
   "video": "GS013338.360",
@@ -799,7 +834,7 @@ VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
 {
   "type": "FeatureCollection",
   "generator": "v2i.py",
-  "generator_version": "0.0.3",
+  "generator_version": "0.0.4",
   "camera": "gopro-max-360",
   "camera_label": "GoPro MAX 360",
   "video": "GS013338.360",
@@ -995,8 +1030,8 @@ python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
 |---|---|
 | Faster flat extraction | `--workers N` (one ffmpeg per frame) |
 | Lower CPU | `--workers 1`, `--threads 1` |
-| Faster MAX leveling | `--workers N` runs each frame's sphere rotation in parallel |
-| Lower temporary disk use | Leveled MAX batches at 8 frames; unleveled at 60 |
+| Faster MAX leveling | Already single pass; `--workers N` only matters for the two-pass fallback |
+| Lower temporary disk use | MAX batches hold at most 60 frames (8 in the two-pass fallback) |
 | Less ffmpeg memory | `--threads` |
 | Avoid resampling | Leave `--level-horizon` off when the source is already level |
 | Quick inventory | `--dry-run` still reads telemetry and plans every frame |
@@ -1036,7 +1071,8 @@ python3 v2i.py -i video/ -o images/ -d 7 --manifest run.json
 | `--heading-offset auto: folder … has more than one heading offset` | Two 3-digit parts in a folder name | Rename the folder so it carries one offset |
 | 360 images face sideways / backwards | Wrong or missing heading offset | Check the mount direction: `090` = front lens to the right of travel; use `--heading-offset auto` with labelled folders |
 | Local filenames are UTC | Camera has no local clock evidence | Pass `--timezone +HH:MM` |
-| MAX leveling is slow | Per-frame `v360` sphere rotation on CPU | Raise `--workers`, reduce output size, or leave `--level-horizon` off |
+| MAX leveling is slow | Many single-pass runs (angles change a lot) or the two-pass fallback was used (see the log) | Reduce output size, or leave `--level-horizon` off |
+| Leveled images still tilt on hills | The smoothing window averages the real road gradient away | Try `--horizon-gradient` (opt-in) |
 | Looking for `*.telemetry.json` | Telemetry exports switched to GeoJSON | Read `<sequence>.telemetry.geojson` / `<sequence>.image-telemetry.geojson` (RFC 7946 FeatureCollections) |
 
 ---
@@ -1139,10 +1175,13 @@ Speed conversion: knots × `0.514444` = m/s.
 | Constant | Value | Meaning |
 |---|---|---|
 | `DEFAULT_EXTENSIONS` | `.mp4,.mov,.m4v,.360` | Files scanned by default |
-| `SOFTWARE_TAG` | `v2i.py v0.0.3` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
+| `SOFTWARE_TAG` | `v2i.py v0.0.4` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
 | `LEVEL_WINDOW_DEFAULT` | `25.0` | Default `--level-window` in real-time seconds |
 | `LEVEL_MAX_STEP_DEG` | `0.5` | Largest leveling change between consecutive images |
-| `LEVEL_ACCEL_WEIGHTING` | `False` | Down-weight gravity samples during acceleration (implemented, off) |
+| `LEVEL_ACCEL_WEIGHTING` | `False` | Down-weight gravity samples during acceleration (implemented, off, candidate for removal) |
+| `LEVEL_GROUP_TOLERANCE_DEG` | `0.2` | Leveled frames within this angle share one single-pass rotation |
+| `LEVEL_GRADIENT_BASELINE_M` | `30.0` | `--horizon-gradient`: altitude differenced over ± this travel |
+| `LEVEL_GRADIENT_MAX_STEP_DEG` | `1.0` | `--horizon-gradient`: largest total change between images |
 | `FIRST_FIX_MAX_DELAY_S` | `2.0` | Frame 0 is forced only if GPS was fixed within this many seconds |
 | `EXTRACT_CHUNK_SIZE` | `60` | Unleveled MAX batch size |
 | `MAX360_LEVEL_CHUNK_SIZE` | `8` | MAX `rotate`-leveled batch size |
@@ -1169,5 +1208,30 @@ Speed conversion: knots × `0.514444` = m/s.
 
 | Version | Highlight |
 |---|---|
+| `0.0.4` | GoPro MAX2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, `GoPro MAX2` model); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX 360: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
 | `0.0.3` | Unified single-file pipelines, per-camera telemetry, timezone detection, universal unpositioned fallback. Horizon leveling restricted to 360 (MAX) videos via `--level-horizon {no,rotate,exif}`; telemetry exports switched from `*.json` to RFC 7946 `*.geojson`; exporter version written to EXIF `Software` |
 | Earlier | Per-camera scripts and modules, merged into `v2i.py` |
+
+---
+
+## 11. Further research
+
+### 11.1 GPS-aided attitude filter (horizon leveling)
+
+Today's leveling smooths GoPro's `GRAV`, an apparent gravity that also contains the vehicle's own acceleration, and optionally adds the road gradient from GPS altitude (§6.5). The principled replacement is a GPS-aided attitude filter:
+
+- **Propagate** the camera's attitude with the gyroscope (`GYRO`, ~200 Hz in normal video), which follows real tilt changes (hills, crests, bike lean) without lag.
+- **Correct** its slow drift with the accelerometer (`ACCL`) after subtracting the vehicle's own acceleration, computed from GNSS: longitudinal (change of speed), lateral (speed × turn rate, from GNSS course or `GYRO` yaw rate) and vertical (from altitude).
+- **Benefits:** no smoothing window or step cap is needed; braking, turns and hills are separated physically instead of averaged.
+- **Limits:** only for normal video. In time-lapse the camera stores one IMU sample per frame (2 Hz real time), too sparse to integrate the gyroscope, so time-lapse keeps the current method. `CORI` (GoPro's own gyro-fused orientation) might shortcut the propagation step, but its frame convention relative to `GRAV` could not yet be confirmed (3–10° differences in a first comparison).
+
+**RTK GNSS recordings.** RTK GNSS logs recorded alongside future videos are the natural input and reference for this work:
+
+- Centimetre-level position and altitude give a clean road gradient and vehicle acceleration. The GoPro's own GPS altitude noise is what limits `--horizon-gradient` today, and its Doppler vertical speed is unusable.
+- They are a reference to validate the existing leveling, the `--horizon-gradient` numbers above, heading (course over ground), and image positions.
+- Suggested order: first import RTK tracks as a reference and re-measure the tables in §6.5, then build the filter.
+
+### 11.2 Bike lean
+
+Mapillary recommends 0.5 s time-lapse for bikes. In a turn a bike leans by `atan(a_lateral / g)`, about 14° at 18 km/h in a 10 m-radius turn. GoPro's apparent gravity stays aligned with the leaning bike, so leveling cannot see the lean. The fix is the opposite of acceleration down-weighting: *add* the lateral acceleration back as roll, projected with the mount angle like the road gradient. It needs bike recordings to validate and is deferred until they exist.
+

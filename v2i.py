@@ -6,7 +6,7 @@ Everything needed to identify videos, read telemetry, select frames, extract
 stills and write metadata lives in this single file.  Supported cameras:
 
     * Garmin VIRB Ultra 30   (MP4 + sibling FIT telemetry)
-    * GoPro MAX 360          (``.360`` EAC hemispheres -> equirectangular)
+    * GoPro MAX 360 / MAX2   (``.360`` EAC hemispheres -> equirectangular)
     * BlackVue DR900         (MP4 with embedded NMEA)
     * GoPro HERO             (flat MP4 with GPMF telemetry)
 
@@ -56,10 +56,10 @@ class Fatal(Exception):
 # Shared helpers: CLI, detection, timelines, extraction and tracks
 # =========================================================================
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 # Written to EXIF ``Software``, ``XMP:CreatorTool`` and the GPano
-# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.3``.
+# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.4``.
 SOFTWARE_TAG = "%s v%s" % (SCRIPT_NAME, __version__)
 
 # Values ``--level-horizon`` accepted before it became an on/off switch; they
@@ -268,6 +268,104 @@ def _scan_markers(path: str, needles: Iterable[bytes],
         if needle in blob:
             found.add(needle)
     return found
+
+
+@dataclass
+class GoProSettings:
+    """Camera facts from the ``moov/udta/GPMF`` "Global Settings" block.
+
+    Every GoPro file carries this block in its container header (the same
+    place the camera's own photos take their EXIF from).  ``tz_offset_s`` is
+    the camera's configured UTC offset (``TZON``, minutes, daylight saving
+    included) and ``local_created`` the camera-local wall clock (``CDAT``);
+    the GoPro MAX does not write either, the MAX2 and HERO11 do.
+    """
+    model: Optional[str] = None             # MINF, e.g. "GoPro Max", "MAX2"
+    firmware: Optional[str] = None          # FMWR
+    serial: Optional[str] = None            # CASN
+    tz_offset_s: Optional[int] = None       # TZON * 60
+    local_created: Optional[dt.datetime] = None   # CDAT (naive local)
+
+
+def _udta_gpmf(path: str) -> Optional[bytes]:
+    """Return the raw ``moov/udta/GPMF`` payload, or ``None``.
+
+    Only atom headers are read while walking, so this is cheap even for
+    multi-gigabyte files whose ``moov`` sits at the end.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            def walk(start: int, end: int, depth: int) -> Optional[bytes]:
+                pos = start
+                while pos + 8 <= end:
+                    fh.seek(pos)
+                    head = fh.read(16)
+                    if len(head) < 8:
+                        return None
+                    atom_size, kind = struct.unpack(">I4s", head[:8])
+                    header = 8
+                    if atom_size == 1 and len(head) >= 16:
+                        atom_size = struct.unpack(">Q", head[8:16])[0]
+                        header = 16
+                    elif atom_size == 0:
+                        atom_size = end - pos
+                    if atom_size < header:
+                        return None
+                    if depth == 0 and kind == b"moov":
+                        return walk(pos + header, pos + atom_size, 1)
+                    if depth == 1 and kind == b"udta":
+                        return walk(pos + header, pos + atom_size, 2)
+                    if depth == 2 and kind == b"GPMF":
+                        length = min(atom_size - header, 1 << 20)
+                        fh.seek(pos + header)
+                        return fh.read(length)
+                    pos += atom_size
+                return None
+            return walk(0, size, 0)
+    except (OSError, struct.error):
+        return None
+
+
+@lru_cache(maxsize=64)
+def read_gopro_settings(path: str) -> GoProSettings:
+    """Read :class:`GoProSettings`; missing fields stay ``None``."""
+    settings = GoProSettings()
+    buf = _udta_gpmf(path)
+    if not buf:
+        return settings
+    try:
+        for elem in iter_elements(buf):
+            if elem.typ == TYPE_NEST:
+                continue
+            if elem.key == "MINF" and settings.model is None:
+                settings.model = as_text(buf, elem).strip() or None
+            elif elem.key == "FMWR" and settings.firmware is None:
+                settings.firmware = as_text(buf, elem).strip() or None
+            elif elem.key == "CASN" and settings.serial is None:
+                settings.serial = as_text(buf, elem).strip() or None
+            elif elem.key == "TZON" and settings.tz_offset_s is None:
+                values = decode(buf, elem)
+                if isinstance(values, list) and values:
+                    minutes = int(values[0])
+                    if abs(minutes) <= 14 * 60:
+                        settings.tz_offset_s = minutes * 60
+            elif elem.key == "CDAT" and settings.local_created is None:
+                values = decode(buf, elem)
+                if isinstance(values, list) and values and values[0] > 0:
+                    settings.local_created = dt.datetime.fromtimestamp(
+                        int(values[0]), dt.timezone.utc).replace(tzinfo=None)
+    except (GpmfError, struct.error, ValueError, OverflowError, OSError):
+        pass
+    return settings
+
+
+def gopro_model_name(minf: Optional[str], fallback: str) -> str:
+    """EXIF ``Model`` as the camera writes it ("GoPro Max", "GoPro MAX2")."""
+    text = (minf or "").strip()
+    if not text:
+        return fallback
+    return text if text.lower().startswith("gopro") else "GoPro " + text
 
 
 def read_gpmf_device_name(path: str, stream_index: Optional[int],
@@ -620,6 +718,13 @@ def add_common_arguments(parser: argparse.ArgumentParser, *,
                              "so the horizon is level, using the camera's own "
                              "gravity sensor smoothed over --level-window.  "
                              "Off by default; ignored for flat videos")
+    parser.add_argument("--horizon-gradient", "--level-gradient",
+                        dest="horizon_gradient", action="store_true",
+                        help="opt-in, with --level-horizon: follow the road "
+                             "gradient from GPS altitude instead of averaging "
+                             "it away, so hills do not leave the horizon "
+                             "tilted (uses the heading offset as the mount "
+                             "angle); see README section 6.5")
     parser.add_argument("--level-window", "--horizon-window",
                         dest="level_window", type=float,
                         default=LEVEL_WINDOW_DEFAULT, metavar="SECONDS",
@@ -782,6 +887,8 @@ def validate_common_args(parser: argparse.ArgumentParser,
     if args.max_dop < 0:
         parser.error("--max-dop must be 0 (off) or positive (got %g)"
                      % args.max_dop)
+    if args.horizon_gradient and not args.level_horizon:
+        parser.error("--horizon-gradient needs --level-horizon")
     if args.level_window < 0:
         parser.error("--level-window must not be negative (got %g)"
                      % args.level_window)
@@ -952,6 +1059,39 @@ def timezone_from_clock_skew(skew_s: Optional[float]) -> Optional[int]:
     return offset
 
 
+# A camera UTC offset further than this from the solar offset of the GPS
+# longitude (longitude / 15 h) is almost certainly a wrong camera setting.
+# Real-world zones stay within about 3 h of solar time (western China, Spain
+# in summer); 3.5 h leaves room for those without hiding a wrong continent.
+TZ_SOLAR_TOLERANCE_H = 3.5
+
+
+def check_timezone_plausible(offset_s: int, longitude: Optional[float],
+                             source: str, logger: logging.Logger) -> bool:
+    """Warn when *offset_s* cannot be local time at *longitude*.
+
+    A dependency-free sanity check of the camera's timezone against the GPS
+    position: it catches a camera still set to another continent, not a
+    one-hour daylight-saving slip.  Returns ``True`` when plausible or when
+    there is no position to compare with.
+    """
+    if longitude is None or not -180.0 <= float(longitude) <= 180.0:
+        return True
+    solar_h = float(longitude) / 15.0
+    diff_h = abs(offset_s / 3600.0 - solar_h)
+    if diff_h <= TZ_SOLAR_TOLERANCE_H:
+        logger.debug("  timezone %s (%s) is plausible for longitude %.3f "
+                     "(solar offset %+.1f h)", offset_string(offset_s),
+                     source, longitude, solar_h)
+        return True
+    logger.warning("  timezone %s from %s does not fit the GPS position "
+                   "(longitude %.3f, solar offset %+.1f h): the camera clock "
+                   "may still be set for another region; pass --timezone to "
+                   "override", offset_string(offset_s), source, longitude,
+                   solar_h)
+    return False
+
+
 def resolve_timezone(args: argparse.Namespace, detected: Optional[int], *,
                      camera: str, logger: logging.Logger) -> Tuple[int, bool]:
     """Return ``(offset_seconds, known)`` for naming and EXIF.
@@ -973,6 +1113,41 @@ def resolve_timezone(args: argparse.Namespace, detected: Optional[int], *,
         logger.warning("no camera-local timezone in this video; using UTC for "
                        "file names and EXIF (pass --timezone to override)")
     return 0, False
+
+
+def resolve_gopro_timezone(args: argparse.Namespace, tzon_s: Optional[int],
+                           other_s: Optional[int], other_source: str,
+                           track, *, camera: str,
+                           logger: logging.Logger) -> Tuple[int, bool]:
+    """Timezone for a GoPro video, logged with its source and sanity-checked.
+
+    Order: ``--timezone`` / ``--time-base utc`` (see
+    :func:`resolve_timezone`), then the camera's own ``TZON`` setting
+    (MAX2, HERO11+), then *other_s* (the MAX clock-skew estimate), else UTC
+    with a warning.  A camera-derived offset is compared with the GPS
+    longitude of the first fix (:func:`check_timezone_plausible`).
+    """
+    if tzon_s is not None:
+        detected, source = tzon_s, "camera TZON setting"
+    elif other_s is not None:
+        detected, source = other_s, other_source
+    else:
+        detected, source = None, ""
+    offset, known = resolve_timezone(args, detected, camera=camera,
+                                     logger=logger)
+    explicit = parse_timezone(getattr(args, "timezone", None)) is not None
+    if explicit:
+        source = "--timezone"
+    elif args.time_base == "utc":
+        source = "--time-base utc"
+    if known:
+        logger.info("  camera-local time offset: %s (%s)",
+                    offset_string(offset), source)
+        if not explicit and args.time_base != "utc" and detected is not None:
+            samples = getattr(track, "samples", None) or []
+            longitude = samples[0].get("lon") if samples else None
+            check_timezone_plausible(offset, longitude, source, logger)
+    return offset, known
 
 
 # ---------------------------------------------------------------------------
@@ -1976,10 +2151,17 @@ def select_expression(frames: Sequence[int]) -> str:
 # still decodes a bounded batch per ffmpeg call.
 EXTRACT_CHUNK_SIZE = 60
 
-# Leveled MAX frames are stitched to lossless PNG intermediates and then
-# rotated by a second v360 pass.  Smaller batches bound the temporary disk
-# use (a 5376x2688 RGB PNG is roughly 40 MB).
+# Fallback path only: when a single-pass leveled run fails, its frames are
+# stitched to lossless PNG intermediates and rotated by a second v360 pass.
+# Smaller batches bound the temporary disk use (a 5376x2688 RGB PNG is
+# roughly 40 MB).
 MAX360_LEVEL_CHUNK_SIZE = 8
+# Leveled frames whose roll and pitch are all within this many degrees of a
+# common value share one single-pass rotation (see max360_level_groups).
+# 0.2 degrees is ~3 px at the edge of a 5376 px panorama; on four test drives
+# it gave runs of 4-5 images and made leveled exports ~2.5x faster than one
+# extra rotation pass per frame.
+LEVEL_GROUP_TOLERANCE_DEG = 0.2
 
 # At most this many MAX stitch batches run at the same time (bounded by
 # --workers).  Every batch decodes two 4K hemisphere streams through a large
@@ -2039,6 +2221,54 @@ def place_extracted(extracted: Mapping[int, str], records: Sequence[dict]
         record["written"] = True
         written.append(record)
     return written, failed
+
+
+def max360_rotation_opts(yaw: float = 0.0, roll_deg: float = 0.0,
+                         pitch_deg: float = 0.0) -> str:
+    """``v360`` rotation options for re-centring and leveling, or ``""``.
+
+    Same convention as :func:`max360_level_filter` (``roll=-roll_deg``,
+    ``rorder=pry``: leveling in the camera frame, then the yaw).  Placed in
+    the stitching ``v360=eac:equirect`` it gives the same image as stitching
+    first and rotating afterwards (36 dB PSNR on a real frame, the normal
+    difference between one and two resamplings) at no extra cost.
+    """
+    if max(abs(float(yaw)), abs(float(roll_deg)), abs(float(pitch_deg))) < 0.05:
+        return ""
+    return ":yaw=%.6f:pitch=%.6f:roll=%.6f:rorder=pry" % (
+        float(yaw), float(pitch_deg), -float(roll_deg))
+
+
+def max360_level_groups(frames: Sequence[int],
+                        levels: Mapping[int, Tuple[float, float]],
+                        tolerance: float, max_size: int
+                        ) -> List[Tuple[List[int], Tuple[float, float]]]:
+    """Split frames into runs that can share one leveling rotation.
+
+    Consecutive frames stay in a run while every frame's roll and pitch are
+    within *tolerance* degrees of the run's midpoint.  Frames without an
+    angle count as (0, 0), i.e. only re-centred.  Returns
+    ``[(frames, (roll, pitch)), ...]`` with the midpoint per run.
+    """
+    runs: List[Tuple[List[int], Tuple[float, float]]] = []
+    current: List[int] = []
+    lo = hi = (0.0, 0.0)
+    for frame in frames:
+        angle = levels.get(frame) or (0.0, 0.0)
+        if current:
+            new_lo = (min(lo[0], angle[0]), min(lo[1], angle[1]))
+            new_hi = (max(hi[0], angle[0]), max(hi[1], angle[1]))
+            if (len(current) < max_size
+                    and new_hi[0] - new_lo[0] <= 2 * tolerance
+                    and new_hi[1] - new_lo[1] <= 2 * tolerance):
+                current.append(frame)
+                lo, hi = new_lo, new_hi
+                continue
+            runs.append((current, ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2)))
+        current, lo, hi = [frame], angle, angle
+    if current:
+        runs.append((current, ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2)))
+    return runs
 
 
 def max360_level_filter(roll_deg: float, pitch_deg: float, width: int,
@@ -3067,6 +3297,31 @@ def decode(buf: bytes, elem: Element) -> Union[List, bytes]:
     return list(_big_endian_struct(fmt, n).unpack_from(buf, elem.offset))
 
 
+def decode_complex(buf: bytes, elem: Element, type_string: str
+                   ) -> Optional[List]:
+    """Decode a ``?`` (complex) element with the stream's ``TYPE`` string.
+
+    Newer GoPros (MAX2, HERO11+) store ``GPS9`` as one structure per sample,
+    e.g. ``TYPE`` ``lllllllSS`` = seven int32 plus two uint16.  Returns the
+    values flattened sample after sample, or ``None`` when the TYPE contains
+    a non-numeric member or does not match the structure size.
+    """
+    fmt = ""
+    for char in type_string:
+        entry = _NUMERIC.get(ord(char))
+        if entry is None:
+            return None
+        fmt += entry[0]
+    sample = struct.Struct(">" + fmt)
+    if not fmt or sample.size != elem.struct_size:
+        return None
+    values: List = []
+    end = min(elem.end, len(buf))
+    for pos in range(elem.offset, end - sample.size + 1, sample.size):
+        values.extend(sample.unpack_from(buf, pos))
+    return values
+
+
 def as_text(buf: bytes, elem: Element) -> str:
     """Return a decoded element as a NUL-trimmed ASCII string."""
     raw = buf[elem.offset:elem.end]
@@ -3124,9 +3379,12 @@ def _utc_from_gps9(days, seconds) -> Optional[dt.datetime]:
         return None
     try:
         days_i = int(days)
+        # Callers pass the SCAL-scaled value, i.e. seconds since midnight.
+        # Guessing "milliseconds" from the magnitude would misread the first
+        # 86.4 s after midnight UTC, so only clearly impossible values are
+        # treated as unscaled milliseconds.
         secs = float(seconds)
-        # GPS9 stores milliseconds in some firmware, seconds in others.
-        if secs > 86400:
+        if secs >= 86400.0 + 1.0:
             secs = secs / 1000.0
         return GPS9_EPOCH + dt.timedelta(days=days_i, seconds=secs)
     except (TypeError, ValueError, OverflowError):
@@ -3144,6 +3402,7 @@ class _Block:
     utc: Optional[dt.datetime] = None
     fix: Optional[int] = None
     dop: Optional[List[float]] = None
+    type_string: Optional[str] = None                # TYPE for ``?`` data
     keys: Dict[str, list] = field(default_factory=dict)
 
     def add(self, key: str, values: list) -> None:
@@ -3210,6 +3469,13 @@ def _collect_blocks(buf: bytes, device_names: Optional[List[str]] = None
                 values = decode(buf, elem)
                 if isinstance(values, list):
                     current.dop = [float(v) / 100.0 for v in values]
+            elif elem.key == "TYPE":
+                current.type_string = as_text(buf, elem)
+            elif elem.typ == TYPE_COMPLEX:
+                values = (decode_complex(buf, elem, current.type_string)
+                          if current.type_string else None)
+                if values:
+                    current.add(elem.key, values)
             elif elem.typ == TYPE_COMPRESSED:
                 # Huffman-compressed payloads are not decoded here.
                 current.keys.setdefault("_compressed", []).append(elem.key)
@@ -3264,8 +3530,8 @@ def _make_gps_sample(row: Sequence[float], scale: Sequence[float],
     speed2d = vals[3] if len(vals) > 3 else None
     speed3d = vals[4] if len(vals) > 4 else None
     if kind == "GPS9":
-        if utc is None and len(row) >= 7:
-            utc = _utc_from_gps9(row[5], row[6])
+        if utc is None and len(vals) >= 7:
+            utc = _utc_from_gps9(vals[5], vals[6])
         dop = vals[7] if len(vals) > 7 else None
         fix = int(row[8]) if len(row) > 8 else block.fix
     else:
@@ -3310,6 +3576,23 @@ def _build_gps_samples(blocks: List[_Block]
     if not gps_blocks:
         return [], 0.0, 0, 0
 
+    # GPS9 (MAX2, HERO11+) has no GPSU block time; each sample carries its
+    # own days/seconds instead.  The first sample of a block is taken at the
+    # block's STMP, so its time anchors the camera clock exactly like GPSU.
+    for block in gps_blocks:
+        if block.utc is not None:
+            continue
+        rows, kind = _gps_rows(block)
+        if kind != "GPS9" or not rows or len(rows[0]) < 7:
+            continue
+        divisors = list(block.scale or GPS9_SCALE)
+        if len(divisors) < 7:
+            divisors += GPS9_SCALE[len(divisors):]
+        if (len(rows[0]) > 8 and int(rows[0][8]) < 2) or not divisors[6]:
+            continue                                     # no fix: no time
+        block.utc = _utc_from_gps9(rows[0][5] / (divisors[5] or 1.0),
+                                   rows[0][6] / divisors[6])
+
     offsets = []
     for block in gps_blocks:
         if block.stmp_us is not None and block.utc is not None:
@@ -3331,7 +3614,9 @@ def _build_gps_samples(blocks: List[_Block]
         for i, row in enumerate(rows):
             stmp = (int(block.stmp_us + i * period)
                     if block.stmp_us is not None else None)
-            if stmp is not None and median_offset:
+            if kind == "GPS9":
+                utc = None              # every GPS9 row carries its fix time
+            elif stmp is not None and median_offset:
                 utc = dt.datetime.fromtimestamp(
                     (stmp + median_offset) / 1e6, dt.timezone.utc)
             else:
@@ -3502,13 +3787,29 @@ LEVEL_WINDOW_DEFAULT = 25.0
 # cap on the test drives (the uncapped median used before jumped up to 3.3
 # degrees around stops), while following real slope changes.
 LEVEL_MAX_STEP_DEG = 0.5
-# Optionally, gravity samples taken while the vehicle accelerates, brakes or
-# turns are down-weighted by 1 / (1 + (a / LEVEL_ACCEL_REF)^2), a from GPS
-# (m/s^2).  Off: on four test drives it changed the angles by ~0.4 degrees
-# but made image-to-image steps slightly larger (fewer effective samples),
-# with no evidence of a more accurate horizon.
+# CANDIDATE FOR REMOVAL (kept for now, off): gravity samples taken while the
+# vehicle accelerates, brakes or turns are down-weighted by
+# 1 / (1 + (a / LEVEL_ACCEL_REF)^2), a from GPS (m/s^2).  On four test drives
+# it changed the angles by ~0.4 degrees but made image-to-image steps
+# slightly larger, with no evidence of a more accurate horizon.  A later
+# analysis showed why: on hilly roads most of the tilt variation is the real
+# road gradient (GPS altitude explained 46-61% of it), which down-weighting
+# cannot separate from acceleration.  Remove together with
+# _vehicle_acceleration once --horizon-gradient (or a GPS-aided attitude
+# filter, see README "Further research") has settled.
 LEVEL_ACCEL_WEIGHTING = False
 LEVEL_ACCEL_REF = 0.5
+# --horizon-gradient: the road gradient from GPS altitude is taken out of the
+# gravity samples before smoothing and added back per image, so a vehicle
+# pitching on hills is followed without the smoothing lag.  Altitude is
+# averaged over +-LEVEL_GRADIENT_ALT_SMOOTH_S and differenced over
+# +-LEVEL_GRADIENT_BASELINE_M of travel; |gradient| is clamped.
+LEVEL_GRADIENT_BASELINE_M = 30.0
+LEVEL_GRADIENT_ALT_SMOOTH_S = 2.0
+LEVEL_GRADIENT_MAX = 0.3
+# The smoothed part keeps LEVEL_MAX_STEP_DEG; the total (smoothed + gradient)
+# may change by up to this much per image, so crests are not delayed.
+LEVEL_GRADIENT_MAX_STEP_DEG = 1.0
 
 
 def _angle_unit_vector(row: dict, key: str) -> Optional[Tuple[float, float, float]]:
@@ -3588,6 +3889,70 @@ def _vehicle_acceleration(track) -> Tuple[List[dt.datetime], List[float]]:
     return times, accel
 
 
+def _road_gradient(track) -> Tuple[List[dt.datetime], List[float]]:
+    """Road gradient (rise over run) at each GPS sample, from GPS altitude.
+
+    Altitude is averaged over +-LEVEL_GRADIENT_ALT_SMOOTH_S real seconds, then
+    differenced over +-LEVEL_GRADIENT_BASELINE_M of travel.  Shorter spans
+    (stops, the ends of the track) give 0.  Empty without a usable track.
+    """
+    samples = getattr(track, "samples", None) or []
+    cum = getattr(track, "cum", None) or []
+    idx = [i for i, s in enumerate(samples)
+           if isinstance(s.get("utc"), dt.datetime) and s.get("alt") is not None
+           and i < len(cum)]
+    times = [samples[i]["utc"] for i in idx]
+    dist = [cum[i] for i in idx]
+    alts = [float(samples[i]["alt"]) for i in idx]
+    prefix = [0.0]
+    for value in alts:
+        prefix.append(prefix[-1] + value)
+    smooth = []
+    window = dt.timedelta(seconds=LEVEL_GRADIENT_ALT_SMOOTH_S)
+    for k, when in enumerate(times):
+        lo = bisect.bisect_left(times, when - window)
+        hi = bisect.bisect_right(times, when + window)
+        smooth.append((prefix[hi] - prefix[lo]) / max(1, hi - lo))
+    gradient = []
+    base = LEVEL_GRADIENT_BASELINE_M
+    for k in range(len(times)):
+        lo = bisect.bisect_left(dist, dist[k] - base)
+        hi = min(len(dist) - 1, bisect.bisect_right(dist, dist[k] + base) - 1)
+        run = dist[hi] - dist[lo]
+        if run < 1.3 * base:
+            gradient.append(0.0)
+            continue
+        value = (smooth[hi] - smooth[lo]) / run
+        gradient.append(max(-LEVEL_GRADIENT_MAX, min(LEVEL_GRADIENT_MAX, value)))
+    return times, gradient
+
+
+def _gradient_tilt(gradient: float, mount_deg: float) -> Tuple[float, float]:
+    """Camera ``(roll, pitch)`` caused by driving on *gradient*.
+
+    Uphill raises the vehicle's nose by atan(gradient).  For a camera whose
+    front lens points *mount_deg* clockwise of travel (the heading offset)
+    that is ``pitch = -g cos(mount)`` and ``roll = +g sin(mount)`` (camera
+    pitch positive = looking down, roll positive = right side down).  The
+    signs match regressions of GRAV against GPS gradient on 000/090/270
+    mounts (pitch for 000, roll with opposite signs for 090 and 270).
+    """
+    angle = math.degrees(math.atan(gradient))
+    mount = math.radians(mount_deg or 0.0)
+    return angle * math.sin(mount), -angle * math.cos(mount)
+
+
+def _vector_from_angles(roll: float, pitch: float
+                        ) -> Optional[Tuple[float, float, float]]:
+    """Unit gravity vector ``(x, down, forward)`` for camera roll/pitch."""
+    r, q = math.radians(roll), math.radians(pitch)
+    if abs(math.cos(r)) < 1e-9 or abs(math.cos(q)) < 1e-9:
+        return None
+    x, forward = math.tan(r), math.tan(q)
+    norm = math.sqrt(x * x + 1.0 + forward * forward)
+    return x / norm, 1.0 / norm, forward / norm
+
+
 def _limit_steps(values: Sequence[Tuple[float, float]], max_step: float
                  ) -> List[Tuple[float, float]]:
     """Cap the change between consecutive (roll, pitch) pairs.
@@ -3617,7 +3982,9 @@ def _limit_steps(values: Sequence[Tuple[float, float]], max_step: float
 def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
                   *, window_s: float = LEVEL_WINDOW_DEFAULT,
                   max_delta_s: float = 1.0, track=None,
-                  max_step: float = LEVEL_MAX_STEP_DEG
+                  max_step: float = LEVEL_MAX_STEP_DEG,
+                  accel_weighting: bool = LEVEL_ACCEL_WEIGHTING,
+                  gradient_mount_deg: Optional[float] = None
                   ) -> Tuple[Dict[int, Tuple[float, float]],
                              Dict[int, Tuple[float, float]]]:
     """Map ``frame_index`` to raw and leveling ``(roll, pitch)`` per image.
@@ -3628,12 +3995,20 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
 
     * a Gaussian-weighted mean of the gravity vectors within ``window_s``
       *real* seconds centred on the capture time (sigma = window / 4);
-    * samples taken while the vehicle accelerates, brakes or turns (from the
-      GPS *track*) count less, since GoPro's gravity estimate then tilts;
+    * with *accel_weighting* (off; candidate for removal), samples taken
+      while the vehicle accelerates, brakes or turns (from the GPS *track*)
+      count less;
+    * with *gradient_mount_deg* (``--horizon-gradient``; the heading offset,
+      0 for a forward lens), the tilt caused by the road gradient (GPS
+      altitude of *track*) is removed from every sample before averaging and
+      the image's own gradient tilt is added back afterwards, so hills are
+      followed without the window's lag;
     * near the start and end of the recording the window is not cut in half:
       the value of the first/last full window is held instead;
     * finally the change between consecutive images is capped at *max_step*
-      degrees (forward/backward averaged, so without lag).
+      degrees (forward/backward averaged, so without lag); with the gradient
+      term, that cap applies to the smoothed part and the total is capped at
+      LEVEL_GRADIENT_MAX_STEP_DEG.
 
     Working in real (UTC) time rather than in exported-image neighbours makes
     this independent of the frame spacing, so TimeWarp/timelapse footage is
@@ -3661,8 +4036,25 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
                             [item[1] for item in timed])
     half = max(0.0, float(window_s)) / 2.0
     sigma = half / 2.0
-    acc_times, acc_values = (_vehicle_acceleration(track) if half > 0
-                             else ([], []))
+    acc_times, acc_values = (_vehicle_acceleration(track)
+                             if half > 0 and accel_weighting else ([], []))
+    use_gradient = gradient_mount_deg is not None and half > 0
+    grad_times, grad_values = (_road_gradient(track) if use_gradient
+                               else ([], []))
+
+    def gradient_term(when: dt.datetime) -> Tuple[float, float]:
+        if not grad_times:
+            return 0.0, 0.0
+        pos = min(len(grad_times) - 1, bisect.bisect_left(grad_times, when))
+        if pos > 0 and (abs((grad_times[pos - 1] - when).total_seconds())
+                        < abs((grad_times[pos] - when).total_seconds())):
+            pos -= 1
+        if abs((grad_times[pos] - when).total_seconds()) > 2.0:
+            return 0.0, 0.0
+        return _gradient_tilt(grad_values[pos], gradient_mount_deg)
+
+    image_terms: Dict[int, Tuple[float, float]] = {}
+    vector_cache: Dict[Tuple[str, int], Optional[Tuple[float, float, float]]] = {}
 
     def accel_weight(when: dt.datetime) -> float:
         if not acc_times:
@@ -3711,7 +4103,19 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
             hi = bisect.bisect_right(times, centre + dt.timedelta(seconds=half))
             vectors, weights = [], []
             for i in range(lo, hi):
-                vector = _angle_unit_vector(rows[i], key)
+                if (key, i) in vector_cache:
+                    vector = vector_cache[(key, i)]
+                else:
+                    vector = _angle_unit_vector(rows[i], key)
+                    if vector is not None and grad_times:
+                        # Take this sample's road-gradient tilt out first.
+                        s_roll, s_pitch = _roll_pitch_from_body(
+                            vector[0], vector[2], vector[1])
+                        if s_roll is not None and s_pitch is not None:
+                            g_roll, g_pitch = gradient_term(times[i])
+                            vector = _vector_from_angles(s_roll - g_roll,
+                                                         s_pitch - g_pitch)
+                    vector_cache[(key, i)] = vector
                 if vector is None:
                     continue
                 offset_s = (times[i] - centre).total_seconds()
@@ -3724,6 +4128,8 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
             angles = _weighted_vector_angles(vectors, weights)
             if angles is not None:
                 level[frame] = angles
+                if grad_times:
+                    image_terms[frame] = gradient_term(target)
             break
     if half > 0 and level:
         ordered = sorted((record for record in records
@@ -3734,6 +4140,12 @@ def _image_angles(records: Sequence[dict], imu: Optional[Dict[str, List[dict]]],
                                         int(r["frame_index"])))
         frames = [int(r["frame_index"]) for r in ordered]
         limited = _limit_steps([level[f] for f in frames], max_step)
+        if image_terms:
+            limited = _limit_steps(
+                [(roll + image_terms.get(f, (0.0, 0.0))[0],
+                  pitch + image_terms.get(f, (0.0, 0.0))[1])
+                 for f, (roll, pitch) in zip(frames, limited)],
+                LEVEL_GRADIENT_MAX_STEP_DEG)
         for frame, (roll, pitch) in zip(frames, limited):
             level[frame] = (round(roll, 3), round(pitch, 3))
     return raw, level
@@ -5015,6 +5427,35 @@ class max360_VideoInfo:
     make: str = "GoPro"
     model: str = "GoPro Max"
     serial: Optional[str] = None
+    tz_offset_s: Optional[int] = None   # camera TZON (MAX2), None on the MAX
+    out_width: int = max360_DEFAULT_WIDTH        # equirectangular output size
+    out_height: int = max360_DEFAULT_HEIGHT
+
+
+def max360_native_size(width: int, height: int,
+                       already_equirect: bool) -> Tuple[int, int]:
+    """Native equirectangular size: four cube faces around (MAX 5376x2688,
+    MAX2 7680x3840).  Equirectangular input keeps the historical default."""
+    if already_equirect or not height:
+        return max360_DEFAULT_WIDTH, max360_DEFAULT_HEIGHT
+    try:
+        _side, centre, _blend = max360__eac_layout(width, height)
+    except max360_BackendError:
+        return max360_DEFAULT_WIDTH, max360_DEFAULT_HEIGHT
+    return 4 * centre, 2 * centre
+
+
+def max360_output_size(info: "max360_VideoInfo", args) -> Tuple[int, int]:
+    """``--width``/``--height`` or the camera's native size (2:1)."""
+    width, height = getattr(args, "width", None), getattr(args, "height", None)
+    if width is None and height is None:
+        return max360_native_size(info.width, info.height,
+                                  info.already_equirect)
+    if width is None:
+        width = 2 * height
+    if height is None:
+        height = width // 2 + (width // 2) % 2
+    return width, height
 
 
 max360__parse_rate = _parse_rate
@@ -5094,13 +5535,17 @@ def max360_probe(path: str) -> max360_VideoInfo:
             ordinals[int(stream["index"])] = ordinal
         except (KeyError, TypeError, ValueError):
             pass
+    settings = read_gopro_settings(path)
     return max360_VideoInfo(
         path=path, duration=duration, fps=fps, frame_count=frame_count,
         video_ordinals=ordinals, hemi_a=a_idx, hemi_b=b_idx, gpmd=meta.gpmd_index,
         width=width, height=height, creation_time=creation,
         already_equirect=already,
-        firmware=meta.format_tags.get("firmware"),
-        serial=meta.format_tags.get("serial_number") or meta.format_tags.get("serial"),
+        firmware=meta.format_tags.get("firmware") or settings.firmware,
+        model=gopro_model_name(settings.model, "GoPro Max"),
+        serial=(meta.format_tags.get("serial_number")
+                or meta.format_tags.get("serial") or settings.serial),
+        tz_offset_s=settings.tz_offset_s,
     )
 
 
@@ -5113,6 +5558,11 @@ def max360_probe(path: str) -> max360_VideoInfo:
 max360_EAC_LAYOUTS = {
     (4096, 1344): (1376, 1344, 32),
     (2272, 736): (768, 736, 16),
+    # GoPro MAX2: 1984 + 1920 + 1984.  Measured on GS010037: content repeats
+    # 64 px apart across each seam (like the MAX), so the overlap crops are
+    # 64 px, not the 128 px the generic gap formula below would assume, and
+    # 928 unique + 64 blended + 928 unique fill a 1920 face without scaling.
+    (5888, 1920): (1984, 1920, 32),
 }
 
 
@@ -5135,7 +5585,8 @@ def max360_build_eac_filter(a: int, b: Optional[int], width: int, height: int,
                      already_equirect: bool = False,
                      hemi_width: int = max360_HEMI_W,
                      hemi_height: int = max360_HEMI_H,
-                     yaw: float = 0.0) -> str:
+                     yaw: float = 0.0, roll: float = 0.0,
+                     pitch: float = 0.0) -> str:
     """Build the ffmpeg filter graph for one EAC hemisphere pair.
 
     A native 4096x1344 strip is side 1376 + centre 1344 + side 1376 with no
@@ -5144,9 +5595,10 @@ def max360_build_eac_filter(a: int, b: Optional[int], width: int, height: int,
     the same).  The six faces are assembled into a 3x2 EAC net and v360
     reprojects it to equirectangular.  The 2272x736 (side 768, centre 736,
     blend 16) layout is handled by the same code.  A non-zero *yaw*
-    re-centres the sphere in the same v360 call (see :func:`recenter_yaw`).
+    re-centres the sphere and *roll*/*pitch* level it, in the same v360 call
+    (see :func:`max360_rotation_opts`).
     """
-    yaw_opt = ":yaw=%.6f" % yaw if abs(yaw) >= 1e-6 else ""
+    yaw_opt = max360_rotation_opts(yaw, roll, pitch)
     lines: List[str] = []
     if already_equirect:
         if select:
@@ -5321,8 +5773,12 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
                   keep_filter: Optional[str], total_batches: int,
                   seek_time: Optional[float],
                   levels: Optional[Mapping[int, Tuple[float, float]]] = None,
-                  workers: int = 1, yaw: float = 0.0) -> None:
+                  workers: int = 1, yaw: float = 0.0,
+                  rotation: Optional[Tuple[float, float]] = None) -> None:
     """Run one bounded EAC/v360 batch and copy its images to their targets.
+
+    *rotation* ``(roll, pitch)`` levels every frame of the batch with one
+    rotation inside the stitching v360 (single pass, no intermediate).
 
     When *levels* contains a roll/pitch pair for any selected frame, the batch
     is stitched to lossless PNG intermediates and each frame is then remapped
@@ -5330,8 +5786,9 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
     once per batch.
     """
     ordered = [int(frame) for frame in frames]
-    leveled = (levels is not None
+    leveled = (rotation is None and levels is not None
                and any(levels.get(frame) is not None for frame in ordered))
+    roll, pitch = rotation if rotation is not None else (0.0, 0.0)
     selected = ordered if seek_time is None else\
         [frame - ordered[0] for frame in ordered]
     select = select_expression(selected)
@@ -5341,7 +5798,7 @@ def max360__stitch_batch(info: max360_VideoInfo, frames: Sequence[int],
         info.hemi_a, info.hemi_b, width, height, select=select,
         interp=interp, already_equirect=info.already_equirect,
         hemi_width=info.width, hemi_height=info.height,
-        yaw=0.0 if leveled else yaw)
+        yaw=0.0 if leveled else yaw, roll=roll, pitch=pitch)
     attempt = "seek" if seek_time is not None else "full"
     script_path = os.path.join(
         temp_dir, "stitch_%03d_%s.filter" % (batch_index, attempt))
@@ -5431,11 +5888,24 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
         return
     # outputs correspond to the original (already increasing) choices
     by_frame = {int(frame): output for frame, output in zip(frames, outputs)}
-    # A leveled batch stitches to lossless PNG intermediates, so keep those
-    # batches smaller to bound temporary disk use.
-    size = MAX360_LEVEL_CHUNK_SIZE if levels else EXTRACT_CHUNK_SIZE
-    chunks = [ordered_frames[i:i + size]
-              for i in range(0, len(ordered_frames), size)]
+    # Leveled frames are grouped into runs that share one rotation (within
+    # LEVEL_GROUP_TOLERANCE_DEG), each stitched and leveled in a single v360
+    # pass.  The former two-pass path (PNG intermediate + one rotation per
+    # frame) remains as the fallback for a run that fails.
+    if levels:
+        groups = max360_level_groups(ordered_frames, levels,
+                                     LEVEL_GROUP_TOLERANCE_DEG,
+                                     EXTRACT_CHUNK_SIZE)
+        chunks = [run for run, _ in groups]
+        rotations: List[Optional[Tuple[float, float]]] = \
+            [angle for _, angle in groups]
+        LOG.info("  horizon: %d leveled frame(s) in %d single-pass run(s) "
+                 "(angles within %.1f deg)", len(ordered_frames), len(chunks),
+                 LEVEL_GROUP_TOLERANCE_DEG)
+    else:
+        chunks = [ordered_frames[i:i + EXTRACT_CHUNK_SIZE]
+                  for i in range(0, len(ordered_frames), EXTRACT_CHUNK_SIZE)]
+        rotations = [None] * len(chunks)
     # Batches are independent ffmpeg runs, so several can stitch at once.
     # Each one decodes two hemisphere streams, so memory bounds the count.
     parallel = max(1, min(workers, len(chunks), MAX360_PARALLEL_BATCHES))
@@ -5443,8 +5913,8 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
     inner_workers = max(1, workers // parallel)
     temp_dir = make_temp_dir("max360_", outputs)
 
-    def do_batch(item: Tuple[int, List[int]]) -> None:
-        batch_index, chunk = item
+    def run_batch(batch_index: int, chunk: List[int],
+                  rotation: Optional[Tuple[float, float]]) -> None:
         seek_time = None
         if (timeline is not None and timeline.source == "ffprobe"
                 and len(timeline) and chunk[-1] < len(timeline)):
@@ -5457,7 +5927,8 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
                     image_format=image_format, interp=interp,
                     threads=threads, keep_filter=keep_filter,
                     total_batches=len(chunks), seek_time=seek_time,
-                    levels=levels, workers=inner_workers, yaw=yaw)
+                    levels=levels, workers=inner_workers, yaw=yaw,
+                    rotation=rotation)
                 return
             except max360_BackendError as exc:
                 LOG.warning("seek-based stitching failed for frames "
@@ -5468,7 +5939,26 @@ def max360_stitch_ffmpeg(info: max360_VideoInfo, frames: Sequence[int],
             width=width, height=height, quality=quality,
             image_format=image_format, interp=interp, threads=threads,
             keep_filter=keep_filter, total_batches=len(chunks),
-            seek_time=None, levels=levels, workers=inner_workers, yaw=yaw)
+            seek_time=None, levels=levels, workers=inner_workers, yaw=yaw,
+            rotation=rotation)
+
+    def do_batch(item: Tuple[int, List[int]]) -> None:
+        batch_index, chunk = item
+        rotation = rotations[batch_index]
+        if rotation is None:
+            run_batch(batch_index, chunk, None)
+            return
+        try:
+            run_batch(batch_index, chunk, rotation)
+        except max360_BackendError as exc:
+            LOG.warning("single-pass leveling failed for frames %d-%d (%s); "
+                        "falling back to one rotation pass per frame",
+                        chunk[0], chunk[-1], exc)
+            # Distinct batch numbers keep the temporary file names apart.
+            for sub, start in enumerate(range(0, len(chunk),
+                                              MAX360_LEVEL_CHUNK_SIZE)):
+                run_batch(1000 * (batch_index + 1) + sub,
+                          chunk[start:start + MAX360_LEVEL_CHUNK_SIZE], None)
 
     try:
         items = list(enumerate(chunks))
@@ -5745,7 +6235,8 @@ def max360__metadata_for(record, info: max360_VideoInfo, args) -> FrameMetadata:
         pdop=record.get("pdop"),
         position_source=record.get("position_source"),
         clamped=record.get("clamped"), estimated=record.get("estimated"),
-        image_width=args.width, image_height=args.height, panorama=True,
+        image_width=info.out_width, image_height=info.out_height,
+        panorama=True,
         pose_heading=record.get("heading_deg"),
         pose_pitch=0.0, pose_roll=0.0,
         exposure_time=record.get("exposure_time_s"), iso=record.get("iso"),
@@ -5825,10 +6316,12 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     LOG.info("--- %s -> %s", name, sequence)
     log_heading_offset(args)
     info = max360_probe(path)
-    LOG.info("  video: %dx%d %.4f fps, %d frame(s), %.2f s%s",
-             info.width, info.height, info.fps, info.frame_count,
+    info.out_width, info.out_height = max360_output_size(info, args)
+    LOG.info("  video: %s, %dx%d %.4f fps, %d frame(s), %.2f s%s -> %dx%d",
+             info.model, info.width, info.height, info.fps, info.frame_count,
              info.duration, " (already equirectangular)"
-             if info.already_equirect else " (EAC hemispheres)")
+             if info.already_equirect else " (EAC hemispheres)",
+             info.out_width, info.out_height)
 
     ordinal = info.video_ordinals.get(info.hemi_a, 0)
     timeline = probe_frame_timeline(
@@ -5852,11 +6345,13 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
             return result
         LOG.warning("  %s", exc)
 
+    # The MAX2 writes real UTC into creation_time and its own timezone into
+    # TZON; the clock-skew estimate is only meaningful for the MAX, which
+    # writes its local wall clock there.
     detected_offset = gpmf.camera_utc_offset if gpmf else None
-    tz_offset, tz_known = resolve_timezone(
-        args, detected_offset, camera=CAMERA_MAX, logger=LOG)
-    if tz_known:
-        LOG.info("  camera-local time offset: %s", offset_string(tz_offset))
+    tz_offset, tz_known = resolve_gopro_timezone(
+        args, info.tz_offset_s, detected_offset,
+        "container clock vs GPS", track, camera=CAMERA_MAX, logger=LOG)
 
     if track is None:
         if args.fallback_interval <= 0:
@@ -5892,9 +6387,15 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     level_on = bool(getattr(args, "level_horizon", False))
     if level_on:
         window_s = float(getattr(args, "level_window", LEVEL_WINDOW_DEFAULT))
+        gradient_mount = None
+        if getattr(args, "horizon_gradient", False) and track is not None:
+            # The camera's own frame: the mount angle is the heading offset,
+            # whether it is re-centred afterwards or not.
+            gradient_mount = (getattr(args, "recenter_deg", 0.0)
+                              or getattr(args, "heading_offset", 0.0) or 0.0)
         angles, leveled = _image_angles(
             records, gpmf.imu if gpmf else None, window_s=window_s,
-            track=track if LEVEL_ACCEL_WEIGHTING else None)
+            track=track, gradient_mount_deg=gradient_mount)
         for record in records:
             angle = angles.get(record["frame_index"])
             if angle is not None:
@@ -5904,10 +6405,13 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                 record["level_roll_deg"], record["level_pitch_deg"] = level
                 record["level_window_s"] = window_s
         LOG.info("  horizon: leveling %d/%d image(s) (%s, at most %.1f deg "
-                 "change between images)", len(leveled), len(records),
+                 "change between images%s)", len(leveled), len(records),
                  "Gaussian average over a %g s real-time window" % window_s
                  if window_s > 0 else "nearest sample, no smoothing",
-                 LEVEL_MAX_STEP_DEG)
+                 LEVEL_MAX_STEP_DEG,
+                 "; road gradient from GPS altitude followed (mount %03d)"
+                 % int(round(gradient_mount)) if gradient_mount is not None
+                 else "")
     first_time = records[0]["naming_time"]
     sequence_dir = sequence_output_dir(
         args.output, CAMERA_MAX, sequence, first_time,
@@ -5959,14 +6463,15 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
         keep_filter = (os.path.join(sequence_dir, sequence + ".filter")
                        if args.keep_filter else None)
         if backend == "max2sphere":
-            max360_stitch_max2sphere(info, frames, outputs, width=args.width,
-                              height=args.height, quality=args.quality,
+            max360_stitch_max2sphere(info, frames, outputs,
+                              width=info.out_width,
+                              height=info.out_height, quality=args.quality,
                               image_format=args.format, interp=args.interp,
                               threads=args.threads, levels=levels,
                               workers=args.workers, yaw=yaw)
         else:
-            max360_stitch_ffmpeg(info, frames, outputs, width=args.width,
-                          height=args.height, quality=args.quality,
+            max360_stitch_ffmpeg(info, frames, outputs, width=info.out_width,
+                          height=info.out_height, quality=args.quality,
                           image_format=args.format, interp=args.interp,
                           threads=args.threads, keep_filter=keep_filter,
                           timeline=timeline, levels=levels,
@@ -7232,6 +7737,7 @@ class hero_VideoInfo:
     device_name: Optional[str] = None
     firmware: Optional[str] = None
     serial: Optional[str] = None
+    tz_offset_s: Optional[int] = None   # camera TZON (HERO11 and later)
 
 
 hero__parse_rate = _parse_rate
@@ -7255,12 +7761,15 @@ def hero_probe(path: str) -> hero_VideoInfo:
         frame_count = 0
     if frame_count <= 0:
         frame_count = max(1, int(round(duration * fps))) if duration else 1
+    settings = read_gopro_settings(path)
     return hero_VideoInfo(
         path=path, duration=duration, fps=fps, frame_count=frame_count,
         gpmd=meta.gpmd_index, width=width, height=height,
         creation_time=parse_utc_timestamp(meta.creation_time),
-        firmware=meta.format_tags.get("firmware"),
-        serial=meta.format_tags.get("serial_number") or meta.format_tags.get("serial"),
+        firmware=meta.format_tags.get("firmware") or settings.firmware,
+        serial=(meta.format_tags.get("serial_number")
+                or meta.format_tags.get("serial") or settings.serial),
+        tz_offset_s=settings.tz_offset_s,
     )
 
 
@@ -7435,8 +7944,9 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
         result["failed"] = True
         return result
 
-    tz_offset, tz_known = resolve_timezone(
-        args, None, camera=CAMERA_HERO, logger=LOG)
+    tz_offset, tz_known = resolve_gopro_timezone(
+        args, info.tz_offset_s, None, "", track, camera=CAMERA_HERO,
+        logger=LOG)
 
     if track is None:
         if args.fallback_interval <= 0:
@@ -7591,10 +8101,12 @@ def build_parser() -> argparse.ArgumentParser:
                            "--fallback-interval SECONDS")
 
     geometry = parser.add_argument_group("GoPro MAX 360 output geometry")
-    geometry.add_argument("--width", type=int, default=max360_DEFAULT_WIDTH,
-                          help="MAX output image width (2:1 with --height)")
-    geometry.add_argument("--height", type=int, default=max360_DEFAULT_HEIGHT,
-                          help="MAX output image height")
+    geometry.add_argument("--width", type=int, default=None,
+                          help="360 output image width (default: the "
+                               "camera's native size, 5376 for the MAX, "
+                               "7680 for the MAX2; 2:1 with --height)")
+    geometry.add_argument("--height", type=int, default=None,
+                          help="360 output image height (default: width / 2)")
     geometry.add_argument("--interp", default="cubic",
                           choices=["cubic", "linear", "nearest", "lanczos"],
                           help="MAX v360 reprojection interpolation")
@@ -7643,10 +8155,11 @@ def validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         parser.error("--gpmf-stream must not be negative")
     if args.allow_missing_gps and args.fallback_interval <= 0:
         parser.error("--allow-missing-gps requires --fallback-interval SECONDS")
-    if args.width < 2 or args.height < 2:
-        parser.error("--width/--height must be at least 2")
-    if args.width % 2 or args.height % 2:
-        parser.error("--width/--height must be even for yuv output")
+    for value in (args.width, args.height):
+        if value is not None and value < 2:
+            parser.error("--width/--height must be at least 2")
+        if value is not None and value % 2:
+            parser.error("--width/--height must be even for yuv output")
     if args.heading_window < 1:
         parser.error("--heading-window must be at least 1")
     for path in args.fit:
