@@ -1,6 +1,8 @@
 # video2images (`v2i.py`)
 
-`v2i.py` turns action-camera footage into a distance-spaced, geotagged still-image sequence. It is a single-file, standard-library-only CLI that reads the camera's own telemetry, selects one unique frame per distance target, optionally levels 360 photospheres from the IMU (by rotating the pixels or by writing the XMP-GPano pose), and writes EXIF/XMP metadata plus GPX and GeoJSON tracks and detailed GeoJSON telemetry.
+> **AI-generated code.** `v2i.py` and this README were written largely by AI coding assistants, under the direction of the project owner, who specified the behaviour and tested it on their own recordings. The code has not been independently reviewed line by line. Check the output (positions, timestamps, headings, EXIF) before publishing images, and report problems with a sample file when possible.
+
+`v2i.py` turns action-camera footage into a distance-spaced, geotagged still-image sequence. It is a single-file, standard-library-only CLI that reads the camera's own telemetry, selects one unique frame per distance target, optionally levels 360 photospheres from the IMU by rotating the pixels, and writes EXIF/XMP metadata plus GPX and GeoJSON tracks and detailed GeoJSON telemetry.
 
 No separate per-camera modules, no database, no service dependencies. `ffmpeg`, `ffprobe` and `exiftool` are external tools; `max2sphere` is optional.
 
@@ -37,7 +39,7 @@ No separate per-camera modules, no database, no service dependencies. `ffmpeg`, 
 7. **Selects unique frames** at fixed distance intervals, never reusing a frame and never going backwards.
 8. **Extracts stills** with accurate input seek, or stitches MAX/MAX2 hemispheres to equirectangular in bounded batches.
 9. **Optionally levels** 360 photospheres using smoothed IMU roll/pitch from the camera — either by rotating the sphere pixels or by writing the pose into XMP-GPano tags. Classic flat videos are never rotated.
-10. **Writes metadata** (EXIF/XMP, GPS, camera firmware in `Software`, exporter version in `XMP:CreatorTool`, GPano pose) with `exiftool`.
+10. **Writes metadata** (EXIF/XMP, GPS, camera firmware in `Software`, exporter version in `XMP:CreatorTool`, GPano panorama tags) with `exiftool`.
 11. **Exports tracks and telemetry** as GPX plus three GeoJSON files per sequence (track, raw telemetry points, per-image snapshots).
 12. **Optionally writes a run manifest** covering every exported image and video summary.
 
@@ -104,11 +106,11 @@ plan_shots() ──► select_unique_frames()
 FrameChoice[]  ── frame index, PTS, interpolated point, distance, error
       │
       ├── flat cameras: extract_frames_by_index()  (one accurate seek per frame, never rotated)
-      └── MAX 360: max360_stitch_ffmpeg() / max360_stitch_max2sphere()
-                   │ --level-horizon (smoothed IMU roll/pitch), re-centring yaw
-                   ├── no:     pixels and GPano pose untouched (default)
-                   ├── rotate: v360 sphere rotation, GPano pose = 0
-                   └── exif:   pixels untouched, GPano pose = roll/pitch
+      └── Max / Max2: max360_stitch_ffmpeg() / max360_stitch_max2sphere()
+                   │ re-centring yaw (heading offset)
+                   ├── default:         source tilt kept as recorded
+                   └── --level-horizon: v360 sphere rotation by the smoothed
+                                        IMU roll/pitch (same pass)
       ▼
 JPEG/PNG files
       │
@@ -162,7 +164,7 @@ run manifest JSON
 | Class | Camera | Container / media | Video | Telemetry carrier | IMU | 360 | Leveling |
 |---|---|---|---|---|---|---|---|
 | `garmin-virb-ultra-30` | Garmin VIRB Ultra 30 | MP4/MOV, H.264 | Flat 4K/1080 | Sibling `.FIT` in `GMetrix/` or matched by name/time | `ACCL`, `GYRO`, `MAGN` in FIT | No | None (`--level-horizon` ignored) |
-| `gopro-max` | GoPro Max | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation **or** XMP-GPano pose |
+| `gopro-max` | GoPro Max | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation |
 | `gopro-max2` | GoPro Max2 | `.360`, H.265 | Dual EAC hemispheres (5888×1920) | Embedded GPMF `gpmd` (`GPS9`) | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI`, `MNOR` | Yes | Sphere rotation |
 | `blackvue-dr900` | BlackVue DR900 series | MP4, H.264 | Flat dashcam | NMEA sentences in top-level `free` atoms | None | No | None |
 | `gopro-hero` | GoPro HERO (flat) | MP4/MOV, H.264/H.265 | Single flat stream | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | No | None (`--level-horizon` ignored) |
@@ -1212,9 +1214,11 @@ Speed conversion: knots × `0.514444` = m/s.
 
 | Version | Highlight |
 |---|---|
-| `0.0.4` | GoPro Max2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, EXIF model `GoPro Max2`, title case like the MAX's own `GoPro Max`); GoPro Max and GoPro Max2 are separate cameras (ids `gopro-max`/`gopro-max2`, output folders `-max`/`-max2`; the old `gopro-max-360` id and `-max360` folder suffix are gone); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
+| `0.0.4` | Notice added that the code is AI-generated. GoPro Max2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, EXIF model `GoPro Max2`, title case like the MAX's own `GoPro Max`); GoPro Max and GoPro Max2 are separate cameras (ids `gopro-max`/`gopro-max2`, output folders `-max`/`-max2`; the old `gopro-max-360` id and `-max360` folder suffix are gone); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
 | `0.0.3` | Unified single-file pipelines, per-camera telemetry, timezone detection, universal unpositioned fallback. Horizon leveling restricted to 360 (MAX) videos via `--level-horizon {no,rotate,exif}`; telemetry exports switched from `*.json` to RFC 7946 `*.geojson`; exporter version written to EXIF `Software` |
 | Earlier | Per-camera scripts and modules, merged into `v2i.py` |
+
+All versions were produced with AI assistance; see the notice at the top of this README.
 
 ---
 

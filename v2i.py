@@ -17,6 +17,11 @@ and Panoramax.  Unrecognised files are skipped with a logged reason.
 
 Only the Python standard library is used.  ``ffmpeg``, ``ffprobe`` and
 ``exiftool`` must be available on ``PATH``; ``max2sphere`` is optional.
+
+Notice: this code was written largely by AI coding assistants under the
+direction of the project owner, and tested on the owner's recordings.  It has
+not been independently reviewed line by line; check the output (positions,
+timestamps, headings, EXIF) before publishing images.
 """
 
 from __future__ import annotations
