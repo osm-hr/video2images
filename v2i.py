@@ -8,6 +8,7 @@ stills and write metadata lives in this single file.  Supported cameras:
     * Garmin VIRB Ultra 30   (MP4 + sibling FIT telemetry)
     * GoPro Max, GoPro Max2  (``.360`` EAC hemispheres -> equirectangular)
     * Kandao QooCam 3 Ultra  (raw dual fisheye + ``.kvar`` sidecar -> equirect.)
+    * DJI Osmo Pocket 3      (flat MP4; positions from an external GPX track)
     * BlackVue DR900         (MP4 with embedded NMEA)
     * GoPro HERO             (flat MP4 with GPMF telemetry)
 
@@ -63,10 +64,10 @@ class Fatal(Exception):
 # Shared helpers: CLI, detection, timelines, extraction and tracks
 # =========================================================================
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 # Written to EXIF ``Software``, ``XMP:CreatorTool`` and the GPano
-# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.5``.
+# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.6``.
 SOFTWARE_TAG = "%s v%s" % (SCRIPT_NAME, __version__)
 
 # Values ``--level-horizon`` accepted before it became an on/off switch; they
@@ -83,6 +84,7 @@ CAMERA_VIRB = "garmin-virb-ultra-30"
 CAMERA_MAX = "gopro-max"
 CAMERA_MAX2 = "gopro-max2"
 CAMERA_QOOCAM = "kandao-qoocam3ultra"
+CAMERA_OSMO = "dji-osmopocket3"
 CAMERA_BLACKVUE = "blackvue-dr900"
 CAMERA_HERO = "gopro-hero"
 
@@ -91,6 +93,7 @@ CAMERA_LABELS = {
     CAMERA_MAX: "GoPro Max",
     CAMERA_MAX2: "GoPro Max2",
     CAMERA_QOOCAM: "Kandao QooCam 3 Ultra",
+    CAMERA_OSMO: "DJI Osmo Pocket 3",
     CAMERA_BLACKVUE: "BlackVue DR900",
     CAMERA_HERO: "GoPro HERO",
 }
@@ -101,6 +104,7 @@ CAMERA_SUFFIX = {
     CAMERA_MAX: "max",
     CAMERA_MAX2: "max2",
     CAMERA_QOOCAM: "qoocam3ultra",
+    CAMERA_OSMO: "osmopocket3",
     CAMERA_BLACKVUE: "blackvue",
     CAMERA_HERO: "hero",
 }
@@ -498,7 +502,7 @@ def _detect_camera_family(path: str, *, ffprobe: str = FFPROBE) -> Detection:
 
     evidence: Dict[str, List[str]] = {
         CAMERA_VIRB: [], CAMERA_MAX: [], CAMERA_MAX2: [], CAMERA_BLACKVUE: [],
-        CAMERA_HERO: [], CAMERA_QOOCAM: [],
+        CAMERA_HERO: [], CAMERA_QOOCAM: [], CAMERA_OSMO: [],
     }
     handlers = meta.handler_text
     if "garmin" in handlers:
@@ -532,6 +536,15 @@ def _detect_camera_family(path: str, *, ffprobe: str = FFPROBE) -> Detection:
         evidence[CAMERA_HERO].append("GoPro HERO file name (%s)" % name)
     if _RE_BLACKVUE_NAME.match(name):
         evidence[CAMERA_BLACKVUE].append("BlackVue file name (%s)" % name)
+
+    # DJI Osmo Pocket 3: DJI_..._D file name, encoder tag, "DJI meta" track.
+    if _RE_OSMO_NAME.match(name):
+        evidence[CAMERA_OSMO].append("DJI file name (%s)" % name)
+    encoder = str(meta.format_tags.get("encoder", ""))
+    if "osmopocket3" in encoder.lower().replace(" ", ""):
+        evidence[CAMERA_OSMO].append("encoder %r" % encoder)
+    if "dji meta" in handlers and evidence[CAMERA_OSMO]:
+        evidence[CAMERA_OSMO].append("DJI meta track")
 
     # Kandao QooCam: Q360_ file name and the camera's kfix product record.
     if _RE_QOOCAM_NAME.match(name):
@@ -899,6 +912,20 @@ def add_track_export_arguments(parser: argparse.ArgumentParser) -> None:
                         help="if a video has no usable GPS position, sample every "
                              "N seconds instead of skipping it, for any camera "
                              "(default 0 = skip)")
+    parser.add_argument("--gpx", action="append", default=None,
+                        metavar="FILE",
+                        help="external GPS track for videos without their own "
+                             "GPS (repeatable); default: every *.gpx under the "
+                             "input folder")
+    parser.add_argument("--gpx-time-offset", type=float, default=0.0,
+                        metavar="SECONDS",
+                        help="seconds added to the camera clock before matching "
+                             "an external GPX (camera clock behind the GPS "
+                             "logger -> positive)")
+    parser.add_argument("--gpx-max-gap", type=float,
+                        default=GPX_MAX_GAP_DEFAULT, metavar="SECONDS",
+                        help="external GPX points further apart than this are "
+                             "not bridged (default %(default)g)")
 
 
 def resolve_extensions(args: argparse.Namespace) -> Tuple[str, ...]:
@@ -1206,7 +1233,7 @@ def resolve_timezone(args: argparse.Namespace, detected: Optional[int], *,
         return 0, True
     if detected is not None:
         return detected, True
-    if camera in CAMERA_SPHERICAL + (CAMERA_HERO,):
+    if camera in CAMERA_SPHERICAL + (CAMERA_HERO, CAMERA_OSMO):
         logger.warning("no camera-local timezone in this video; using UTC for "
                        "file names and EXIF (pass --timezone to override)")
     return 0, False
@@ -6449,6 +6476,24 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
     # TZON; the clock-skew estimate is only meaningful for the MAX, which
     # writes its local wall clock there.
     detected_offset = gpmf.camera_utc_offset if gpmf else None
+    if track is None and external_gpx_files(args):
+        # The MAX2's creation_time is UTC; the MAX writes its local wall
+        # clock there, so it needs --timezone to be matched to UTC points.
+        start = None
+        explicit = parse_timezone(getattr(args, "timezone", None))
+        if info.tz_offset_s is not None:
+            start = info.creation_time
+        elif explicit is not None and info.creation_time is not None:
+            start = info.creation_time - dt.timedelta(seconds=explicit)
+        if start is None:
+            LOG.info("  external GPX: the GoPro Max file clock is local time; "
+                     "pass --timezone to match a GPX track")
+        else:
+            track, reason = external_gpx_track(
+                args, start, info.duration,
+                time_scale=gpmf.time_scale if gpmf else 1.0)
+            if track is None:
+                LOG.info("  external GPX: %s", reason)
     tz_offset, tz_known = resolve_gopro_timezone(
         args, info.tz_offset_s, detected_offset,
         "container clock vs GPS", track, camera=info.camera, logger=LOG)
@@ -6484,6 +6529,7 @@ def max360_process_video(path: str, sequence: str, args) -> dict:
                    time_scale=gpmf.time_scale if gpmf else 1.0)
                for c in choices]
     attach_exposure(records, gpmf.exposure if gpmf else None)
+    mark_external_gpx(records, track)
     level_on = bool(getattr(args, "level_horizon", False))
     if level_on:
         window_s = float(getattr(args, "level_window", LEVEL_WINDOW_DEFAULT))
@@ -8785,6 +8831,17 @@ def qoocam_process_video(path: str, sequence: str, args) -> dict:
                         "using local time")
 
     track = qoocam_build_track(info, tel, args, utc_offset) if tel.gps else None
+    if track is None and external_gpx_files(args):
+        if utc_offset is None or not info.frame_clock_us:
+            LOG.info("  external GPX: the QooCam records local time only; "
+                     "pass --timezone to match a GPX track")
+        else:
+            start = qoocam_utc(qoocam_local_time(
+                info, info.frame_clock_us[0] / 1e6), utc_offset)
+            track, reason = external_gpx_track(
+                args, start, info.duration, time_scale=tel.time_scale or 1.0)
+            if track is None:
+                LOG.info("  external GPX: %s", reason)
     if track is not None:
         LOG.info("  telemetry: %d GPS fix(es), %.1f m of travel; heading: %s",
                  len(track.samples), track.length, tel.gyro_note
@@ -8814,6 +8871,7 @@ def qoocam_process_video(path: str, sequence: str, args) -> dict:
 
     records = [qoocam__record(c, track, args, info, tel, utc_offset,
                               sequence, name) for c in choices]
+    mark_external_gpx(records, track)
     yaw = recenter_yaw(getattr(args, "recenter_deg", 0.0))
     levels = None
     if getattr(args, "level_horizon", False):
@@ -8888,6 +8946,537 @@ def qoocam_process_video(path: str, sequence: str, args) -> dict:
         extra={"distance_interval_m": args.distance,
                "time_base": args.time_base,
                "timezone_known": utc_offset is not None})
+    result["entries"] = [{k: v for k, v in r.items()
+                          if k not in ("point", "naming_time")}
+                         for r in written]
+    return result
+
+
+# =========================================================================
+# External GPX tracks (cameras without their own GPS)
+# =========================================================================
+#
+# A separate GPS logger (handheld Garmin, phone app, ...) can position videos
+# from cameras that record no GPS: the DJI Osmo Pocket 3, a HERO without a
+# fix, or a GoPro/QooCam whose own GPS is empty.  GPX files are found under
+# the input folder automatically and can be named with --gpx; with --gpx only
+# the named files are used.  A camera's own GPS always wins.
+
+GPX_MAX_GAP_DEFAULT = 20.0      # s; longer gaps between points are not bridged
+GPX_IGNORED_CREATORS = ("video2images", "qoocam studio")
+
+
+@dataclass
+class GpxTrack:
+    path: str
+    creator: str
+    points: List[dict]           # {"utc", "lat", "lon", "alt", "hdop"}
+
+
+_GPX_CACHE: Dict[str, Optional[GpxTrack]] = {}
+_GPX_DISCOVERED: Dict[Tuple[str, ...], List[str]] = {}
+
+
+def _gpx_time(text: str) -> Tuple[Optional[dt.datetime], bool]:
+    """Parse a GPX ``<time>``; returns ``(utc, had_zone)``."""
+    text = (text or "").strip()
+    if not text:
+        return None, False
+    try:
+        value = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None, False
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc), False
+    return value.astimezone(dt.timezone.utc), True
+
+
+def read_gpx(path: str) -> Optional[GpxTrack]:
+    """All timed track points of a GPX file (cached), or ``None``."""
+    if path in _GPX_CACHE:
+        return _GPX_CACHE[path]
+    import xml.etree.ElementTree as ET
+    track = None
+    try:
+        root = ET.parse(path).getroot()
+        creator = root.get("creator") or ""
+        points = []
+        naive = 0
+        for elem in root.iter():
+            tag = elem.tag.rsplit("}", 1)[-1]
+            if tag not in ("trkpt", "rtept"):
+                continue
+            try:
+                lat = float(elem.get("lat"))
+                lon = float(elem.get("lon"))
+            except (TypeError, ValueError):
+                continue
+            item = {"lat": lat, "lon": lon, "alt": None, "hdop": None,
+                    "utc": None}
+            for child in elem:
+                ctag = child.tag.rsplit("}", 1)[-1]
+                if ctag == "time":
+                    item["utc"], zoned = _gpx_time(child.text)
+                    naive += 0 if zoned or item["utc"] is None else 1
+                elif ctag == "ele":
+                    try:
+                        item["alt"] = float(child.text)
+                    except (TypeError, ValueError):
+                        pass
+                elif ctag == "hdop":
+                    try:
+                        item["hdop"] = float(child.text)
+                    except (TypeError, ValueError):
+                        pass
+            if item["utc"] is not None:
+                points.append(item)
+        points.sort(key=lambda p: p["utc"])
+        if naive:
+            LOG.warning("GPX %s: %d point time(s) without a timezone, read "
+                        "as UTC", os.path.basename(path), naive)
+        track = GpxTrack(path, creator, points) if points else None
+    except (OSError, ET.ParseError) as exc:
+        LOG.warning("GPX %s unreadable: %s", os.path.basename(path), exc)
+    _GPX_CACHE[path] = track
+    return track
+
+
+def external_gpx_files(args) -> List[str]:
+    """``--gpx`` files, else every ``*.gpx`` under the input folder."""
+    explicit = [os.path.abspath(p) for p in (getattr(args, "gpx", None) or [])]
+    if explicit:
+        return explicit
+    root = getattr(args, "input", None)
+    if not root:
+        return []
+    root = os.path.abspath(root if os.path.isdir(root)
+                           else os.path.dirname(root) or ".")
+    output = os.path.abspath(getattr(args, "output", "") or "")
+    key = (root, output)
+    if key not in _GPX_DISCOVERED:
+        found = []
+        for folder, dirs, files in os.walk(root):
+            if output and os.path.abspath(folder).startswith(output):
+                dirs[:] = []
+                continue
+            dirs.sort()
+            for entry in sorted(files):
+                if entry.lower().endswith(".gpx"):
+                    found.append(os.path.join(folder, entry))
+        _GPX_DISCOVERED[key] = found
+    return _GPX_DISCOVERED[key]
+
+
+def external_gpx_track(args, start_utc: Optional[dt.datetime],
+                       duration_s: float, *, time_scale: float = 1.0,
+                       label: str = "") -> Tuple[Optional[Track], str]:
+    """Track for a video from an external GPX, or ``(None, reason)``.
+
+    *start_utc* is the UTC time of video time 0 on the camera clock;
+    ``--gpx-time-offset`` is added to it.  The GPX is split where points are
+    more than ``--gpx-max-gap`` seconds apart, and the contiguous run that
+    covers most of the video is used; frames outside it get no position.
+    """
+    if start_utc is None:
+        return None, "no UTC start time for the video"
+    files = external_gpx_files(args)
+    if not files:
+        return None, "no GPX file found"
+    offset = float(getattr(args, "gpx_time_offset", 0.0) or 0.0)
+    max_gap = float(getattr(args, "gpx_max_gap", GPX_MAX_GAP_DEFAULT)
+                    or GPX_MAX_GAP_DEFAULT)
+    scale = time_scale or 1.0
+    t0 = start_utc + dt.timedelta(seconds=offset)
+    t1 = t0 + dt.timedelta(seconds=max(duration_s, 0.0) / scale)
+    best = None
+    for path in files:
+        gpx = read_gpx(path)
+        if gpx is None:
+            continue
+        if any(name in gpx.creator.lower() for name in GPX_IGNORED_CREATORS):
+            LOG.debug("  GPX %s ignored (creator %r)", path, gpx.creator)
+            continue
+        run: List[dict] = []
+        runs = []
+        for point in gpx.points:
+            if run and (point["utc"] - run[-1]["utc"]).total_seconds() > max_gap:
+                runs.append(run)
+                run = []
+            run.append(point)
+        if run:
+            runs.append(run)
+        for run in runs:
+            lo = max(run[0]["utc"], t0)
+            hi = min(run[-1]["utc"], t1)
+            cover = (hi - lo).total_seconds()
+            if len(run) >= 2 and cover > 0 and (best is None or cover > best[0]):
+                best = (cover, gpx, run)
+    if best is None:
+        return None, "no GPX track covers %s-%s UTC" % (
+            t0.strftime("%H:%M:%S"), t1.strftime("%H:%M:%S"))
+    cover, gpx, run = best
+    # Keep only the points inside the video's span plus one on each side, so
+    # distance targets are not planned along track the video never saw.
+    first = max(0, bisect.bisect_left([p["utc"] for p in run], t0) - 1)
+    last = min(len(run), bisect.bisect_right([p["utc"] for p in run], t1) + 1)
+    run = run[first:last]
+    samples = []
+    for i, point in enumerate(run):
+        a, b = run[max(0, i - 1)], run[min(len(run) - 1, i + 1)]
+        span = (b["utc"] - a["utc"]).total_seconds()
+        speed = (haversine(a["lat"], a["lon"], b["lat"], b["lon"]) / span
+                 if span > 0 else None)
+        utc = point["utc"] - dt.timedelta(seconds=offset)
+        # Sparse logger points (often 5-15 s apart): the course is the
+        # bearing between the neighbouring points, not the Track's short
+        # 10 s window, which would find at most one course.
+        moved = haversine(a["lat"], a["lon"], b["lat"], b["lon"])
+        course = (initial_bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"])
+                  if moved >= COURSE_BASELINE_M else None)
+        item = {"t": (utc - start_utc).total_seconds() * scale,
+                "utc": utc, "lat": point["lat"], "lon": point["lon"],
+                "alt": point["alt"], "hdop": point["hdop"], "speed": speed,
+                "course": course}
+        apply_accuracy(item, args.uere)
+        samples.append(item)
+    samples, _n_dop, n_jump = reject_bad_gps(samples, 0)
+    log_rejected_gps(0, n_jump, 0)
+    if len(samples) < 2:
+        return None, "too few usable GPX points"
+    track = Track(samples, args.distance_mode)
+    total = (t1 - t0).total_seconds()
+    LOG.info("  external GPX: %s (%s), %d point(s), covers %.0f%% of the "
+             "video%s, %.1f m of travel", os.path.basename(gpx.path),
+             gpx.creator or "unknown creator", len(samples),
+             100.0 * cover / total if total > 0 else 100.0,
+             ", time offset %+.1f s" % offset if offset else "", track.length)
+    track.external_gpx = gpx.path            # type: ignore[attr-defined]
+    return track, ""
+
+
+def mark_external_gpx(records: Sequence[dict], track) -> None:
+    """Label positions that came from an external GPX."""
+    if track is None or not getattr(track, "external_gpx", None):
+        return
+    for record in records:
+        if not record.get("unpositioned"):
+            record["position_source"] = "external_gpx_%s" % (
+                record.get("position_source") or "interpolated")
+
+
+# =========================================================================
+# DJI Osmo Pocket 3 pipeline
+# =========================================================================
+#
+# Flat 4K, gimbal-stabilised, no GPS of its own (only from a paired phone),
+# so positions come from an external GPX.  The "DJI meta" (djmd) track is a
+# protobuf stream (``dvtm_PP-101.proto``): device info once, then per frame
+# the frame number, a microsecond camera clock, ISO and white balance.
+
+CAMERA_OSMO_PRODUCT = "Osmo Pocket 3"
+_RE_OSMO_NAME = re.compile(r"^DJI_(\d{14})_\d{4}_D\.(mp4|mov)$", re.IGNORECASE)
+
+
+def _pb_varint(buf: bytes, pos: int) -> Tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, pos
+
+
+def pb_fields(buf: bytes) -> Optional[List[Tuple[int, int, object]]]:
+    """Decode one protobuf message level: ``[(field, wire_type, value)]``.
+
+    Length-delimited values stay ``bytes``; returns ``None`` when *buf* is
+    not a valid message (so callers can treat it as a string instead).
+    """
+    out = []
+    pos = 0
+    try:
+        while pos < len(buf):
+            key, pos = _pb_varint(buf, pos)
+            number, wire = key >> 3, key & 7
+            if number == 0:
+                return None
+            if wire == 0:
+                value, pos = _pb_varint(buf, pos)
+            elif wire == 1:
+                value = buf[pos:pos + 8]
+                pos += 8
+            elif wire == 5:
+                value = buf[pos:pos + 4]
+                pos += 4
+            elif wire == 2:
+                size, pos = _pb_varint(buf, pos)
+                value = buf[pos:pos + size]
+                pos += size
+            else:
+                return None
+            if pos > len(buf):
+                return None
+            out.append((number, wire, value))
+    except IndexError:
+        return None
+    return out
+
+
+def _pb_get(fields, number: int, default=None):
+    for n, _w, v in fields or []:
+        if n == number:
+            return v
+    return default
+
+
+@dataclass
+class OsmoInfo:
+    path: str
+    width: int
+    height: int
+    fps: float
+    frame_count: int
+    duration: float
+    creation_time: Optional[dt.datetime]
+    local_start: Optional[dt.datetime]
+    meta_index: Optional[int] = None
+    serial: Optional[str] = None
+    firmware: Optional[str] = None
+    model: str = CAMERA_OSMO_PRODUCT
+    device_name: Optional[str] = None
+    iso: Dict[int, int] = field(default_factory=dict)
+    white_balance: Dict[int, int] = field(default_factory=dict)
+
+
+def osmo_read_meta(info: OsmoInfo) -> None:
+    """Device and per-frame values from the "DJI meta" track (best effort)."""
+    if info.meta_index is None:
+        return
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-v", "error", "-i", info.path, "-map",
+             "0:%d" % info.meta_index, "-c", "copy", "-f", "data", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return
+    # Packets are complete messages; concatenated they read as one message
+    # whose repeated field 3 holds one entry per frame.
+    fields = pb_fields(proc.stdout) if proc.returncode == 0 else None
+    if not fields:
+        LOG.warning("  DJI meta track unreadable; camera details left out")
+        return
+    for number, wire, value in fields:
+        if number == 1 and wire == 2:
+            device = pb_fields(_pb_get(pb_fields(value), 1, b"")) or []
+            serial = _pb_get(device, 5)
+            firmware = _pb_get(device, 6)
+            if isinstance(serial, bytes) and serial:
+                info.serial = serial.decode("ascii", "replace")
+            if isinstance(firmware, bytes) and firmware:
+                info.firmware = firmware.decode("ascii", "replace")
+        elif number == 3 and wire == 2:
+            frame = pb_fields(value) or []
+            head = pb_fields(_pb_get(frame, 1, b"")) or []
+            index = _pb_get(head, 1, 0)
+            body = pb_fields(_pb_get(frame, 2, b"")) or []
+            iso_msg = pb_fields(_pb_get(body, 9, b"")) or []
+            iso = _pb_get(iso_msg, 1)
+            if isinstance(iso, bytes) and len(iso) == 4:
+                value_iso = struct.unpack("<f", iso)[0]
+                if 25 <= value_iso <= 409600:
+                    info.iso[int(index)] = int(round(value_iso))
+            wb = _pb_get(body, 24)
+            if isinstance(wb, int) and 1000 <= wb <= 20000:
+                info.white_balance[int(index)] = wb
+
+
+def osmo_probe(path: str) -> OsmoInfo:
+    meta = probe_metadata(path, FFPROBE)
+    videos = meta.video_streams_info()
+    # The first video stream is the recording; a later MJPEG stream is the
+    # embedded cover image.
+    main = next((s for s in videos if s.get("codec_name") != "mjpeg"), None)
+    if main is None:
+        raise Fatal("no video stream")
+    width = int(main.get("width") or 0)
+    height = int(main.get("height") or 0)
+    fps = _parse_rate(main.get("avg_frame_rate")
+                      or main.get("r_frame_rate")) or 30.0
+    duration = float(main.get("duration") or meta.duration or 0.0)
+    try:
+        frame_count = int(main.get("nb_frames"))
+    except (TypeError, ValueError):
+        frame_count = max(1, int(round(duration * fps)))
+    match = _RE_OSMO_NAME.match(os.path.basename(path))
+    local_start = None
+    if match:
+        try:
+            local_start = dt.datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    meta_index = None
+    for stream in meta.streams:
+        tags = stream.get("tags") or {}
+        if (stream.get("codec_type") == "data"
+                and "dji meta" in str(tags.get("handler_name", "")).lower()):
+            meta_index = int(stream["index"])
+    info = OsmoInfo(path=path, width=width, height=height, fps=fps,
+                    frame_count=frame_count, duration=duration,
+                    creation_time=parse_utc_timestamp(meta.creation_time),
+                    local_start=local_start, meta_index=meta_index)
+    osmo_read_meta(info)
+    return info
+
+
+def osmo__record(choice, args, info: OsmoInfo, tz_offset: int,
+                 tz_known: bool, sequence: str) -> dict:
+    record = hero__record(choice, args, info, tz_offset, tz_known, sequence)
+    record["camera"] = CAMERA_OSMO
+    iso = info.iso.get(int(choice.frame_index))
+    if iso is not None:
+        record["iso"] = iso
+    wb = info.white_balance.get(int(choice.frame_index))
+    if wb is not None:
+        record["white_balance_k"] = wb
+    return record
+
+
+def osmo__metadata_for(record, info: OsmoInfo, args) -> FrameMetadata:
+    meta = hero__metadata_for(record, info, args)
+    meta.camera = CAMERA_LABELS[CAMERA_OSMO]
+    meta.make = "DJI"
+    meta.model = args.device_model or info.model
+    return meta
+
+
+def osmo_process_video(path: str, sequence: str, args) -> dict:
+    name = os.path.basename(path)
+    result = {"video": name, "sequence": sequence, "images": 0,
+              "planned": 0, "failed": False, "entries": [], "dir": None}
+    LOG.info("--- %s -> %s", name, sequence)
+    log_heading_offset(args)
+    try:
+        info = osmo_probe(path)
+    except (Fatal, UnreadableVideo) as exc:
+        LOG.error("  %s", exc)
+        result["failed"] = True
+        return result
+    LOG.info("  video: %s, %dx%d %.4f fps, %d frame(s), %.2f s; serial %s, "
+             "firmware %s", info.model, info.width, info.height, info.fps,
+             info.frame_count, info.duration, info.serial or "?",
+             info.firmware or "?")
+    timeline = probe_frame_timeline(
+        path, stream_ordinal=0, fps_hint=info.fps,
+        frame_count_hint=info.frame_count, duration_hint=info.duration,
+        logger=LOG)
+    if len(timeline) > info.frame_count:
+        timeline = FrameTimeline(timeline.times[:info.frame_count],
+                                 timeline.source, timeline.fps)
+
+    # creation_time is UTC; the file name is the local start time.
+    detected = None
+    if info.creation_time is not None and info.local_start is not None:
+        skew = (info.local_start.replace(tzinfo=dt.timezone.utc)
+                - info.creation_time).total_seconds()
+        detected = timezone_from_clock_skew(skew)
+    tz_offset, tz_known = resolve_timezone(args, detected, camera=CAMERA_OSMO,
+                                           logger=LOG)
+    if tz_known:
+        LOG.info("  camera-local time offset: %s (%s)", offset_string(tz_offset),
+                 "--timezone" if getattr(args, "timezone", None)
+                 else "file name vs UTC creation time")
+
+    track, reason = external_gpx_track(args, info.creation_time, info.duration,
+                                       label=name)
+    if track is None:
+        LOG.warning("  no position: %s", reason)
+        if args.fallback_interval <= 0:
+            LOG.error("  no GPS telemetry (the Osmo Pocket 3 records none; "
+                      "add a GPX track or use --fallback-interval SECONDS)")
+            result["failed"] = True
+            return result
+        choices = unpositioned_choices(timeline, args.fallback_interval,
+                                       info.duration, args.max_images)
+        LOG.warning("  exporting %d unpositioned frame(s) on a %g s time grid",
+                    len(choices), args.fallback_interval)
+    else:
+        choices, skipped = select_unique_frames(
+            track, timeline, args.distance, start_distance=args.start_distance,
+            max_position_error=args.max_position_error,
+            max_images=args.max_images, mode=args.distance_mode, logger=LOG,
+            require_first_frame=False)
+        if skipped:
+            LOG.info("  skipped %d target(s) with no acceptable unused frame",
+                     len(skipped))
+        if not choices:
+            LOG.error("  no capture point could be matched to a unique frame")
+            result["failed"] = True
+            return result
+
+    records = [osmo__record(c, args, info, tz_offset, tz_known, sequence)
+               for c in choices]
+    mark_external_gpx(records, track)
+    if args.level_horizon:
+        LOG.info("  --level-horizon applies to 360 videos only; flat %s "
+                 "frames are exported as recorded", CAMERA_LABELS[CAMERA_OSMO])
+    first_time = records[0]["naming_time"]
+    sequence_dir = sequence_output_dir(
+        args.output, CAMERA_OSMO, sequence, first_time,
+        heading_offset=heading_offset_for_folder(args))
+    used_paths = set()
+    for record in records:
+        record["path"] = unique_path(
+            os.path.join(sequence_dir, record["image"]), used_paths)
+        record["image"] = os.path.basename(record["path"])
+    result["planned"] = len(records)
+    result["dir"] = sequence_dir
+    LOG.info("  %d capture point(s) -> %s", len(records), sequence_dir)
+
+    if args.dry_run:
+        for record in records:
+            LOG.info("    frame=%d pts=%.3fs %s hdg=%s d=%s -> %s",
+                     record["frame_index"], record["pts_seconds"],
+                     (record["datetime_utc"] or "no-utc")[11:23],
+                     record["heading_deg"],
+                     ("unpositioned" if record.get("unpositioned")
+                      else ("%.1fm" % record["distance_m"]
+                            if record.get("distance_m") is not None else "-")),
+                     record["image"])
+        return result
+
+    to_extract = [r for r in records
+                  if args.overwrite or not os.path.exists(r["path"])]
+    skipped_existing = len(records) - len(to_extract)
+    written = []
+    failed_frames = []
+    if to_extract:
+        temp_dir = make_temp_dir("osmo_", [r["path"] for r in to_extract])
+        try:
+            extracted = extract_frames_by_index(
+                path, [r["frame_index"] for r in to_extract], temp_dir,
+                image_format=args.format, quality=args.quality,
+                workers=args.workers, threads=args.threads, stream_ordinal=0,
+                timeline=timeline)
+            written, failed_frames = place_extracted(extracted, to_extract)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    result["images"] = len(written)
+    LOG.info("  wrote %d image(s), skipped %d existing%s", len(written),
+             skipped_existing,
+             (", %d failed" % len(failed_frames)) if failed_frames else "")
+    if written and not args.no_exif:
+        write_metadata([(r["path"], build_exiftool_args(
+            osmo__metadata_for(r, info, args))) for r in written])
+    export_track_files(
+        sequence_dir, sequence, track.samples if track else [], records,
+        track_export=args.track_export, camera=CAMERA_OSMO, video=name,
+        imu=None, video_start_utc=info.creation_time,
+        telemetry_export=args.telemetry_export,
+        extra={"distance_interval_m": args.distance,
+               "time_base": args.time_base,
+               "external_gpx": getattr(track, "external_gpx", None)})
     result["entries"] = [{k: v for k, v in r.items()
                           if k not in ("point", "naming_time")}
                          for r in written]
@@ -9118,6 +9707,12 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
         result["failed"] = True
         return result
 
+    if track is None and info.creation_time is not None:
+        track, reason = external_gpx_track(args, info.creation_time,
+                                           info.duration)
+        if track is None and external_gpx_files(args):
+            LOG.info("  external GPX: %s", reason)
+
     tz_offset, tz_known = resolve_gopro_timezone(
         args, info.tz_offset_s, None, "", track, camera=CAMERA_HERO,
         logger=LOG)
@@ -9149,6 +9744,7 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 
     records = [hero__record(choice, args, info, tz_offset, tz_known, sequence)
                for choice in choices]
+    mark_external_gpx(records, track)
     attach_exposure(records, gpmf.exposure if gpmf else None)
 
     if args.level_horizon:
@@ -9239,7 +9835,7 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 # Command-line interface
 # ===========================================================================
 CAMERA_ORDER = (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_MAX2, CAMERA_QOOCAM,
-                CAMERA_VIRB, CAMERA_HERO)
+                CAMERA_VIRB, CAMERA_HERO, CAMERA_OSMO)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -9247,7 +9843,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=SCRIPT_NAME,
         description="Export geotagged still images from supported action-camera "
                     "videos every N metres of travel. The camera is detected "
-                    "per file (Garmin VIRB Ultra 30, GoPro Max, GoPro Max2, Kandao QooCam 3 Ultra, BlackVue "
+                    "per file (Garmin VIRB Ultra 30, GoPro Max, GoPro Max2, Kandao QooCam 3 Ultra, DJI Osmo Pocket 3, BlackVue "
                     "DR900 or GoPro HERO), so one input tree may mix cameras.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Examples:\n"
@@ -9397,6 +9993,8 @@ def process_group(camera: str, videos: Sequence[str], root: str,
                 summary = max360_process_video(video, sequence, args)
             elif camera == CAMERA_QOOCAM:
                 summary = qoocam_process_video(video, sequence, args)
+            elif camera == CAMERA_OSMO:
+                summary = osmo_process_video(video, sequence, args)
             elif camera == CAMERA_VIRB:
                 summary = virb_process_video(video, sequence, output_dir, fits,
                                              args, telemetry_cache,
