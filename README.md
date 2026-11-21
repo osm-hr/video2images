@@ -6,7 +6,7 @@
 
 No separate per-camera modules, no database, no service dependencies. `ffmpeg`, `ffprobe` and `exiftool` are external tools; `max2sphere` is optional.
 
-**Version:** `0.0.4` · **Python:** 3.9+ · **Validated with:** ffmpeg/ffprobe 5.1.9, exiftool 12.x
+**Version:** `0.0.5` · **Python:** 3.9+ · **Validated with:** ffmpeg/ffprobe 5.1.9, exiftool 12.x
 
 ---
 
@@ -114,7 +114,7 @@ FrameChoice[]  ── frame index, PTS, interpolated point, distance, error
       ▼
 JPEG/PNG files
       │
-      │ exiftool batch  (Software = "v2i.py v0.0.4")
+      │ exiftool batch  (Software = "v2i.py v0.0.5")
       ▼
 EXIF + XMP + GPano tags
       │
@@ -166,6 +166,7 @@ run manifest JSON
 | `garmin-virb-ultra-30` | Garmin VIRB Ultra 30 | MP4/MOV, H.264 | Flat 4K/1080 | Sibling `.FIT` in `GMetrix/` or matched by name/time | `ACCL`, `GYRO`, `MAGN` in FIT | No | None (`--level-horizon` ignored) |
 | `gopro-max` | GoPro Max | `.360` / MP4 / MOV, H.264/H.265 | Dual EAC hemispheres (4096×1344 or 2272×736) | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | Yes | Sphere rotation |
 | `gopro-max2` | GoPro Max2 | `.360`, H.265 | Dual EAC hemispheres (5888×1920) | Embedded GPMF `gpmd` (`GPS9`) | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI`, `MNOR` | Yes | Sphere rotation |
+| `kandao-qoocam3ultra` | Kandao QooCam 3 Ultra | MP4, H.265 10-bit HLG | Dual fisheye, two 3840×3840 circles stacked (3840×7680) | Sibling `.kvar` sidecar | 1 kHz gyro + accelerometer | Yes | Sphere rotation |
 | `blackvue-dr900` | BlackVue DR900 series | MP4, H.264 | Flat dashcam | NMEA sentences in top-level `free` atoms | None | No | None |
 | `gopro-hero` | GoPro HERO (flat) | MP4/MOV, H.264/H.265 | Single flat stream | Embedded GPMF `gpmd` | `ACCL`, `GYRO`, `MAGN`, `GRAV`, `CORI`, `IORI` | No | None (`--level-horizon` ignored) |
 
@@ -208,6 +209,22 @@ The MAX and the MAX2 are **separate cameras**: their own detection label, run-su
 - **No valid GPS fix:** `--fallback-interval SECONDS` exports an unpositioned time grid while retaining the GPMF IMU, camera clock and TimeWarp scale.
 - **Filename convention:** `GS[0-9A-Z]+.(360|mp4|mov)`; device name usually contains `MAX` (`GoPro Max`, `MAX2`).
 
+### 3.3.1 Kandao QooCam 3 Ultra
+
+Only the **raw** recording is exported: `Q360_YYYYMMDD_HHMMSS_NNNNNN.MP4` (both fisheye circles stacked, front lens on top) plus its `.kvar` sidecar with the same base name. A QooCam Studio export (`STITCHED=1` in the camera record, e.g. `…_Output@HHMMSS.MP4`) is skipped with a logged reason; the sidecar, GPX and other files in the folder are not videos and are ignored.
+
+- **Camera records:** Kandao stores its data in `kfix`/`kvar` atoms at the end of the MP4 and in the `.kvar` sidecar, all with one layout: a little-endian count, then entries of `name[32]`, `type[8]`, count and data. `kfix` gives the product (`QooCam 3 Ultra` → EXIF Model, Make `Kandao`), serial (`SN` → EXIF serial), camera firmware (`SW_VER` → `Software`), capture time and `STITCHED`. The sidecar holds `GPS`, `IMU`, `EXP`, `PTS`, `INFO` and the lens calibration `LENS`.
+- **Stitching (standard library + ffmpeg):** `LENS` is the factory calibration of both lenses: focal length, optical centre, four Kannala-Brandt (OpenCV fisheye) distortion coefficients and a rig→lens rotation per lens, stored at a 6944 px calibration width and scaled to the video. v2i computes remap maps from it in plain Python on a 1920×960 grid (≈20 s per video), scales them to the output size with ffmpeg (bilinear; 0.001 px median error against exact maps, < 2 px at the poles), then per image: HLG→SDR tone mapping (`zscale` + `tonemap=hable`), one `remap` per lens and a 6° cross-fade at the seams (`maskedmerge`). The whole sphere gets the fixed rotation of QooCam Studio's own export (`QOOCAM_STUDIO_ROTATION_DEG` = yaw 184.1°, pitch 6.0°, roll −1.3°, fitted on three frames; Studio does not change it per frame), so the output lines up with the vendor's stitch: against Studio's export of the sample the correlation is 0.95 and the median offset 1 px at 1920 px width, and both seams are continuous on distant objects. Near objects (the car roof) can still show small parallax steps that Studio's optical flow hides. ffmpeg 5.1's `remap` is nearest-neighbour only; at the native size this was not visible next to Studio's output.
+- **Output:** 7680×3840 by default (`--width`/`--height` override). About 6–8 s per image on the test machine plus the map computation once per video; `--workers N` stitches N images in parallel (each ffmpeg needs a few GB of memory).
+- **Time:** the camera records only its **local** wall clock (`VIDEO_CAPTIME`, else the file name) and no timezone. It belongs to the first frame; each frame's time is that plus its own camera-clock time from the `PTS` list (milliseconds within the video, the absolute time is to the second). Image names and `DateTimeOriginal` are always local. `--timezone +HH:MM` additionally writes `OffsetTime*`, the GPS date/time in UTC and UTC in the exports; without it a warning says they are left out (the GPX then has no `<time>`). `--time-base utc` needs `--timezone` here.
+- **Timelapse:** frame times come from the camera clock, so the 0.5 s timelapse maps exactly (logged like the GoPro time-lapse, e.g. `15.0x speed-up`).
+- **GPS:** ~1 Hz, latitude/longitude/altitude only (no UTC, speed, course, DOP or fix type). Repeated fixes are dropped and the jump/speed check applies; speed comes from the positions.
+- **Heading (GPS + gyro):** the 1 kHz gyro turn rate about the measured down axis is integrated and its sign checked against the GPS course changes (logged correlation; below 0.5 the plain GPS course is used). The heading is the gyro yaw plus a Gaussian-smoothed (σ 8 s) offset to the GPS course, so turns between 1 Hz fixes and slow driving keep a stable heading while the GPS removes the gyro drift. `UserComment` says `heading_source=gps_course+gyro`.
+- **Leveling (`--level-horizon`):** the accelerometer is low-passed (1 s), turned into the output frame (Studio rotation, then the re-centring yaw) and averaged like the MAX (Gaussian over `--level-window`, step cap 0.5°); the sphere is then rotated with the same v360 pass as the MAX fallback. On the sample the corrected horizon and verticals were straight, which confirms that the IMU axes match the lens rig.
+- **Exposure:** `EXP` per sensor frame, read as microseconds (10000 → 1/100 s) into `ExposureTime`. No reliable ISO was found, so ISO is not written.
+- **First frame:** on the sample the first frame of the recording has a visibly brighter top lens (auto exposure settling); Studio's export shows the same.
+- **Re-centring / heading offset:** as for the MAX (§6.4); the folder offset rotates the sphere so travel is the image centre.
+
 ### 3.4 BlackVue DR900 series
 
 - **Format requirements:** MP4 with a single H.264 video stream. NMEA sentences are embedded in top-level `free` atoms; the `cprt` atom supplies make, model, firmware and serial.
@@ -236,6 +253,7 @@ Detection never guesses. Accepted evidence includes:
 |---|---|
 | VIRB | Garmin container handler; `VIRB*` filename; Garmin container markers |
 | MAX / MAX2 | GoPro handler plus `DVNM` containing `MAX`; `.360`; dual-video/EAC layout; `GS*` filename. The two are then told apart by `DVNM` (`MAX2` vs `GoPro Max`), else the camera model `MINF` in the file's Global Settings block, else the hemisphere size (5888×1920 = MAX2); the default is the MAX. |
+| QooCam 3 Ultra | `Q360_YYYYMMDD_HHMMSS_N.MP4` file name; `kfix` product record containing `QooCam`. Files with `STITCHED=1` (QooCam Studio exports) are skipped. |
 | BlackVue | PittaSoft/BlackVue handler; `YYYYMMDD_HHMMSS_XX` filename; PittaSoft/BlackVue markers |
 | HERO | GoPro handler plus `DVNM` containing `HERO`; single flat video stream with GPMF; `GX*`/`GH*`/`GOPR*` filename |
 
@@ -248,6 +266,7 @@ Ambiguous GoPro files (for example a generic GoPro handler with conflicting MAX/
 | Garmin VIRB Ultra 30 | 24 fps, 30 fps | Classic recording; VFR handled by real PTS |
 | GoPro Max | 24 fps, 30 fps, TimeWarp/timelapse at 30 fps playback | GPS span is scaled to video span |
 | GoPro Max2 | 0.5 s time-lapse at 30 fps playback | One GPS sample per frame |
+| Kandao QooCam 3 Ultra | 0.5 s time-lapse at 30 fps playback | Frame times from the camera clock (`PTS`) |
 | BlackVue DR900 | 2 fps, 30 fps | Timelapse and normal drive modes |
 | GoPro HERO | 24 fps, 30 fps | Classic recording |
 
@@ -362,6 +381,7 @@ The host timezone is never consulted.
 | Camera | Clock rule |
 |---|---|
 | MAX2 (and any GoPro with `TZON`) | The camera's own timezone setting `TZON` (minutes, daylight saving included) from the "Global Settings" GPMF block in `moov/udta/GPMF` is the default source. `creation_time` is real UTC; `CDAT` there is the matching local wall clock. |
+| QooCam 3 Ultra | Only the camera-local wall clock is recorded (capture time, file name); names and `DateTimeOriginal` use it. The UTC offset, GPS time and UTC exports need `--timezone`; without it they are left out with a warning. |
 | MAX | No `TZON`. Container `creation_time` (camera-local wall clock) is compared with the first GPS UTC. `STMP` is added so later chapters compare against recording start. The difference is rounded to the nearest 15 minutes and rejected beyond ±14 hours. |
 | HERO | GPS UTC is authoritative. The offset is `TZON` (HERO11 and later); older models without it fall back to UTC with a warning. |
 | VIRB | FIT UTC is authoritative. Container `creation_time` is camera-local wall clock and is used for segment matching and as a last-resort anchor. |
@@ -637,7 +657,7 @@ It helps most on steep roads and in the 90th percentile, but it is not better ev
 - GoPro (MAX/HERO): `ExposureTime` and `ISO` come from the camera's per-frame `SHUT`/`ISOE` telemetry (nearest frame within 1 s of the capture time). They are real per-frame values, e.g. useful to spot motion blur; other lens/exposure tags are not written.
 - All tags are written with exiftool `-n`, so values must be raw (`T`, `K`, `2 3 0 0`, `YYYY:mm:dd HH:MM:SS.sssZ`); exiftool drops print-form values such as `True North` with only a warning.
 - **Camera firmware:** EXIF `Software` (defined as "software or firmware of the camera") and `XMP-aux:Firmware` carry the camera firmware, as the cameras' own photos do (e.g. `H19.03.02.02.00`, `VIRB Ultra 30 FW 4.80`). When no firmware is known, `Software` falls back to the exporter version. The serial number goes to `SerialNumber`, `CameraSerialNumber` and `XMP-aux:SerialNumber`. For GoPro (MAX, MAX2, HERO) it is `CASN` from the file's "Global Settings" block, as on the camera's own photos (e.g. `C3351325080196`); ffprobe does not show it. Note that Panoramax publishes EXIF, so the serial is public.
-- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.4`.
+- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.5`.
 - **Provenance note:** only `UserComment`, e.g. `heading_source=gps_course; position_source=interpolated`, plus per-camera flags (`camera_orientation_deg` for VIRB, `unpositioned` for HERO). It holds only facts without an EXIF tag of their own. `ImageDescription`, `XPComment` and `XMP:Description` and `XMP:Title` are not written, because galleries and Panoramax show them as the photo caption or title. Video, frame, PTS, distance, accuracy source and DOPs are in the per-image telemetry GeoJSON. Provenance never goes to keywords.
 - `Keywords`/`XMP:Subject` are written only when `--keywords` is passed.
 - GPano/XMP-GPano tags are written only for MAX panoramic images.
@@ -664,7 +684,7 @@ It helps most on steep roads and in the 90th percentile, but it is not better ev
 ```
 
 - The date folder is based on the **first exported frame**, not on the source filename.
-- Camera suffixes: `virb30`, `max`, `max2`, `blackvue`, `hero`.
+- Camera suffixes: `virb30`, `max`, `max2`, `qoocam3ultra`, `blackvue`, `hero`.
 - The sequence name is the source stem. Duplicate stems in nested folders are prefixed with the relative directory (`subdir__VIRB0001`); no numeric `_NNNNNN` counter is used.
 - An explicitly supplied heading offset is appended to the camera folder: `YYYY-MM-DD-virb30-090`.
 - Images that cross midnight stay in the same sequence folder; their filenames carry the date.
@@ -775,7 +795,7 @@ A one-point track is emitted as a `Point` feature. An empty track emits no geome
 {
   "type": "FeatureCollection",
   "generator": "v2i.py",
-  "generator_version": "0.0.4",
+  "generator_version": "0.0.5",
   "camera": "gopro-max",
   "camera_label": "GoPro Max",
   "video": "GS013338.360",
@@ -840,7 +860,7 @@ VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
 {
   "type": "FeatureCollection",
   "generator": "v2i.py",
-  "generator_version": "0.0.4",
+  "generator_version": "0.0.5",
   "camera": "gopro-max",
   "camera_label": "GoPro Max",
   "video": "GS013338.360",
@@ -1181,7 +1201,7 @@ Speed conversion: knots × `0.514444` = m/s.
 | Constant | Value | Meaning |
 |---|---|---|
 | `DEFAULT_EXTENSIONS` | `.mp4,.mov,.m4v,.360` | Files scanned by default |
-| `SOFTWARE_TAG` | `v2i.py v0.0.4` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
+| `SOFTWARE_TAG` | `v2i.py v0.0.5` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
 | `LEVEL_WINDOW_DEFAULT` | `25.0` | Default `--level-window` in real-time seconds |
 | `LEVEL_MAX_STEP_DEG` | `0.5` | Largest leveling change between consecutive images |
 | `LEVEL_ACCEL_WEIGHTING` | `False` | Down-weight gravity samples during acceleration (implemented, off, candidate for removal) |
@@ -1214,7 +1234,8 @@ Speed conversion: knots × `0.514444` = m/s.
 
 | Version | Highlight |
 |---|---|
-| `0.0.4` | Notice added that the code is AI-generated. GoPro Max2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, EXIF model `GoPro Max2`, title case like the MAX's own `GoPro Max`); GoPro Max and GoPro Max2 are separate cameras (ids `gopro-max`/`gopro-max2`, output folders `-max`/`-max2`; the old `gopro-max-360` id and `-max360` folder suffix are gone); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
+| `0.0.5` | Version bump; development continues from 0.0.4 (no functional changes yet) |
+| `0.0.4` | Notice added that the code is AI-generated. Kandao QooCam 3 Ultra support (raw dual fisheye + `.kvar` sidecar; stitched with the camera's own lens calibration and QooCam Studio's orientation, HLG tone mapping, GPS + gyro heading, accelerometer leveling, local-time names with `--timezone` opt-in). GoPro Max2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, EXIF model `GoPro Max2`, title case like the MAX's own `GoPro Max`); GoPro Max and GoPro Max2 are separate cameras (ids `gopro-max`/`gopro-max2`, output folders `-max`/`-max2`; the old `gopro-max-360` id and `-max360` folder suffix are gone); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
 | `0.0.3` | Unified single-file pipelines, per-camera telemetry, timezone detection, universal unpositioned fallback. Horizon leveling restricted to 360 (MAX) videos via `--level-horizon {no,rotate,exif}`; telemetry exports switched from `*.json` to RFC 7946 `*.geojson`; exporter version written to EXIF `Software` |
 | Earlier | Per-camera scripts and modules, merged into `v2i.py` |
 

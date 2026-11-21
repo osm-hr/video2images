@@ -7,6 +7,7 @@ stills and write metadata lives in this single file.  Supported cameras:
 
     * Garmin VIRB Ultra 30   (MP4 + sibling FIT telemetry)
     * GoPro Max, GoPro Max2  (``.360`` EAC hemispheres -> equirectangular)
+    * Kandao QooCam 3 Ultra  (raw dual fisheye + ``.kvar`` sidecar -> equirect.)
     * BlackVue DR900         (MP4 with embedded NMEA)
     * GoPro HERO             (flat MP4 with GPMF telemetry)
 
@@ -42,6 +43,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -61,10 +63,10 @@ class Fatal(Exception):
 # Shared helpers: CLI, detection, timelines, extraction and tracks
 # =========================================================================
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 # Written to EXIF ``Software``, ``XMP:CreatorTool`` and the GPano
-# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.4``.
+# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.5``.
 SOFTWARE_TAG = "%s v%s" % (SCRIPT_NAME, __version__)
 
 # Values ``--level-horizon`` accepted before it became an on/off switch; they
@@ -80,6 +82,7 @@ FFMPEG = os.environ.get("V2I_FFMPEG", "ffmpeg")
 CAMERA_VIRB = "garmin-virb-ultra-30"
 CAMERA_MAX = "gopro-max"
 CAMERA_MAX2 = "gopro-max2"
+CAMERA_QOOCAM = "kandao-qoocam3ultra"
 CAMERA_BLACKVUE = "blackvue-dr900"
 CAMERA_HERO = "gopro-hero"
 
@@ -87,6 +90,7 @@ CAMERA_LABELS = {
     CAMERA_VIRB: "Garmin VIRB Ultra 30",
     CAMERA_MAX: "GoPro Max",
     CAMERA_MAX2: "GoPro Max2",
+    CAMERA_QOOCAM: "Kandao QooCam 3 Ultra",
     CAMERA_BLACKVUE: "BlackVue DR900",
     CAMERA_HERO: "GoPro HERO",
 }
@@ -96,6 +100,7 @@ CAMERA_SUFFIX = {
     CAMERA_VIRB: "virb30",
     CAMERA_MAX: "max",
     CAMERA_MAX2: "max2",
+    CAMERA_QOOCAM: "qoocam3ultra",
     CAMERA_BLACKVUE: "blackvue",
     CAMERA_HERO: "hero",
 }
@@ -103,6 +108,8 @@ CAMERA_SUFFIX = {
 # GoPro 360 cameras: separate cameras (labels, counts, output folders) that
 # share the EAC stitching pipeline (``max360_*`` functions).
 CAMERA_360 = (CAMERA_MAX, CAMERA_MAX2)
+# Every 360 camera (re-centring, leveling); the QooCam has its own pipeline.
+CAMERA_SPHERICAL = CAMERA_360 + (CAMERA_QOOCAM,)
 
 # Default scanned extensions.  The single entry point scans this set and uses
 # :func:`detect_camera` to route each file to its camera pipeline.
@@ -447,6 +454,15 @@ def detect_camera(path: str, *, ffprobe: str = FFPROBE) -> Detection:
     (MAX or MAX2) by :func:`gopro_360_camera`.
     """
     detection = _detect_camera_family(path, ffprobe=ffprobe)
+    if detection.camera == CAMERA_QOOCAM:
+        fix = read_kandao_fix(path)
+        if fix.get("STITCHED"):
+            return Detection(
+                None, None, detection.evidence,
+                "QooCam Studio export (already stitched); only raw QooCam "
+                "recordings with their .kvar sidecar are exported",
+                detection.device_name)
+        return detection
     if detection.camera != CAMERA_MAX:
         return detection
     streams: List[dict] = []
@@ -482,7 +498,7 @@ def _detect_camera_family(path: str, *, ffprobe: str = FFPROBE) -> Detection:
 
     evidence: Dict[str, List[str]] = {
         CAMERA_VIRB: [], CAMERA_MAX: [], CAMERA_MAX2: [], CAMERA_BLACKVUE: [],
-        CAMERA_HERO: [],
+        CAMERA_HERO: [], CAMERA_QOOCAM: [],
     }
     handlers = meta.handler_text
     if "garmin" in handlers:
@@ -516,6 +532,13 @@ def _detect_camera_family(path: str, *, ffprobe: str = FFPROBE) -> Detection:
         evidence[CAMERA_HERO].append("GoPro HERO file name (%s)" % name)
     if _RE_BLACKVUE_NAME.match(name):
         evidence[CAMERA_BLACKVUE].append("BlackVue file name (%s)" % name)
+
+    # Kandao QooCam: Q360_ file name and the camera's kfix product record.
+    if _RE_QOOCAM_NAME.match(name):
+        evidence[CAMERA_QOOCAM].append("QooCam file name (%s)" % name)
+    product = str(read_kandao_fix(path).get("PRODUCT") or "")
+    if "qoocam" in product.lower():
+        evidence[CAMERA_QOOCAM].append("Kandao product %r" % product)
 
     # GoPro stream layout: MAX stores two EAC hemispheres; HERO is flat.
     if meta.has_gpmd:
@@ -1183,7 +1206,7 @@ def resolve_timezone(args: argparse.Namespace, detected: Optional[int], *,
         return 0, True
     if detected is not None:
         return detected, True
-    if camera in CAMERA_360 + (CAMERA_HERO,):
+    if camera in CAMERA_SPHERICAL + (CAMERA_HERO,):
         logger.warning("no camera-local timezone in this video; using UTC for "
                        "file names and EXIF (pass --timezone to override)")
     return 0, False
@@ -1658,7 +1681,8 @@ def video_args(args: argparse.Namespace, video: str,
     """
     vargs = copy.copy(args)
     offset = video_heading_offset(args, video)
-    recenter = camera in CAMERA_360 and getattr(args, "recenter_forward", True)
+    recenter = (camera in CAMERA_SPHERICAL
+                and getattr(args, "recenter_forward", True))
     vargs.recenter_deg = (offset % 360.0) if (recenter and offset) else 0.0
     vargs.heading_offset = 0.0 if (recenter or offset is None) else offset
     vargs.heading_offset_given = offset is not None and not recenter
@@ -7797,6 +7821,1080 @@ def virb_process_video(video, sequence, output_dir, all_fits, args, telemetry_ca
 
 
 # =========================================================================
+# Kandao QooCam 3 Ultra pipeline
+# =========================================================================
+#
+# The camera writes one HEVC stream with the two fisheye circles stacked
+# (front lens on top, 3840x3840 each, so 3840x7680), 10-bit HLG HDR, plus a
+# ``.kvar`` sidecar with the telemetry (GPS, 1 kHz gyro/accelerometer, frame
+# times, exposure) and the factory lens calibration.  Kandao's own records
+# (``kfix``/``kvar`` atoms at the end of the MP4 and the sidecar) share one
+# layout: a little-endian count, then entries of name[32], type[8], count and
+# the data.  Nothing here is GoPro GPMF.
+
+QOOCAM_LABEL_PRODUCT = "QooCam 3 Ultra"
+# Fixed sphere rotation of QooCam Studio's equirectangular export, fitted on
+# frames 100/300/500 of a sample recording (it does not change per frame):
+# yaw, pitch, roll in degrees, composed as R_yaw @ R_pitch @ R_roll.  Using it
+# makes v2i's output line up with the vendor's own stitch.
+QOOCAM_STUDIO_ROTATION_DEG = (184.094, 5.969, -1.281)
+QOOCAM_DEFAULT_WIDTH, QOOCAM_DEFAULT_HEIGHT = 7680, 3840
+# Remap maps are computed in Python on this grid and scaled up by ffmpeg
+# (bilinear).  Against exact full-size maps the error is 0.001 px median and
+# under 2 px at the poles.
+QOOCAM_MAP_GRID = (1920, 960)
+QOOCAM_SEAM_FEATHER_DEG = 6.0          # total width of the cross-fade
+# Heading: GPS course corrected by the integrated gyro yaw rate.  The gyro
+# keeps the short-term shape (turns between 1 Hz fixes, slow driving); the
+# GPS course removes its drift through a Gaussian-smoothed offset.
+QOOCAM_HEADING_SIGMA_S = 8.0
+QOOCAM_HEADING_MIN_SPEED = 1.5         # m/s; slower GPS courses are noise
+QOOCAM_GYRO_MIN_CORRELATION = 0.5
+QOOCAM_GRAVITY_TAU_S = 1.0             # low-pass of the accelerometer
+QOOCAM_IMU_ROW_HZ = 10.0               # resampled IMU rate for leveling
+QOOCAM_TONEMAP = ("zscale=tin=arib-std-b67:pin=bt2020:min=bt2020nc:rin=full:"
+                  "t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                  "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=full,"
+                  "format=gbrp")
+_RE_QOOCAM_NAME = re.compile(r"^Q360_\d{8}_\d{6}_\d+\.(mp4|mov)$",
+                             re.IGNORECASE)
+_RE_QOOCAM_STAMP = re.compile(r"Q360_(\d{8})_(\d{6})", re.IGNORECASE)
+
+_KANDAO_TYPES = {"U8": ("B", 1), "S8": ("b", 1), "U16": ("H", 2),
+                 "S16": ("h", 2), "U32": ("I", 4), "S32": ("i", 4),
+                 "U64": ("Q", 8), "S64": ("q", 8), "FLOAT": ("f", 4),
+                 "DOUBLE": ("d", 8), "CHAR": (None, 1)}
+
+
+class QooCamError(Fatal):
+    """Unreadable or unsupported QooCam recording."""
+
+
+def _mp4_top_atoms(path: str, wanted: Sequence[bytes],
+                   limit: int = 1 << 22) -> Dict[bytes, bytes]:
+    """Return the payload of each wanted *top-level* atom (headers only read)."""
+    found: Dict[bytes, bytes] = {}
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            pos = 0
+            while pos + 8 <= size:
+                fh.seek(pos)
+                head = fh.read(16)
+                if len(head) < 8:
+                    break
+                atom_size, kind = struct.unpack(">I4s", head[:8])
+                header = 8
+                if atom_size == 1 and len(head) >= 16:
+                    atom_size = struct.unpack(">Q", head[8:16])[0]
+                    header = 16
+                elif atom_size == 0:
+                    atom_size = size - pos
+                if atom_size < header:
+                    break
+                if kind in wanted and atom_size - header <= limit:
+                    fh.seek(pos + header)
+                    found[kind] = fh.read(atom_size - header)
+                pos += atom_size
+    except (OSError, struct.error):
+        pass
+    return found
+
+
+def kandao_records(buf: bytes, start: int = 0) -> Dict[str, Tuple[str, int, bytes]]:
+    """Parse Kandao ``kfix``/``kvar`` records: ``{name: (type, count, data)}``."""
+    records: Dict[str, Tuple[str, int, bytes]] = {}
+    if len(buf) < start + 4:
+        return records
+    total = struct.unpack_from("<I", buf, start)[0]
+    pos = start + 4
+    for _ in range(total):
+        if pos + 44 > len(buf):
+            break
+        name = buf[pos:pos + 32].split(b"\0", 1)[0].decode("latin1")
+        kind = buf[pos + 32:pos + 40].split(b"\0", 1)[0].decode("latin1")
+        count = struct.unpack_from("<I", buf, pos + 40)[0]
+        size = _KANDAO_TYPES.get(kind, (None, 1))[1]
+        data = buf[pos + 44:pos + 44 + count * size]
+        records[name] = (kind, count, data)
+        pos += 44 + count * size
+    return records
+
+
+def kandao_value(record: Optional[Tuple[str, int, bytes]]):
+    """Decode a record: text for CHAR, a number for count 1, else a list."""
+    if record is None:
+        return None
+    kind, count, data = record
+    fmt = _KANDAO_TYPES.get(kind, (None, 1))[0]
+    if fmt is None:
+        return data.split(b"\0", 1)[0].decode("utf-8", "replace").strip()
+    try:
+        values = list(struct.unpack("<%d%s" % (count, fmt), data))
+    except struct.error:
+        return None
+    return values[0] if count == 1 else values
+
+
+def read_kandao_fix(path: str) -> Dict[str, object]:
+    """Camera facts from the MP4's ``kfix`` atom (empty for other files)."""
+    atoms = _mp4_top_atoms(path, (b"kfix",))
+    if b"kfix" not in atoms:
+        return {}
+    return {name: kandao_value(rec)
+            for name, rec in kandao_records(atoms[b"kfix"]).items()}
+
+
+@dataclass
+class QooCamLens:
+    focal: float                 # px, calibration scale
+    cx: float
+    cy: float                    # in the stacked (two-lens) frame
+    k: Tuple[float, float, float, float]
+    rotation: Tuple[float, ...]  # row-major 3x3, rig -> lens
+    calib_width: float
+
+
+@dataclass
+class QooCamInfo:
+    path: str
+    width: int
+    height: int
+    fps: float
+    frame_count: int
+    duration: float
+    product: str = QOOCAM_LABEL_PRODUCT
+    serial: Optional[str] = None
+    firmware: Optional[str] = None
+    capture_local: Optional[dt.datetime] = None
+    capture_source: str = ""
+    stitched: bool = False
+    capture_mode: Optional[str] = None
+    lenses: List[QooCamLens] = field(default_factory=list)
+    frame_clock_us: List[int] = field(default_factory=list)
+    sidecar: Optional[str] = None
+    out_width: int = QOOCAM_DEFAULT_WIDTH
+    out_height: int = QOOCAM_DEFAULT_HEIGHT
+    camera: str = CAMERA_QOOCAM
+    make: str = "Kandao"
+
+
+def qoocam_parse_lenses(text: str) -> List[QooCamLens]:
+    """Decode the ``LENS`` calibration string (hex of two lens records).
+
+    Each lens record holds, as little-endian float32: the focal length (+24),
+    the optical centre y/x (+28/+32, y in the stacked two-lens frame), four
+    Kannala-Brandt distortion coefficients (+36..+48), a row-major rig->lens
+    rotation (+68) and a translation (+104); +20 is the calibration image
+    width (6944 px on the QooCam 3 Ultra).  The hex is not byte aligned, so
+    each record is located by trying the alignments and keeping the one whose
+    rotation matrix is orthonormal.
+    """
+    lenses: List[QooCamLens] = []
+    for part in text.split("ffffffff"):
+        best = None
+        for skip in range(0, 8):
+            hexpart = part[skip:]
+            hexpart = hexpart[:len(hexpart) // 2 * 2]
+            try:
+                blob = bytes.fromhex(hexpart)
+            except ValueError:
+                continue
+            if len(blob) < 104:
+                continue
+            try:
+                floats = struct.unpack_from("<17f", blob, 24)
+                rot = struct.unpack_from("<9f", blob, 68)
+                width = struct.unpack_from("<I", blob, 20)[0]
+            except struct.error:
+                continue
+            rows = [rot[0:3], rot[3:6], rot[6:9]]
+            ortho = sum(abs(sum(a * b for a, b in zip(rows[i], rows[j]))
+                            - (1.0 if i == j else 0.0))
+                        for i in range(3) for j in range(3))
+            focal, cy, cx = floats[0], floats[1], floats[2]
+            if not (100.0 < focal < 20000.0 and 1000 < width < 20000
+                    and ortho < 1e-3):
+                continue
+            if best is None or ortho < best[0]:
+                best = (ortho, QooCamLens(
+                    focal=focal, cx=cx, cy=cy, k=tuple(floats[3:7]),
+                    rotation=tuple(rot), calib_width=float(width)))
+        if best is not None:
+            lenses.append(best[1])
+    return lenses
+
+
+def qoocam_read_sidecar(path: str) -> Dict[str, Tuple[str, int, bytes]]:
+    """Records of a ``.kvar`` sidecar (big-endian size, ``kvar``, records)."""
+    with open(path, "rb") as fh:
+        buf = fh.read()
+    if len(buf) < 12 or buf[4:8] != b"kvar":
+        raise QooCamError("%s is not a Kandao .kvar file"
+                          % os.path.basename(path))
+    return kandao_records(buf, 8)
+
+
+def qoocam_find_sidecar(path: str) -> Optional[str]:
+    """The ``.kvar`` file next to *path* with the same base name."""
+    base = os.path.splitext(path)[0]
+    for ext in (".kvar", ".KVAR", ".Kvar"):
+        if os.path.isfile(base + ext):
+            return base + ext
+    folder = os.path.dirname(path) or "."
+    stem = os.path.basename(base).lower()
+    try:
+        for entry in os.listdir(folder):
+            if entry.lower() == stem + ".kvar":
+                return os.path.join(folder, entry)
+    except OSError:
+        pass
+    return None
+
+
+def _qoocam_capture_time(fix: Dict[str, object], name: str
+                         ) -> Tuple[Optional[dt.datetime], str]:
+    text = fix.get("VIDEO_CAPTIME")
+    if isinstance(text, str) and text:
+        try:
+            return dt.datetime.strptime(text, "%Y-%m-%d %H:%M:%S"), \
+                "camera capture time"
+        except ValueError:
+            pass
+    match = _RE_QOOCAM_STAMP.search(name)
+    if match:
+        try:
+            return dt.datetime.strptime(match.group(1) + match.group(2),
+                                        "%Y%m%d%H%M%S"), "file name"
+        except ValueError:
+            pass
+    return None, ""
+
+
+def qoocam_probe(path: str) -> QooCamInfo:
+    """Describe a raw QooCam recording and its sidecar."""
+    meta = probe_metadata(path, FFPROBE)
+    videos = meta.video_streams_info()
+    if len(videos) != 1:
+        raise QooCamError("expected one video stream, found %d" % len(videos))
+    stream = videos[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    fps = _parse_rate(stream.get("r_frame_rate")
+                      or stream.get("avg_frame_rate")) or 30.0
+    duration = float(stream.get("duration") or meta.duration or 0.0)
+    try:
+        frame_count = int(stream.get("nb_frames"))
+    except (TypeError, ValueError):
+        frame_count = max(1, int(round(duration * fps)))
+    atoms = _mp4_top_atoms(path, (b"kfix", b"kvar"))
+    fix = {n: kandao_value(r)
+           for n, r in kandao_records(atoms.get(b"kfix", b"")).items()}
+    embedded = kandao_records(atoms.get(b"kvar", b""))
+    sidecar = qoocam_find_sidecar(path)
+    side = {}
+    if sidecar:
+        try:
+            side = qoocam_read_sidecar(sidecar)
+        except (OSError, QooCamError) as exc:
+            LOG.warning("  %s", exc)
+            sidecar = None
+    lens_text = kandao_value(side.get("LENS") or embedded.get("LENS")) or ""
+    clock = kandao_value(side.get("PTS") or embedded.get("PTS"))
+    if isinstance(clock, int):
+        clock = [clock]
+    capture, source = _qoocam_capture_time(fix, os.path.basename(path))
+    info = QooCamInfo(
+        path=path, width=width, height=height, fps=fps,
+        frame_count=frame_count, duration=duration,
+        product=str(fix.get("PRODUCT") or QOOCAM_LABEL_PRODUCT),
+        serial=(str(fix["SN"]) if fix.get("SN") else None),
+        firmware=(str(fix["SW_VER"]) if fix.get("SW_VER") else None),
+        capture_local=capture, capture_source=source,
+        stitched=bool(fix.get("STITCHED")),
+        capture_mode=(str(fix["CAPTURE_MODE"]) if fix.get("CAPTURE_MODE")
+                      else None),
+        lenses=qoocam_parse_lenses(lens_text) if lens_text else [],
+        frame_clock_us=[int(v) for v in (clock or [])],
+        sidecar=sidecar)
+    info._sidecar_records = side          # type: ignore[attr-defined]
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Geometry: rig rotation, lens projection and remap maps
+# ---------------------------------------------------------------------------
+def _mat3_mul(a: Sequence[float], b: Sequence[float]) -> List[float]:
+    return [sum(a[3 * i + k] * b[3 * k + j] for k in range(3))
+            for i in range(3) for j in range(3)]
+
+
+def _mat3_vec(m: Sequence[float], v: Sequence[float]) -> Tuple[float, float, float]:
+    return (m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+            m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+            m[6] * v[0] + m[7] * v[1] + m[8] * v[2])
+
+
+def _mat3_transpose(m: Sequence[float]) -> List[float]:
+    return [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
+
+
+def qoocam_rig_rotation(yaw_deg: float, pitch_deg: float,
+                        roll_deg: float) -> List[float]:
+    """``R_yaw @ R_pitch @ R_roll`` mapping output directions to the rig.
+
+    Directions use (right, down, forward): an equirectangular pixel at
+    longitude ``lon`` (0 = image centre, positive to the right) and latitude
+    ``lat`` is ``(cos lat sin lon, -sin lat, cos lat cos lon)``.
+    """
+    y, p, r = (math.radians(yaw_deg), math.radians(pitch_deg),
+               math.radians(roll_deg))
+    ry = [math.cos(y), 0, math.sin(y), 0, 1, 0, -math.sin(y), 0, math.cos(y)]
+    rx = [1, 0, 0, 0, math.cos(p), -math.sin(p), 0, math.sin(p), math.cos(p)]
+    rz = [math.cos(r), -math.sin(r), 0, math.sin(r), math.cos(r), 0, 0, 0, 1]
+    return _mat3_mul(_mat3_mul(ry, rx), rz)
+
+
+def _qoocam_project(lens: QooCamLens, scale: float, v: Sequence[float]
+                    ) -> Tuple[float, float, float]:
+    """Rig direction -> (x, y, theta) in the stacked video frame."""
+    c = _mat3_vec(lens.rotation, v)
+    theta = math.acos(max(-1.0, min(1.0, c[2])))
+    t2 = theta * theta
+    k1, k2, k3, k4 = lens.k
+    r = lens.focal * theta * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+    rr = math.hypot(c[0], c[1])
+    if rr < 1e-12:
+        return lens.cx * scale, lens.cy * scale, theta
+    return ((lens.cx + c[0] / rr * r) * scale,
+            (lens.cy + c[1] / rr * r) * scale, theta)
+
+
+def _write_pgm(path: str, width: int, height: int, values, maxval: int) -> None:
+    import array
+    kind = "H" if maxval > 255 else "B"
+    data = array.array(kind, values)
+    if kind == "H" and sys.byteorder == "little":
+        data.byteswap()                       # PGM 16-bit is big-endian
+    with open(path, "wb") as fh:
+        fh.write(b"P5\n%d %d\n%d\n" % (width, height, maxval))
+        fh.write(data.tobytes())
+
+
+def qoocam_write_maps(info: QooCamInfo, directory: str, yaw_deg: float,
+                      grid: Tuple[int, int] = QOOCAM_MAP_GRID
+                      ) -> Dict[str, str]:
+    """Write coarse remap maps (x/y per lens) and the seam blend mask.
+
+    ``yaw_deg`` is the re-centring (v360 convention: the input azimuth shown
+    at the output centre).  Coordinates are clamped to each lens's own half
+    of the stacked frame, so a lens never samples the other one.
+    """
+    if len(info.lenses) < 2:
+        raise QooCamError("no usable lens calibration (LENS) in the recording "
+                          "or its .kvar sidecar")
+    gw, gh = grid
+    scale = info.width / info.lenses[0].calib_width
+    rig = qoocam_rig_rotation(*QOOCAM_STUDIO_ROTATION_DEG)
+    feather = math.radians(QOOCAM_SEAM_FEATHER_DEG)
+    half = info.height // 2
+    limits = [(0.0, half - 1.0), (float(half), info.height - 1.0)]
+    xs = [[], []]
+    ys = [[], []]
+    mask = []
+    yaw = math.radians(yaw_deg)
+    for j in range(gh):
+        lat = math.pi / 2 - (j + 0.5) / gh * math.pi
+        cl, sl = math.cos(lat), math.sin(lat)
+        for i in range(gw):
+            lon = (i + 0.5) / gw * 2 * math.pi - math.pi + yaw
+            w = (cl * math.sin(lon), -sl, cl * math.cos(lon))
+            v = _mat3_vec(rig, w)
+            thetas = []
+            for index, lens in enumerate(info.lenses[:2]):
+                x, y, theta = _qoocam_project(lens, scale, v)
+                lo, hi = limits[index]
+                xs[index].append(int(round(min(max(x, 0.0), info.width - 1.0))))
+                ys[index].append(int(round(min(max(y, lo), hi))))
+                thetas.append(theta)
+            weight = 0.5 + (thetas[1] - thetas[0]) / feather
+            mask.append(int(round(255 * min(1.0, max(0.0, weight)))))
+    paths = {}
+    for index in range(2):
+        for axis, values in (("x", xs[index]), ("y", ys[index])):
+            name = os.path.join(directory, "%s%d.pgm" % (axis, index))
+            _write_pgm(name, gw, gh, values, 65535)
+            paths["%s%d" % (axis, index)] = name
+    paths["mask"] = os.path.join(directory, "mask.pgm")
+    _write_pgm(paths["mask"], gw, gh, mask, 255)
+    return paths
+
+
+def qoocam_scale_maps(maps: Dict[str, str], width: int, height: int,
+                      directory: str) -> Dict[str, str]:
+    """Scale the coarse maps to the output size once (bilinear)."""
+    full = {}
+    for key, src in maps.items():
+        dest = os.path.join(directory, "full_%s.pgm" % key)
+        fmt = "gray" if key == "mask" else "gray16be"
+        max360__run([FFMPEG, "-v", "error", "-y", "-i", src, "-vf",
+                     "scale=%d:%d:flags=bilinear,format=%s"
+                     % (width, height, fmt), "-frames:v", "1", dest])
+        full[key] = dest
+    return full
+
+
+def qoocam_filter() -> str:
+    """Tone-map HLG, remap both lenses and cross-fade them at the seams."""
+    return ";".join([
+        "[0:v]%s,split[s0][s1]" % QOOCAM_TONEMAP,
+        "[1:v]format=gray16[x0]", "[2:v]format=gray16[y0]",
+        "[3:v]format=gray16[x1]", "[4:v]format=gray16[y1]",
+        "[s0][x0][y0]remap=fill=black[l0]",
+        "[s1][x1][y1]remap=fill=black[l1]",
+        "[5:v]format=gray,format=gbrp[m]",
+        "[l1][l0][m]maskedmerge[OUT]"])
+
+
+def qoocam_stitch_frame(info: QooCamInfo, maps: Dict[str, str],
+                        seek_time: float, dest: str, *, image_format: str,
+                        quality: int, threads: int) -> None:
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+           "-ss", "%.6f" % max(0.0, seek_time), "-i", info.path]
+    for key in ("x0", "y0", "x1", "y1", "mask"):
+        cmd += ["-i", maps[key]]
+    cmd += ["-filter_complex", qoocam_filter(), "-map", "[OUT]",
+            "-frames:v", "1",
+            "-pix_fmt", "rgb24" if image_format == "png" else "yuvj420p"]
+    cmd += ffmpeg_quality_args(image_format, quality)
+    if threads:
+        cmd += ["-threads", str(threads)]
+    cmd.append(dest)
+    max360__run(cmd)
+
+
+def qoocam_stitch(info: QooCamInfo, records: Sequence[dict],
+                  timeline: FrameTimeline, *, yaw_deg: float,
+                  levels: Optional[Dict[int, Tuple[float, float]]],
+                  image_format: str, quality: int, interp: str,
+                  threads: int, workers: int) -> None:
+    """Stitch every record's frame to ``record["path"]``."""
+    temp_dir = tempfile.mkdtemp(prefix="v2i_qoocam_")
+    try:
+        started = time.time()
+        coarse = qoocam_write_maps(info, temp_dir, yaw_deg)
+        maps = qoocam_scale_maps(coarse, info.out_width, info.out_height,
+                                 temp_dir)
+        LOG.info("  stitch maps: %dx%d lens model from the camera "
+                 "calibration (%.1f s)", info.out_width, info.out_height,
+                 time.time() - started)
+        half_frame = 0.25 / (timeline.fps or info.fps or 30.0)
+
+        def one(record):
+            index = record["frame_index"]
+            dest = record["path"]
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            seek = timeline.pts(index) - half_frame
+            level = (levels or {}).get(index)
+            if level is None:
+                qoocam_stitch_frame(info, maps, seek, dest,
+                                    image_format=image_format,
+                                    quality=quality, threads=threads)
+                return
+            temp = os.path.join(temp_dir, "frame_%06d.png" % index)
+            qoocam_stitch_frame(info, maps, seek, temp, image_format="png",
+                                quality=quality, threads=threads)
+            max360__level_image(temp, dest, level[0], level[1],
+                                width=info.out_width,
+                                height=info.out_height,
+                                image_format=image_format, quality=quality,
+                                interp=interp, threads=threads)
+            os.remove(temp)
+
+        jobs = max(1, int(workers or 1))
+        if jobs == 1:
+            for record in records:
+                one(record)
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                list(pool.map(one, records))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: clock, GPS, IMU heading and gravity
+# ---------------------------------------------------------------------------
+@dataclass
+class QooCamTelemetry:
+    clock_to_video: Callable[[float], float]
+    video_to_clock: Callable[[float], float]
+    time_scale: float                       # video seconds per real second
+    gps: List[dict] = field(default_factory=list)
+    heading_clock: List[float] = field(default_factory=list)   # seconds
+    heading_deg: List[float] = field(default_factory=list)     # gyro yaw
+    gravity: List[Tuple[float, Tuple[float, float, float]]] = \
+        field(default_factory=list)          # (clock s, rig down vector)
+    exposure: List[Tuple[float, float]] = field(default_factory=list)
+    gyro_used: bool = False
+    gyro_note: str = ""
+
+
+def _piecewise(xs: Sequence[float], ys: Sequence[float]
+               ) -> Callable[[float], float]:
+    """Linear interpolation through (xs, ys), extrapolating at both ends."""
+    def f(x: float) -> float:
+        if len(xs) == 1:
+            return ys[0]
+        i = bisect.bisect_left(xs, x)
+        i = min(max(i, 1), len(xs) - 1)
+        x0, x1, y0, y1 = xs[i - 1], xs[i], ys[i - 1], ys[i]
+        if x1 == x0:
+            return y0
+        return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return f
+
+
+def _wrap180(value: float) -> float:
+    return (value + 180.0) % 360.0 - 180.0
+
+
+def qoocam_read_telemetry(info: QooCamInfo, timeline: FrameTimeline
+                          ) -> QooCamTelemetry:
+    side = getattr(info, "_sidecar_records", {}) or {}
+    clock = [c / 1e6 for c in info.frame_clock_us]
+    count = min(len(clock), len(timeline))
+    if count < 2:
+        raise QooCamError("no per-frame camera clock (PTS) in the recording")
+    clock = clock[:count]
+    video = [timeline.pts(i) for i in range(count)]
+    span_clock = clock[-1] - clock[0]
+    scale = (video[-1] - video[0]) / span_clock if span_clock > 0 else 1.0
+    tel = QooCamTelemetry(clock_to_video=_piecewise(clock, video),
+                          video_to_clock=_piecewise(video, clock),
+                          time_scale=scale)
+    info_text = kandao_value(side.get("INFO")) or ""
+    settings = dict(item.split("=", 1) for item in str(info_text).split()
+                    if "=" in item)
+    try:
+        gyro_lsb = float(settings.get("V_G_RANGE", 2000)) / 32768.0
+        accel_lsb = float(settings.get("V_A_RANGE", 4)) / 32768.0
+    except ValueError:
+        gyro_lsb, accel_lsb = 2000.0 / 32768.0, 4.0 / 32768.0
+
+    # GPS: 4-byte header, then <u32 clock ms, f64 lat, f64 lon, f64 alt>.
+    gps = side.get("GPS")
+    if gps:
+        data = gps[2]
+        offset = 4 if (len(data) - 4) % 28 == 0 else 0
+        last = None
+        for ms, lat, lon, alt in struct.iter_unpack(
+                "<Iddd", data[offset:offset + (len(data) - offset) // 28 * 28]):
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180) or \
+                    (lat == 0 and lon == 0):
+                continue
+            if last is not None and (ms <= last[0] or (lat, lon) == last[1:]):
+                continue                    # repeated fix
+            last = (ms, lat, lon)
+            tel.gps.append({"clock": ms / 1000.0, "lat": lat, "lon": lon,
+                            "alt": alt})
+
+    # IMU: <u64 clock us, int16 gyro xyz, int16 accel xyz> at ~1 kHz.
+    imu = side.get("IMU")
+    if imu:
+        data = imu[2]
+        usable = len(data) // 20 * 20
+        gx = gy = gz = None
+        heading = 0.0
+        prev_t = None
+        next_row = None
+        step = 1.0 / QOOCAM_IMU_ROW_HZ
+        for t_us, wx, wy, wz, ax, ay, az in struct.iter_unpack(
+                "<Q6h", data[:usable]):
+            t = t_us / 1e6
+            ax_g, ay_g, az_g = ax * accel_lsb, ay * accel_lsb, az * accel_lsb
+            if gx is None:
+                gx, gy, gz = ax_g, ay_g, az_g
+                prev_t = t
+                next_row = t
+                continue
+            dt_s = t - prev_t
+            prev_t = t
+            if dt_s <= 0 or dt_s > 0.1:
+                continue
+            alpha = min(1.0, dt_s / QOOCAM_GRAVITY_TAU_S)
+            gx += (ax_g - gx) * alpha
+            gy += (ay_g - gy) * alpha
+            gz += (az_g - gz) * alpha
+            norm = math.sqrt(gx * gx + gy * gy + gz * gz) or 1.0
+            # The accelerometer reads +1 g *up*; down = -a.
+            down = (-gx / norm, -gy / norm, -gz / norm)
+            # Turn rate about the down axis (right-handed): heading change.
+            rate = (wx * down[0] + wy * down[1] + wz * down[2]) * gyro_lsb
+            heading += rate * dt_s
+            if t >= next_row:
+                tel.heading_clock.append(t)
+                tel.heading_deg.append(heading)
+                tel.gravity.append((t, down))
+                next_row = t + step
+
+    exp = side.get("EXP")
+    if exp:
+        data = exp[2]
+        for ms, value in struct.iter_unpack("<II", data[:len(data) // 8 * 8]):
+            if value > 0:
+                tel.exposure.append((ms / 1000.0, value / 1e6))
+    return tel
+
+
+def _qoocam_gps_courses(gps: List[dict]) -> List[Tuple[Optional[float], float]]:
+    """GPS (course, speed) per fix from its neighbours."""
+    out = []
+    for i, fix in enumerate(gps):
+        a = gps[max(0, i - 1)]
+        b = gps[min(len(gps) - 1, i + 1)]
+        span = b["clock"] - a["clock"]
+        dist = haversine(a["lat"], a["lon"], b["lat"], b["lon"])
+        speed = dist / span if span > 0 else 0.0
+        course = (initial_bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"])
+                  if dist >= 1.0 and speed >= QOOCAM_HEADING_MIN_SPEED
+                  else None)
+        out.append((course, speed))
+    return out
+
+
+def qoocam_fuse_heading(tel: QooCamTelemetry) -> List[Optional[float]]:
+    """Heading per GPS fix: gyro yaw + Gaussian-smoothed GPS-course offset.
+
+    The gyro sign is calibrated against the GPS course changes; when the two
+    do not correlate (straight drive, bad data) the plain GPS course is kept.
+    """
+    courses = _qoocam_gps_courses(tel.gps)
+    plain = [c for c, _ in courses]
+    if len(tel.heading_clock) < 10 or len(tel.gps) < 5:
+        tel.gyro_note = "no IMU"
+        return plain
+    gyro = _piecewise(tel.heading_clock, tel.heading_deg)
+    at = [gyro(fix["clock"]) for fix in tel.gps]
+    pairs = []
+    for i in range(1, len(tel.gps)):
+        c0, c1 = courses[i - 1][0], courses[i][0]
+        if c0 is None or c1 is None:
+            continue
+        dc = _wrap180(c1 - c0)
+        if abs(dc) < 45:
+            pairs.append((dc, at[i] - at[i - 1]))
+    corr = None
+    if len(pairs) >= 10:
+        mx = sum(p[0] for p in pairs) / len(pairs)
+        my = sum(p[1] for p in pairs) / len(pairs)
+        sxy = sum((p[0] - mx) * (p[1] - my) for p in pairs)
+        sxx = sum((p[0] - mx) ** 2 for p in pairs)
+        syy = sum((p[1] - my) ** 2 for p in pairs)
+        if sxx > 0 and syy > 0:
+            corr = sxy / math.sqrt(sxx * syy)
+    if corr is None or abs(corr) < QOOCAM_GYRO_MIN_CORRELATION:
+        tel.gyro_note = ("gyro not used (correlation with GPS course %s)"
+                         % ("n/a" if corr is None else "%.2f" % corr))
+        return plain
+    sign = 1.0 if corr > 0 else -1.0
+    tel.gyro_used = True
+    tel.gyro_note = "gyro yaw fused with GPS course (correlation %.2f)" \
+        % abs(corr)
+    clocks = [fix["clock"] for fix in tel.gps]
+    offsets = [(_wrap180(c - sign * a) if c is not None else None)
+               for (c, _), a in zip(courses, at)]
+    sigma = QOOCAM_HEADING_SIGMA_S
+    fused: List[Optional[float]] = []
+    for i, clock_i in enumerate(clocks):
+        lo = bisect.bisect_left(clocks, clock_i - 3 * sigma)
+        hi = bisect.bisect_right(clocks, clock_i + 3 * sigma)
+        sx = sy = 0.0
+        for j in range(lo, hi):
+            if offsets[j] is None:
+                continue
+            w = math.exp(-0.5 * ((clocks[j] - clock_i) / sigma) ** 2)
+            sx += w * math.cos(math.radians(offsets[j]))
+            sy += w * math.sin(math.radians(offsets[j]))
+        if sx == 0 and sy == 0:
+            fused.append(plain[i])
+            continue
+        offset = math.degrees(math.atan2(sy, sx))
+        fused.append((sign * at[i] + offset) % 360.0)
+    return fused
+
+
+def qoocam_level_angles(tel: QooCamTelemetry, clocks: Dict[int, float],
+                        yaw_deg: float, window_s: float
+                        ) -> Dict[int, Tuple[float, float]]:
+    """Roll/pitch per frame from the low-passed accelerometer.
+
+    The rig's down vector is turned into the output frame (Studio rotation,
+    then the re-centring yaw) and averaged with a Gaussian over *window_s*
+    real seconds, then the change between images is capped like the MAX.
+    """
+    if not tel.gravity:
+        return {}
+    rig_t = _mat3_transpose(qoocam_rig_rotation(*QOOCAM_STUDIO_ROTATION_DEG))
+    psi = math.radians(yaw_deg)
+    times = [t for t, _ in tel.gravity]
+    vectors = []
+    for _, down in tel.gravity:
+        x, y, z = _mat3_vec(rig_t, down)
+        vectors.append((x * math.cos(psi) - z * math.sin(psi), y,
+                        z * math.cos(psi) + x * math.sin(psi)))
+    sigma = max(window_s, 0.1) / 4.0
+    order = sorted(clocks, key=lambda k: clocks[k])
+    values = []
+    for frame in order:
+        t = clocks[frame]
+        if window_s <= 0:
+            i = min(max(bisect.bisect_left(times, t), 0), len(times) - 1)
+            picked, weights = [vectors[i]], [1.0]
+        else:
+            lo = bisect.bisect_left(times, t - window_s / 2)
+            hi = bisect.bisect_right(times, t + window_s / 2)
+            picked = vectors[lo:hi]
+            weights = [math.exp(-0.5 * ((times[k] - t) / sigma) ** 2)
+                       for k in range(lo, hi)]
+        angles = _weighted_vector_angles(picked, weights) if picked else None
+        values.append(angles)
+    known = [(f, v) for f, v in zip(order, values) if v is not None]
+    if window_s > 0 and known:
+        capped = _limit_steps([v for _, v in known], LEVEL_MAX_STEP_DEG)
+        known = [(f, v) for (f, _), v in zip(known, capped)]
+    return dict(known)
+
+
+# ---------------------------------------------------------------------------
+# Per-file processing
+# ---------------------------------------------------------------------------
+def qoocam_build_track(info: QooCamInfo, tel: QooCamTelemetry, args,
+                       utc_offset: Optional[int]) -> Optional[Track]:
+    headings = qoocam_fuse_heading(tel)
+    courses = _qoocam_gps_courses(tel.gps)
+    samples = []
+    for fix, heading, (_, speed) in zip(tel.gps, headings, courses):
+        local = qoocam_local_time(info, fix["clock"])
+        item = {"t": tel.clock_to_video(fix["clock"]), "lat": fix["lat"],
+                "lon": fix["lon"], "alt": fix["alt"], "speed": speed,
+                "course": heading, "clock": fix["clock"],
+                # reject_bad_gps needs a clock; the camera's local time is
+                # consistent within the file, real UTC is set below.
+                "utc": (local.replace(tzinfo=dt.timezone.utc)
+                        if local else None)}
+        apply_accuracy(item, args.uere)
+        samples.append(item)
+    samples = [s for s in samples if s["utc"] is not None]
+    max_dop = getattr(args, "max_dop", GPS_MAX_DOP)
+    samples, n_dop, n_jump = reject_bad_gps(samples, max_dop)
+    log_rejected_gps(n_dop, n_jump, max_dop)
+    for sample in samples:
+        sample["utc"] = qoocam_utc(sample["utc"].replace(tzinfo=None),
+                                   utc_offset)
+    if not samples:
+        return None
+    samples.sort(key=lambda s: s["t"])
+    return Track(samples, args.distance_mode)
+
+
+def qoocam_local_time(info: QooCamInfo, clock: float) -> Optional[dt.datetime]:
+    """Camera-local wall clock at camera *clock* seconds.
+
+    The capture time (seconds resolution) belongs to the first frame.
+    """
+    if info.capture_local is None or not info.frame_clock_us:
+        return None
+    return info.capture_local + dt.timedelta(
+        seconds=clock - info.frame_clock_us[0] / 1e6)
+
+
+def qoocam_utc(local: Optional[dt.datetime], utc_offset: Optional[int]
+               ) -> Optional[dt.datetime]:
+    if local is None or utc_offset is None:
+        return None
+    return (local - dt.timedelta(seconds=utc_offset)).replace(
+        tzinfo=dt.timezone.utc)
+
+
+def qoocam__record(choice, track, args, info: QooCamInfo,
+                   tel: QooCamTelemetry, utc_offset: Optional[int],
+                   sequence: str, video_name: str) -> dict:
+    point = choice.point or {}
+    index = int(choice.frame_index)
+    if index < len(info.frame_clock_us):
+        clock = info.frame_clock_us[index] / 1e6
+    else:
+        clock = tel.video_to_clock(float(choice.pts))
+    local = qoocam_local_time(info, clock)
+    utc = qoocam_utc(local, utc_offset)
+    if args.time_base == "utc" and utc is not None:
+        naming = utc.replace(tzinfo=None)
+    else:
+        naming = local or dt.datetime(1970, 1, 1)
+    heading, heading_source = resolve_heading(
+        point, args.heading_offset, args.magnetic_declination,
+        getattr(args, "recenter_deg", 0.0))
+    if heading_source == "gps_course" and tel.gyro_used:
+        heading_source = "gps_course+gyro"
+    accuracy, accuracy_estimated, accuracy_source = derive_accuracy(
+        point, args.uere)
+    unpositioned = point.get("lat") is None
+    exposure = None
+    if tel.exposure:
+        times = [t for t, _ in tel.exposure]
+        i = bisect.bisect_left(times, clock)
+        best = min((j for j in (i - 1, i) if 0 <= j < len(times)),
+                   key=lambda j: abs(times[j] - clock), default=None)
+        if best is not None and abs(times[best] - clock) <= 1.0:
+            exposure = tel.exposure[best][1]
+    return {
+        "sequence": sequence, "video": video_name, "camera": info.camera,
+        "recentered_deg": getattr(args, "recenter_deg", 0.0) or None,
+        "image": image_filename(naming, args.format),
+        "frame_index": index, "pts_seconds": round(float(choice.pts), 3),
+        "camera_clock_s": round(clock, 6),
+        "datetime_local": local.isoformat() if local else None,
+        "datetime_utc": fmt_utc(utc) if utc else None,
+        "utc_offset_s": utc_offset,
+        "latitude": point.get("lat"), "longitude": point.get("lon"),
+        "altitude_m": point.get("alt"), "speed_m_s": point.get("speed"),
+        "course_deg": point.get("course"), "heading_deg": heading,
+        "heading_source": heading_source, "img_direction_deg": heading,
+        "accuracy_m": accuracy, "accuracy_estimated": accuracy_estimated,
+        "accuracy_source": accuracy_source,
+        "hdop": None, "vdop": None, "pdop": None,
+        "distance_m": None if unpositioned else float(choice.target_distance),
+        "track_distance_m": point.get("distance"),
+        "position_source": point.get(
+            "position_source", "unpositioned" if unpositioned else "none"),
+        "clamped": bool(point.get("clamped")),
+        "estimated": bool(point.get("estimated")),
+        "unpositioned": unpositioned,
+        "exposure_time_s": exposure,
+        "naming_time": naming, "point": point,
+    }
+
+
+def qoocam__metadata_for(record, info: QooCamInfo, args) -> FrameMetadata:
+    extra = {}
+    if record.get("recentered_deg"):
+        extra["recentered_deg"] = "%03d" % int(round(record["recentered_deg"]))
+    return FrameMetadata(
+        camera=CAMERA_LABELS[info.camera], video=record["video"],
+        sequence=record["sequence"], frame_index=record["frame_index"],
+        pts=record["pts_seconds"], distance=record.get("distance_m"),
+        script_name=SCRIPT_NAME, make=info.make, model=info.product,
+        firmware=info.firmware, serial=info.serial,
+        captured_utc=parse_utc_timestamp(record.get("datetime_utc")),
+        captured_local=(dt.datetime.fromisoformat(record["datetime_local"])
+                        if record.get("datetime_local") else None),
+        utc_offset_s=record.get("utc_offset_s"),
+        lat=record.get("latitude"), lon=record.get("longitude"),
+        alt=record.get("altitude_m"), speed=record.get("speed_m_s"),
+        course=record.get("course_deg"),
+        img_direction=record.get("img_direction_deg"),
+        heading_source=record.get("heading_source", "none"),
+        accuracy=record.get("accuracy_m"),
+        accuracy_estimated=record.get("accuracy_estimated", False),
+        accuracy_source=record.get("accuracy_source"),
+        position_source=record.get("position_source"),
+        clamped=record.get("clamped"), estimated=record.get("estimated"),
+        image_width=info.out_width, image_height=info.out_height,
+        panorama=True, pose_heading=record.get("heading_deg"),
+        pose_pitch=0.0, pose_roll=0.0,
+        exposure_time=record.get("exposure_time_s"),
+        keywords=parse_keywords(args.keywords), extra=extra)
+
+
+def qoocam_process_video(path: str, sequence: str, args) -> dict:
+    name = os.path.basename(path)
+    result = {"video": name, "sequence": sequence, "images": 0,
+              "planned": 0, "failed": False, "entries": [], "dir": None}
+    LOG.info("--- %s -> %s", name, sequence)
+    log_heading_offset(args)
+    try:
+        info = qoocam_probe(path)
+    except (QooCamError, UnreadableVideo) as exc:
+        LOG.error("  %s", exc)
+        result["failed"] = True
+        return result
+    if args.width or args.height:
+        info.out_width, info.out_height = max360_output_size(
+            max360_VideoInfo(path=path, duration=0, fps=0, frame_count=0,
+                             video_ordinals={}, hemi_a=0, hemi_b=None,
+                             gpmd=None, width=0, height=0,
+                             creation_time=None, already_equirect=True),
+            args)
+    LOG.info("  video: %s, %dx%d %.4f fps, %d frame(s), %.2f s (dual "
+             "fisheye%s) -> %dx%d", info.product, info.width, info.height,
+             info.fps, info.frame_count, info.duration,
+             ", %s" % info.capture_mode if info.capture_mode else "",
+             info.out_width, info.out_height)
+    if info.height != 2 * info.width:
+        LOG.error("  unsupported layout %dx%d (expected two stacked fisheye "
+                  "circles)", info.width, info.height)
+        result["failed"] = True
+        return result
+    if len(info.lenses) < 2:
+        LOG.error("  no lens calibration (LENS) found; cannot stitch")
+        result["failed"] = True
+        return result
+    if info.sidecar:
+        LOG.info("  telemetry sidecar: %s", os.path.basename(info.sidecar))
+    else:
+        LOG.warning("  no .kvar sidecar next to the video: no GPS or IMU "
+                    "(only an unpositioned export is possible)")
+
+    timeline = probe_frame_timeline(
+        path, stream_ordinal=0, fps_hint=info.fps,
+        frame_count_hint=info.frame_count, duration_hint=info.duration,
+        logger=LOG)
+    if len(timeline) > info.frame_count:
+        timeline = FrameTimeline(timeline.times[:info.frame_count],
+                                 timeline.source, timeline.fps)
+    try:
+        tel = qoocam_read_telemetry(info, timeline)
+    except QooCamError as exc:
+        LOG.error("  %s", exc)
+        result["failed"] = True
+        return result
+    if tel.time_scale and abs(tel.time_scale - 1.0) > 0.2:
+        log_time_scale(1.0 / tel.time_scale, info.fps,
+                       (info.frame_clock_us[-1] - info.frame_clock_us[0]) / 1e6,
+                       info.duration)
+
+    # Time: the camera only records its local wall clock.  --timezone adds
+    # the UTC offset (EXIF OffsetTime*, GPS date/time, UTC in the exports).
+    utc_offset = parse_timezone(getattr(args, "timezone", None))
+    if info.capture_local is None:
+        LOG.warning("  no capture time in the recording or its file name")
+    else:
+        LOG.info("  capture time: %s local (%s)%s",
+                 info.capture_local.isoformat(sep=" "), info.capture_source,
+                 "; UTC offset %s from --timezone" % offset_string(utc_offset)
+                 if utc_offset is not None else "")
+    if utc_offset is None:
+        LOG.warning("  the QooCam records no timezone: names and "
+                    "DateTimeOriginal use the camera's local time; pass "
+                    "--timezone to also write the UTC offset and GPS time")
+        if args.time_base == "utc":
+            LOG.warning("  --time-base utc needs --timezone for the QooCam; "
+                        "using local time")
+
+    track = qoocam_build_track(info, tel, args, utc_offset) if tel.gps else None
+    if track is not None:
+        LOG.info("  telemetry: %d GPS fix(es), %.1f m of travel; heading: %s",
+                 len(track.samples), track.length, tel.gyro_note
+                 or "GPS course")
+    if track is None:
+        if args.fallback_interval <= 0:
+            LOG.error("  no usable GPS telemetry; use --fallback-interval "
+                      "SECONDS to export unpositioned frames")
+            result["failed"] = True
+            return result
+        choices = unpositioned_choices(timeline, args.fallback_interval,
+                                       info.duration, args.max_images)
+        LOG.warning("  exporting %d unpositioned frame(s) on a %g s time grid",
+                    len(choices), args.fallback_interval)
+    else:
+        choices, skipped = select_unique_frames(
+            track, timeline, args.distance, start_distance=args.start_distance,
+            max_position_error=args.max_position_error,
+            max_images=args.max_images, mode=args.distance_mode, logger=LOG)
+        if skipped:
+            LOG.info("  skipped %d target(s) with no acceptable unused frame",
+                     len(skipped))
+        if not choices:
+            LOG.error("  no capture point could be matched to a unique frame")
+            result["failed"] = True
+            return result
+
+    records = [qoocam__record(c, track, args, info, tel, utc_offset,
+                              sequence, name) for c in choices]
+    yaw = recenter_yaw(getattr(args, "recenter_deg", 0.0))
+    levels = None
+    if getattr(args, "level_horizon", False):
+        window_s = float(getattr(args, "level_window", LEVEL_WINDOW_DEFAULT))
+        clocks = {r["frame_index"]: r["camera_clock_s"] for r in records}
+        levels = qoocam_level_angles(tel, clocks, yaw, window_s)
+        for record in records:
+            level = levels.get(record["frame_index"])
+            if level is not None:
+                record["level_roll_deg"], record["level_pitch_deg"] = level
+                record["roll_deg"], record["pitch_deg"] = level
+                record["level_window_s"] = window_s
+        LOG.info("  horizon: leveling %d/%d image(s) from the accelerometer "
+                 "(Gaussian average over %g s, at most %.1f deg change "
+                 "between images)", len(levels), len(records), window_s,
+                 LEVEL_MAX_STEP_DEG)
+    first_time = records[0]["naming_time"]
+    sequence_dir = sequence_output_dir(
+        args.output, info.camera, sequence, first_time,
+        heading_offset=heading_offset_for_folder(args))
+    used_paths = set()
+    for record in records:
+        record["path"] = unique_path(
+            os.path.join(sequence_dir, record["image"]), used_paths)
+        record["image"] = os.path.basename(record["path"])
+    result["planned"] = len(records)
+    result["dir"] = sequence_dir
+    LOG.info("  %d capture point(s) -> %s", len(records), sequence_dir)
+
+    if args.dry_run:
+        for record in records:
+            position = ("unpositioned" if record.get("unpositioned")
+                        else "%.6f,%.6f" % (record["latitude"],
+                                            record["longitude"]))
+            distance = ("-" if record.get("distance_m") is None
+                        else "%.1fm" % record["distance_m"])
+            LOG.info("    frame=%d pts=%.3fs %s %s hdg=%s d=%s -> %s",
+                     record["frame_index"], record["pts_seconds"],
+                     (record["datetime_local"] or "no-time")[11:23] + " local",
+                     position, record["heading_deg"], distance,
+                     record["image"])
+        return result
+
+    to_extract = [r for r in records
+                  if args.overwrite or not os.path.exists(r["path"])]
+    skipped_existing = len(records) - len(to_extract)
+    if to_extract:
+        started = time.time()
+        qoocam_stitch(info, to_extract, timeline, yaw_deg=yaw, levels=levels,
+                      image_format=args.format, quality=args.quality,
+                      interp=args.interp, threads=args.threads,
+                      workers=args.workers)
+        LOG.info("  stitched %d image(s) in %.1f s", len(to_extract),
+                 time.time() - started)
+        for record in to_extract:
+            record["written"] = os.path.exists(record["path"])
+    written = [r for r in records if r.get("written")]
+    result["images"] = len(written)
+    LOG.info("  wrote %d image(s), skipped %d existing",
+             len(written), skipped_existing)
+    if written and not args.no_exif:
+        write_metadata([(r["path"], build_exiftool_args(
+            qoocam__metadata_for(r, info, args))) for r in written])
+    start_local = qoocam_local_time(info, info.frame_clock_us[0] / 1e6) \
+        if info.frame_clock_us else None
+    export_track_files(
+        sequence_dir, sequence, track.samples if track else [], records,
+        track_export=args.track_export, camera=info.camera, video=name,
+        imu=None, video_start_utc=qoocam_utc(start_local, utc_offset),
+        telemetry_export=args.telemetry_export,
+        time_scale=tel.time_scale or 1.0,
+        extra={"distance_interval_m": args.distance,
+               "time_base": args.time_base,
+               "timezone_known": utc_offset is not None})
+    result["entries"] = [{k: v for k, v in r.items()
+                          if k not in ("point", "naming_time")}
+                         for r in written]
+    return result
+
+
+# =========================================================================
 # GoPro HERO pipeline
 # =========================================================================
 
@@ -8140,8 +9238,8 @@ def hero_process_video(path: str, sequence: str, args) -> dict:
 # ===========================================================================
 # Command-line interface
 # ===========================================================================
-CAMERA_ORDER = (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_MAX2, CAMERA_VIRB,
-                CAMERA_HERO)
+CAMERA_ORDER = (CAMERA_BLACKVUE, CAMERA_MAX, CAMERA_MAX2, CAMERA_QOOCAM,
+                CAMERA_VIRB, CAMERA_HERO)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -8149,7 +9247,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=SCRIPT_NAME,
         description="Export geotagged still images from supported action-camera "
                     "videos every N metres of travel. The camera is detected "
-                    "per file (Garmin VIRB Ultra 30, GoPro Max, GoPro Max2, BlackVue "
+                    "per file (Garmin VIRB Ultra 30, GoPro Max, GoPro Max2, Kandao QooCam 3 Ultra, BlackVue "
                     "DR900 or GoPro HERO), so one input tree may mix cameras.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Examples:\n"
@@ -8297,6 +9395,8 @@ def process_group(camera: str, videos: Sequence[str], root: str,
                                                  args, have_exiftool)
             elif camera in CAMERA_360:
                 summary = max360_process_video(video, sequence, args)
+            elif camera == CAMERA_QOOCAM:
+                summary = qoocam_process_video(video, sequence, args)
             elif camera == CAMERA_VIRB:
                 summary = virb_process_video(video, sequence, output_dir, fits,
                                              args, telemetry_cache,
