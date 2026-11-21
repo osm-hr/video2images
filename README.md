@@ -6,7 +6,7 @@
 
 No separate per-camera modules, no database, no service dependencies. `ffmpeg`, `ffprobe` and `exiftool` are external tools; `max2sphere` is optional.
 
-**Version:** `0.0.4` · **Python:** 3.9+ · **Validated with:** ffmpeg/ffprobe 5.1.9, exiftool 12.x
+**Version:** `0.0.5` · **Python:** 3.9+ · **Validated with:** ffmpeg/ffprobe 5.1.9, exiftool 12.x
 
 ---
 
@@ -114,7 +114,7 @@ FrameChoice[]  ── frame index, PTS, interpolated point, distance, error
       ▼
 JPEG/PNG files
       │
-      │ exiftool batch  (Software = "v2i.py v0.0.4")
+      │ exiftool batch  (Software = "v2i.py v0.0.5")
       ▼
 EXIF + XMP + GPano tags
       │
@@ -657,7 +657,7 @@ It helps most on steep roads and in the 90th percentile, but it is not better ev
 - GoPro (MAX/HERO): `ExposureTime` and `ISO` come from the camera's per-frame `SHUT`/`ISOE` telemetry (nearest frame within 1 s of the capture time). They are real per-frame values, e.g. useful to spot motion blur; other lens/exposure tags are not written.
 - All tags are written with exiftool `-n`, so values must be raw (`T`, `K`, `2 3 0 0`, `YYYY:mm:dd HH:MM:SS.sssZ`); exiftool drops print-form values such as `True North` with only a warning.
 - **Camera firmware:** EXIF `Software` (defined as "software or firmware of the camera") and `XMP-aux:Firmware` carry the camera firmware, as the cameras' own photos do (e.g. `H19.03.02.02.00`, `VIRB Ultra 30 FW 4.80`). When no firmware is known, `Software` falls back to the exporter version. The serial number goes to `SerialNumber`, `CameraSerialNumber` and `XMP-aux:SerialNumber`. For GoPro (MAX, MAX2, HERO) it is `CASN` from the file's "Global Settings" block, as on the camera's own photos (e.g. `C3351325080196`); ffprobe does not show it. Note that Panoramax publishes EXIF, so the serial is public.
-- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.4`.
+- **Exporter version:** `XMP:CreatorTool` and `XMP-GPano:StitchingSoftware` carry `SOFTWARE_TAG`, built from `__version__` as `v2i.py v0.0.5`.
 - **Provenance note:** only `UserComment`, e.g. `heading_source=gps_course; position_source=interpolated`, plus per-camera flags (`camera_orientation_deg` for VIRB, `unpositioned` for HERO). It holds only facts without an EXIF tag of their own. `ImageDescription`, `XPComment` and `XMP:Description` and `XMP:Title` are not written, because galleries and Panoramax show them as the photo caption or title. Video, frame, PTS, distance, accuracy source and DOPs are in the per-image telemetry GeoJSON. Provenance never goes to keywords.
 - `Keywords`/`XMP:Subject` are written only when `--keywords` is passed.
 - GPano/XMP-GPano tags are written only for MAX panoramic images.
@@ -795,7 +795,7 @@ A one-point track is emitted as a `Point` feature. An empty track emits no geome
 {
   "type": "FeatureCollection",
   "generator": "v2i.py",
-  "generator_version": "0.0.4",
+  "generator_version": "0.0.5",
   "camera": "gopro-max",
   "camera_label": "GoPro Max",
   "video": "GS013338.360",
@@ -860,7 +860,7 @@ VIRB files add a `calibration` member keyed by sensor (`ACCL`, `GYRO`, `MAGN`) w
 {
   "type": "FeatureCollection",
   "generator": "v2i.py",
-  "generator_version": "0.0.4",
+  "generator_version": "0.0.5",
   "camera": "gopro-max",
   "camera_label": "GoPro Max",
   "video": "GS013338.360",
@@ -1201,7 +1201,7 @@ Speed conversion: knots × `0.514444` = m/s.
 | Constant | Value | Meaning |
 |---|---|---|
 | `DEFAULT_EXTENSIONS` | `.mp4,.mov,.m4v,.360` | Files scanned by default |
-| `SOFTWARE_TAG` | `v2i.py v0.0.4` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
+| `SOFTWARE_TAG` | `v2i.py v0.0.5` | `SCRIPT_NAME` + `__version__`; written to EXIF `Software`, `XMP:CreatorTool`, `XMP-GPano:StitchingSoftware` |
 | `LEVEL_WINDOW_DEFAULT` | `25.0` | Default `--level-window` in real-time seconds |
 | `LEVEL_MAX_STEP_DEG` | `0.5` | Largest leveling change between consecutive images |
 | `LEVEL_ACCEL_WEIGHTING` | `False` | Down-weight gravity samples during acceleration (implemented, off, candidate for removal) |
@@ -1234,6 +1234,7 @@ Speed conversion: knots × `0.514444` = m/s.
 
 | Version | Highlight |
 |---|---|
+| `0.0.5` | Version bump; development continues from 0.0.4 (no functional changes yet) |
 | `0.0.4` | Notice added that the code is AI-generated. Kandao QooCam 3 Ultra support (raw dual fisheye + `.kvar` sidecar; stitched with the camera's own lens calibration and QooCam Studio's orientation, HLG tone mapping, GPS + gyro heading, accelerometer leveling, local-time names with `--timezone` opt-in). GoPro Max2 support (`GPS9` complex-type decoding, 5888×1920 layout, native 7680×3840 output, EXIF model `GoPro Max2`, title case like the MAX's own `GoPro Max`); GoPro Max and GoPro Max2 are separate cameras (ids `gopro-max`/`gopro-max2`, output folders `-max`/`-max2`; the old `gopro-max-360` id and `-max360` folder suffix are gone); camera timezone from GoPro `TZON` (MAX2, HERO11+) with a GPS-longitude sanity check; GoPro serial number (`CASN`) in EXIF. MAX: `--heading-offset` 0–360 or `auto` (from folder name), recentre-forward by default, `--level-horizon`/`--horizon` opt-in (single pass, smoothed) with optional `--horizon-gradient`; bad-GPS rejection (`--max-dop`); camera firmware in `Software`/`XMP-aux:Firmware`, provenance only in `UserComment`, `XMP:Title` removed; exposure time/ISO from GPMF; frame-0/clamped-time fix |
 | `0.0.3` | Unified single-file pipelines, per-camera telemetry, timezone detection, universal unpositioned fallback. Horizon leveling restricted to 360 (MAX) videos via `--level-horizon {no,rotate,exif}`; telemetry exports switched from `*.json` to RFC 7946 `*.geojson`; exporter version written to EXIF `Software` |
 | Earlier | Per-camera scripts and modules, merged into `v2i.py` |

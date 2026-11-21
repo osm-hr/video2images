@@ -63,10 +63,10 @@ class Fatal(Exception):
 # Shared helpers: CLI, detection, timelines, extraction and tracks
 # =========================================================================
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 # Written to EXIF ``Software``, ``XMP:CreatorTool`` and the GPano
-# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.4``.
+# ``StitchingSoftware`` tag of every exported image, e.g. ``v2i.py v0.0.5``.
 SOFTWARE_TAG = "%s v%s" % (SCRIPT_NAME, __version__)
 
 # Values ``--level-horizon`` accepted before it became an on/off switch; they
